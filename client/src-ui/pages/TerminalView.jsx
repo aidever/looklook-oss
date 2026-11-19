@@ -8,7 +8,7 @@ import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 
 import { useStatus } from '../App.jsx';
-import { api, selectedDevice, terminalDevice } from '../shared/api.js';
+import { api, rtcMode, selectedDevice, terminalDevice } from '../shared/api.js';
 import { CHAT_LAUNCHES } from '../shared/chat.js';
 import { lossLevel, lossText, PathRows, usePaths, usePop } from '../shared/paths.jsx';
 import { termFit, termFocus, termOffline, termPaste, termSrc, useFocusWhenReady, useRefitOnReturn, useTermConn, useTermTheme } from '../shared/termFrame.js';
@@ -73,7 +73,7 @@ function LinkBadge({ id }) {
   const { status } = useStatus();
   const paths = usePaths();
   const pop = usePop();
-  const dev = terminalDevice(id) ?? selectedDevice();
+  const dev = terminalDevice(id) ?? (rtcMode ? selectedDevice() : null);
   const p = dev ? paths[dev] : status.access === 'remote' ? Object.values(paths)[0] : null;
   if (!p) return null;
   const ms = p.rtt_ms;

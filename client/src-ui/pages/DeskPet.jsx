@@ -6,7 +6,7 @@
 // 可以“不挡操作”（鼠标直接穿过，按住 Ctrl / ⌥ 才能抓）。右键宠物就地调这些。
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { api } from '../shared/api.js';
+import { localApi as api } from '../shared/api.js';
 import { LivePet, PETS_CHANGED, useInstancePet, usePeerChat, usePetsLive } from '../shared/ChatPet.jsx';
 import { Seg } from '../shared/ui.jsx';
 import { useChat } from './ChatView.jsx';

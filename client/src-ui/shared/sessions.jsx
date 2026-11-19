@@ -7,7 +7,7 @@
 // 打开的会话在顶部排成标签（tabs，按打开的先后，可以拖动），最近看过的几个在后台保持连接（recent）。
 import { createContext, useContext, useEffect, useRef, useState } from 'react';
 
-import { api, ApiError, deviceApi, rememberTerminals, terminalDevice } from './api.js';
+import { api, ApiError, deviceApi, rememberTerminals, rtcMode, terminalDevice } from './api.js';
 import { rememberInstances, snapInstances } from './snapshot.js';
 import { useDevices } from './devices.jsx';
 
@@ -219,13 +219,16 @@ export function sessionState(i) {
  * 多台电脑：分别向每台在线的电脑要会话列表，各自独立。一台卡住（超时）或出错只影响它自己那一组，
  * 其他电脑的先显示出来；同一台电脑上一次还没返回时不重复请求。
  */
-function useDeviceGroups(online, key) {
+function useDeviceGroups(online, key, localDef, localSeed) {
   // 远程打开时先用上次各台电脑的会话列表（标了 stale，不拿它判断“会话已删除”）
   const [groups, setGroups] = useState(() => {
     const out = {};
     for (const d of online || []) {
       const items = snapInstances(d.id);
       if (items) out[d.id] = { id: d.id, items, stale: true };
+    }
+    if (!rtcMode && localDef && Array.isArray(localSeed?.items) && !out[localDef]) {
+      out[localDef] = { id: localDef, items: localSeed.items };
     }
     return out;
   });
@@ -258,23 +261,45 @@ function useDeviceGroups(online, key) {
         setGroups((all) => ({ ...all, [id]: g.error ? { ...all[id], id, items: all[id]?.items ?? [], error: g.error } : g }));
       });
   };
-  // 返回的 Promise 在这一轮都取完时完成（新建后要等它出现在列表里再打开）
-  const reload = () => Promise.all(ids.current.map(loadOne));
+  // 返回的 Promise：指定了电脑（或本机 App 默认等本机 127.0.0.1）时只等那台返回，不被其他电脑的 WebRTC 中继协商拖慢
+  const reload = (targetId) => {
+    const ps = ids.current.map((id) => [id, loadOne(id)]);
+    const waitId = targetId ?? (!rtcMode ? localDef : null);
+    if (waitId && ids.current.includes(waitId)) {
+      return Promise.resolve(ps.find(([id]) => id === waitId)?.[1]);
+    }
+    return Promise.all(ps.map(([, p]) => p));
+  };
+  const putGroup = (id, inst) => {
+    if (!id || !inst?.id) return;
+    setGroups((all) => {
+      const cur = all[id]?.items ?? [];
+      const items = [inst, ...cur.filter((x) => x.id !== inst.id)];
+      return { ...all, [id]: { ...all[id], id, items } };
+    });
+  };
   useEffect(() => {
     alive.current = true;
-    setGroups((all) => Object.fromEntries(Object.entries(all).filter(([id]) => ids.current.includes(id))));
+    setGroups((all) => {
+      const next = Object.fromEntries(Object.entries(all).filter(([id]) => ids.current.includes(id)));
+      if (!rtcMode && localDef && ids.current.includes(localDef) && Array.isArray(localSeed?.items) && !next[localDef]) {
+        rememberTerminals(localDef, localSeed.items);
+        next[localDef] = { id: localDef, items: localSeed.items };
+      }
+      return next;
+    });
     reload();
     return () => {
       alive.current = false;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [key]);
-  if (!online) return [null, reload];
+  if (!online) return [null, reload, putGroup];
   const list = ids.current.map((id) => groups[id]).filter(Boolean);
   const items = list.flatMap((g) => g.items);
-  // 还有电脑没返回、其他电脑也都没有会话时继续显示骨架，免得先闪一下“还没有会话”
-  const settled = items.length > 0 || list.length === ids.current.length;
-  return [settled ? { items, groups } : null, reload];
+  // 还有电脑没返回、其他电脑也都没有会话时继续显示骨架，免得先闪一下“还没有会话”；本机 App 本机已返回即可直接显示
+  const settled = items.length > 0 || list.length === ids.current.length || Boolean(!rtcMode && localDef && groups[localDef]);
+  return [settled ? { items, groups } : null, reload, putGroup];
 }
 
 /** 只有一台电脑（或本机 / 局域网打开）时的会话列表。 */
@@ -293,6 +318,7 @@ function useSingle(enabled) {
       .then(
         (r) => {
           const items = Array.isArray(r?.items) ? r.items : [];
+          rememberTerminals('self', items);
           rememberInstances('self', items);
           setState({ data: { items }, error: null });
         },
@@ -302,12 +328,19 @@ function useSingle(enabled) {
         busy.current = false;
       });
   };
+  const putSingle = (inst) => {
+    if (!inst?.id) return;
+    setState((s) => {
+      const cur = s.data?.items ?? [];
+      return { ...s, data: { ...s.data, items: [inst, ...cur.filter((x) => x.id !== inst.id)] } };
+    });
+  };
   useEffect(() => {
     // 停用（换成多台）时丢掉旧列表：再换回单台时那份已经过时，拿它判断“会话已删除”会误关标签
     if (!enabled) setState({ data: null, error: null });
     else reload();
   }, [enabled]);
-  return [state.data, state.error, reload];
+  return [state.data, state.error, reload, putSingle];
 }
 
 /** 每台电脑上记着的项目。`dev` 为 null 表示不分电脑。 */
@@ -492,10 +525,19 @@ export function SessionsProvider({ enabled, children }) {
   const multi = devices.multi;
   const online = multi ? devices.items.filter((d) => d.online) : [];
   const onlineKey = online.map((d) => d.id).join(',');
-  const [single, singleError, reloadSingle] = useSingle(enabled && !multi);
-  const [grouped, reloadGroups] = useDeviceGroups(enabled && multi ? online : null, `${enabled}:${multi}:${onlineKey}`);
+  const [single, singleError, reloadSingle, putSingle] = useSingle(enabled && !multi);
+  const lastSingleRef = useRef(null);
+  if (single && !single.stale) lastSingleRef.current = single;
+  const [grouped, reloadGroups, putGroup] = useDeviceGroups(enabled && multi ? online : null, `${enabled}:${multi}:${onlineKey}`, devices.def, lastSingleRef.current);
   const data = multi ? grouped : single;
-  const reload = () => (multi ? reloadGroups() : reloadSingle());
+  const reload = (targetId) => (multi ? reloadGroups(targetId) : reloadSingle());
+  const rememberItem = (inst, device) => {
+    if (!inst?.id) return;
+    const dev = device || devices.def || 'self';
+    rememberTerminals(dev, [inst]);
+    if (multi) putGroup(device || devices.def, inst);
+    else putSingle(inst);
+  };
   const reloadRef = useRef(reload);
   reloadRef.current = reload;
   useEffect(() => {
@@ -668,6 +710,7 @@ export function SessionsProvider({ enabled, children }) {
     loading: enabled && !data && !(multi ? false : singleError),
     error: multi ? null : singleError,
     reload,
+    rememberItem,
     reloadFolders,
     /** 正在删除：先从列表里拿掉（`on` 为假时放回来） */
     hide,

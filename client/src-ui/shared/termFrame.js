@@ -1,12 +1,13 @@
 // 终端 iframe：地址与通信。终端始终同源打开（/i/{id}/）；远程打开时经 WebRTC，多台电脑时由启动页或本机客户端按 __lldev 转给终端所在的电脑。
 import { useEffect, useState } from 'react';
 
-import { selectedDevice, terminalDevice } from './api.js';
+import { isLocalDevice, rtcMode, selectedDevice, terminalDevice } from './api.js';
 
-/** 终端 iframe 的地址。多台电脑时带上终端所在的电脑（__lldev，启动页 / 本机客户端自己去掉；ttyd 的 WebSocket 地址也会带上它）。 */
+/** 终端 iframe 的地址。多台电脑时带上终端所在的电脑（__lldev，启动页 / 本机客户端自己去掉；ttyd 的 WebSocket 地址也会带上它）。
+ *  本机 App 里的本机终端（127.0.0.1 直连）不带 __lldev，未知归属时也不借用顶栏选中的远端电脑。 */
 export function termSrc(id) {
-  const device = terminalDevice(id) ?? selectedDevice();
-  return device ? `/i/${id}/?__lldev=${encodeURIComponent(device)}` : `/i/${id}/`;
+  const device = terminalDevice(id) ?? (rtcMode ? selectedDevice() : null);
+  return device && !isLocalDevice(device) ? `/i/${id}/?__lldev=${encodeURIComponent(device)}` : `/i/${id}/`;
 }
 
 // ---------------- 与终端 iframe 通信 ----------------

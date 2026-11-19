@@ -504,7 +504,10 @@ function DraftForm() {
         codex_profile: launch === 'codex' && !container && profile ? profile : undefined,
         start: true,
       });
-      if (device && r.id) rememberTerminals(device, [r]);
+      if (r.id) {
+        rememberTerminals(device, [r]);
+        s.rememberItem?.(r, device);
+      }
       const preset = pickModel && (model || effort) ? { model, effort } : null;
       // 点过模型菜单：这次选的记下来（选回默认就忘掉），下次新建时预先选好；那台电脑的客户端太旧时没有这个接口
       if (pickModel && modelTouched.current) client.post('/draft/model_memory', { agent: launch, profile: profile ?? '', model, effort }).catch(() => {});

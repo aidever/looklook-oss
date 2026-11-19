@@ -78,13 +78,32 @@ function writePin(id) {
   }
 }
 
+const LOCAL_DEVICES_KEY = 'looklook.rtc-devices';
+function readLocalDevices() {
+  try {
+    const v = JSON.parse(localStorage.getItem(LOCAL_DEVICES_KEY) || 'null');
+    return v && Array.isArray(v.items) ? v : null;
+  } catch {
+    return null;
+  }
+}
+function writeLocalDevices(d) {
+  try {
+    if (d) localStorage.setItem(LOCAL_DEVICES_KEY, JSON.stringify(d));
+    else localStorage.removeItem(LOCAL_DEVICES_KEY);
+  } catch {
+    /* 无痕模式等：忽略 */
+  }
+}
+
 /**
  * 登录后加载并定时刷新设备列表（`remote` 为假时什么也不做）。
+ * `ownId`：本机 App 从本机 `/api/status` 拿到的本机设备 id（设备列表尚未返回时也知道本机是谁）。
  * `onSelect`：切换电脑后调用（刷新客户端状态）。
  */
-export function useDeviceState(remote, onSelect) {
-  // null = 还没加载；远程打开时先用上次的快照（snapshot.js），不等连上电脑就能显示
-  const [list, setList] = useState(() => (rtcMode ? snapDevices() : null));
+export function useDeviceState(remote, ownId = null, onSelect) {
+  // null = 还没加载；远程打开用 snapshot.js，本机 App 用上次缓存的列表，不等平台返回就能按 127.0.0.1 直连显示本机会话
+  const [list, setList] = useState(() => (rtcMode ? snapDevices() : readLocalDevices()));
   const [want, setWant] = useState(stored);
   const [pin, setPin] = useState(() => (rtcMode ? readPin() : null));
   // 一次没拿到（网络抖动、中转重启）时保留上一次的列表：清空会让页面在“单台/多台”之间来回切换，
@@ -92,7 +111,10 @@ export function useDeviceState(remote, onSelect) {
   const load = useCallback(
     () =>
       fetchDevices().then((d) => {
-        if (d) rememberDevices(d);
+        if (d) {
+          rememberDevices(d);
+          if (!rtcMode) writeLocalDevices(d);
+        }
         setList((prev) => d ?? prev ?? { items: [], default: null, max: null });
       }),
     [],
@@ -108,10 +130,16 @@ export function useDeviceState(remote, onSelect) {
     };
   }, [remote, load]);
   if (!remote) {
-    configureDevices({ multi: false });
+    if (!rtcMode) writeLocalDevices(null);
+    configureDevices({ multi: false, def: null });
     return NONE;
   }
-  if (!list) return { ...NONE, ready: false };
+  const def = list?.default ?? ownId ?? null;
+  if (!list) {
+    configureDevices({ multi: false, def });
+    // 本机 App 不阻塞首屏：在平台设备列表返回前先直接渲染本机 127.0.0.1 会话
+    return rtcMode ? { ...NONE, ready: false } : { ...NONE, ready: true, def };
+  }
   // 只看本机（本机 App，客户端 /api/rtc/local-only）：列表为空，界面按单台电脑显示，所有请求都在本机处理。
   // 网页（WebRTC）里是“只看这台电脑”：只留当前选中的那台，界面按单台显示，请求仍然指定发给它。
   const setLocalOnly = async (on, current) => {
@@ -127,30 +155,30 @@ export function useDeviceState(remote, onSelect) {
     onSelect?.();
   };
   if (list.localOnly) {
-    configureDevices({ multi: false });
-    return { ...NONE, localOnly: true, canLocalOnly: true, setLocalOnly, reload: load };
+    configureDevices({ multi: false, def });
+    return { ...NONE, localOnly: true, canLocalOnly: true, setLocalOnly, def, reload: load };
   }
   const pinned = pin && list.items.find((d) => d.id === pin);
   if (pinned) {
     // 只有一台，但不一定是入口的默认电脑：路由仍按多台处理，请求都带上它
-    configureDevices({ multi: true, selected: pinned.id, devices: [pinned] });
+    configureDevices({ multi: true, selected: pinned.id, def: pinned.id, devices: [pinned] });
     return { ...NONE, localOnly: true, canLocalOnly: true, setLocalOnly, pinned: pinned.id, items: [pinned], def: pinned.id, selected: pinned.id, byId: (id) => (id === pinned.id ? pinned : null), reload: load };
   }
   const items = list.items;
   const multi = items.length > 1;
-  const selected = multi ? pickSelected(items, list.default, want) : null;
+  const selected = multi ? pickSelected(items, def, want) : null;
   // 在渲染时同步给 api.js（幂等），子组件的请求从第一次渲染起就带上正确的设备
-  configureDevices({ multi, selected, devices: items });
+  configureDevices({ multi, selected, def, devices: items });
   // remember 为假：只是这次临时换过去（选中的那台连不上），不改记住的选择
   const select = (id, remember = true) => {
     if (remember) store(id);
     setWant(id);
-    configureDevices({ multi, selected: pickSelected(items, list.default, id), devices: items });
+    configureDevices({ multi, selected: pickSelected(items, def, id), def, devices: items });
     onSelect?.();
   };
   // 本机 App（客户端会回 local_only）和网页（WebRTC）都能只看一台；局域网打开时没有其他电脑
   const canLocalOnly = list.localOnly === false || (rtcMode && multi);
-  return { ready: true, multi, localOnly: false, canLocalOnly, setLocalOnly, items, def: list.default, selected, max: list.max, select, byId: (id) => items.find((d) => d.id === id) ?? null, reload: load };
+  return { ready: true, multi, localOnly: false, canLocalOnly, setLocalOnly, items, def, selected, max: list.max, select, byId: (id) => items.find((d) => d.id === id) ?? null, reload: load };
 }
 
 export function DevicesProvider({ value, children }) {

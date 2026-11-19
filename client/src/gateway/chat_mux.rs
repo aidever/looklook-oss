@@ -167,7 +167,7 @@ async fn run(id: String, feed: impl std::future::Future<Output = Result<Feed, Lo
 
 /// 这个终端在别的电脑上时是哪台（和 [`super::to_peer`] 的判断一样：页面给的、记下的终端路由）
 fn peer_of(app: &App, id: &str, device: Option<String>, forward: bool) -> Option<String> {
-    if !forward || super::api::local_only(app) {
+    if !forward || super::api::local_only(app) || app.instances.exists(id) {
         return None;
     }
     let own = app.account.session()?.device_id;

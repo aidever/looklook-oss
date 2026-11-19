@@ -13,19 +13,33 @@ export class ApiError extends Error {
 // 远程打开且账户有多台电脑在线时，接口请求带 X-LL-Device 指定发给哪台电脑：
 // 指定了 device 的请求发给那台；/instances/{id}… 发给这个终端所在的电脑；其余发给顶栏选中的电脑。
 // 本机/局域网打开、或只有一台电脑时不带这个头，行为与单设备完全一样。
-const routing = { multi: false, selected: null, devices: [], owners: new Map(), locating: new Map() };
+const routing = { multi: false, selected: null, def: null, devices: [], owners: new Map(), locating: new Map() };
 const INSTANCE_PATH = /^\/instances\/([a-z0-9]+)(?:[/?]|$)/;
 
 /** 由界面（设备列表加载后、切换设备时）设置。 */
-export function configureDevices({ multi, selected, devices }) {
+export function configureDevices({ multi, selected, def = null, devices }) {
   routing.multi = Boolean(multi);
   routing.selected = multi ? selected ?? null : null;
+  routing.def = def ?? routing.def ?? null;
   routing.devices = devices ?? [];
+  if (routing.def) {
+    for (const [k, v] of routing.owners) if (v === 'self') routing.owners.set(k, routing.def);
+  }
+  for (const d of routing.devices) {
+    if (d?.id && Array.isArray(d.terminals)) {
+      for (const id of d.terminals) if (id) routing.owners.set(id, d.id);
+    }
+  }
 }
 
 /** 记下终端所在的电脑（终端页按电脑加载列表后调用）。 */
 export function rememberTerminals(device, items) {
-  for (const i of items ?? []) if (i?.id) routing.owners.set(i.id, device);
+  const dev = !rtcMode && (!device || device === 'self') ? routing.def ?? 'self' : device;
+  if (!dev) return;
+  for (const i of items ?? []) {
+    const id = typeof i === 'string' ? i : i?.id;
+    if (id) routing.owners.set(id, dev);
+  }
 }
 
 /** 当前选中的电脑（不分设备时为 null）。 */
@@ -33,19 +47,61 @@ export function selectedDevice() {
   return routing.multi ? routing.selected : null;
 }
 
-export function terminalDevice(id) {
-  return routing.owners.get(id) ?? null;
+/** 本机 App 里的本机设备 id（远程 WebRTC 打开时为 null）。 */
+export function ownDevice() {
+  return !rtcMode ? routing.def : null;
 }
 
-// 不知道终端在哪台电脑（例如直接打开 /t/{id}）：问一遍在线的电脑。
+/** 是否是本机（127.0.0.1 直连，不经客户端 outbound WebRTC 转发）。 */
+export function isLocalDevice(device) {
+  return !rtcMode && (!device || device === 'self' || (Boolean(routing.def) && device === routing.def));
+}
+
+export function terminalDevice(id) {
+  const dev = routing.owners.get(id) ?? null;
+  return dev === 'self' ? routing.def : dev;
+}
+
+// 不知道终端在哪台电脑（例如直接打开 /t/{id}）：本机 App 先查 127.0.0.1 本机，属于本机就立即直连返回，
+// 绝不等其他电脑的 WebRTC / 中继协商；本机没有时再并发问其他在线电脑，任一台找到即返回。
 function locate(id) {
   if (!routing.locating.has(id)) {
-    const online = routing.devices.filter((d) => d.online);
+    const run = async () => {
+      if (!rtcMode) {
+        try {
+          const r = await request('GET', '/instances', undefined, { device: null });
+          rememberTerminals(routing.def ?? 'self', r?.items);
+          if (routing.owners.has(id)) return terminalDevice(id);
+        } catch {
+          /* 本机查询失败时继续尝试在线列表 */
+        }
+      }
+      const online = routing.devices.filter((d) => d.online && (rtcMode || d.id !== routing.def));
+      if (!online.length) return terminalDevice(id);
+      return await new Promise((resolve) => {
+        let left = online.length;
+        let done = false;
+        const finish = (val) => {
+          if (done) return;
+          done = true;
+          resolve(val);
+        };
+        for (const d of online) {
+          request('GET', '/instances', undefined, { device: d.id })
+            .then((r) => {
+              rememberTerminals(d.id, r?.items);
+              if (routing.owners.get(id) === d.id) finish(d.id);
+            }, () => {})
+            .finally(() => {
+              if (--left === 0) finish(terminalDevice(id));
+            });
+        }
+      });
+    };
     routing.locating.set(
       id,
-      Promise.all(online.map((d) => request('GET', '/instances', undefined, { device: d.id }).then((r) => rememberTerminals(d.id, r?.items), () => {}))).then(() => {
+      run().finally(() => {
         routing.locating.delete(id);
-        return routing.owners.get(id) ?? null;
       }),
     );
   }
@@ -54,13 +110,80 @@ function locate(id) {
 
 async function deviceFor(path, options) {
   if (!routing.multi) return null;
-  if (options.device !== undefined) return options.device;
+  if (options.device !== undefined) return isLocalDevice(options.device) ? null : options.device;
   const m = path.match(INSTANCE_PATH);
-  if (m) return routing.owners.get(m[1]) ?? (await locate(m[1])) ?? routing.selected;
-  return routing.selected;
+  if (m) {
+    const known = routing.owners.has(m[1]) ? routing.owners.get(m[1]) : await locate(m[1]);
+    const target = known ?? (rtcMode ? routing.selected : null);
+    return isLocalDevice(target) ? null : target;
+  }
+  return isLocalDevice(routing.selected) ? null : routing.selected;
 }
 
-/** 设备列表 `{items:[{id,name,os,online}], default, max}`：远程打开时由启动页所在的平台应答，本机 App 由这台电脑向平台取
+// 本机 App（http://127.0.0.1，HTTP/1.1 同源最多 6 条连接）发往其他电脑的请求会在客户端 to_peer 里等待 WebRTC 建连与中继协商。
+// 限制同时在路上的跨设备 HTTP 请求数（总共最多 2 条，尚未连通过的电脑每台最多 1 条），始终给本机 127.0.0.1 直连请求留足连接。
+const PEER_MAX_CONCURRENT = 2;
+let peerActive = 0;
+const peerPerDevice = new Map();
+const peerConnected = new Set();
+const peerQueue = [];
+
+function pumpPeerQueue() {
+  if (peerActive >= PEER_MAX_CONCURRENT || !peerQueue.length) return;
+  for (let i = 0; i < peerQueue.length; i++) {
+    const item = peerQueue[i];
+    const inDev = peerPerDevice.get(item.device) ?? 0;
+    if (!peerConnected.has(item.device) && inDev >= 1) continue;
+    peerQueue.splice(i, 1);
+    peerActive += 1;
+    peerPerDevice.set(item.device, inDev + 1);
+    item.start();
+    if (peerActive >= PEER_MAX_CONCURRENT) break;
+  }
+}
+
+function withPeerSlot(device, signal, fn) {
+  if (rtcMode || !device || isLocalDevice(device)) return fn();
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new DOMException('The operation was aborted.', 'AbortError'));
+      return;
+    }
+    const item = {
+      device,
+      start() {
+        signal?.removeEventListener('abort', onAbort);
+        let ok = false;
+        fn()
+          .then(
+            (r) => {
+              ok = true;
+              return r;
+            },
+          )
+          .then(resolve, reject)
+          .finally(() => {
+            if (ok) peerConnected.add(device);
+            peerActive = Math.max(0, peerActive - 1);
+            const cur = (peerPerDevice.get(device) ?? 1) - 1;
+            if (cur <= 0) peerPerDevice.delete(device);
+            else peerPerDevice.set(device, cur);
+            pumpPeerQueue();
+          });
+      },
+    };
+    const onAbort = () => {
+      const idx = peerQueue.indexOf(item);
+      if (idx !== -1) peerQueue.splice(idx, 1);
+      reject(new DOMException('The operation was aborted.', 'AbortError'));
+    };
+    signal?.addEventListener('abort', onAbort, { once: true });
+    peerQueue.push(item);
+    pumpPeerQueue();
+  });
+}
+
+/** 设备列表 `{items:[{id,name,os,online,terminals}], default, max}`：远程打开时由启动页所在的平台应答，本机 App 由这台电脑向平台取
  *  （default 是本机）；拿不到（旧服务端、网络）时为 null。 */
 export async function fetchDevices() {
   try {
@@ -68,7 +191,14 @@ export async function fetchDevices() {
     if (!res.ok) return null;
     const d = await res.json();
     if (!Array.isArray(d?.items)) return null;
-    const items = d.items.filter((x) => x && typeof x.id === 'string').map((x) => ({ id: x.id, name: x.name || '', os: x.os || '', online: x.online !== false }));
+    if (d.default) routing.def = d.default;
+    const items = d.items
+      .filter((x) => x && typeof x.id === 'string')
+      .map((x) => {
+        const terminals = Array.isArray(x.terminals) ? x.terminals.filter((t) => typeof t === 'string') : [];
+        for (const id of terminals) routing.owners.set(id, x.id);
+        return { id: x.id, name: x.name || '', os: x.os || '', online: x.online !== false, terminals };
+      });
     // local_only：本机 App 的“只看本机”（远程打开时没有这个字段）
     return { items, default: d.default ?? null, max: d.max ?? null, localOnly: typeof d.local_only === 'boolean' ? d.local_only : null,
       // 只看本机时同一局域网里在线的其他电脑（点“直接打开”才连）
@@ -88,7 +218,9 @@ async function request(method, path, body, options = {}) {
   try {
     // no-store：浏览器（Chrome 的缓存锁）会让同一网址的并发 GET 排队等前一个返回。多台电脑时各台的
     // `/api/instances` 网址相同、只是 X-LL-Device 不同，一台卡住会让其他电脑的请求也一起等。
-    res = await fetch(`/api${path}`, { signal: options.signal, method, headers, credentials: 'same-origin', cache: 'no-store', body: body === undefined ? undefined : JSON.stringify(body) });
+    res = await withPeerSlot(device, options.signal, () =>
+      fetch(`/api${path}`, { signal: options.signal, method, headers, credentials: 'same-origin', cache: 'no-store', body: body === undefined ? undefined : JSON.stringify(body) }),
+    );
   } catch (e) {
     if (e.name === 'AbortError') throw e;
     throw new ApiError(0, 'CLIENT_UNREACHABLE');
@@ -129,7 +261,9 @@ export async function fetchRaw(path, options = {}) {
   let res;
   try {
     // cache：网址带版本、内容不会变的（宠物动画）可以用 'default'，走浏览器缓存
-    res = await fetch(`/api${path}`, { signal: options.signal, headers, credentials: 'same-origin', cache: options.cache ?? 'no-store' });
+    res = await withPeerSlot(device, options.signal, () =>
+      fetch(`/api${path}`, { signal: options.signal, headers, credentials: 'same-origin', cache: options.cache ?? 'no-store' }),
+    );
   } catch (e) {
     if (e.name === 'AbortError') throw e;
     throw new ApiError(0, 'CLIENT_UNREACHABLE');
@@ -148,8 +282,11 @@ export async function postFile(path, file, options = {}) {
   if (device) headers['X-LL-Device'] = device;
   let res;
   try {
-    res = await fetch(`/api${path}`, { method: 'POST', headers, credentials: 'same-origin', cache: 'no-store', body: file });
-  } catch {
+    res = await withPeerSlot(device, options.signal, () =>
+      fetch(`/api${path}`, { signal: options.signal, method: 'POST', headers, credentials: 'same-origin', cache: 'no-store', body: file }),
+    );
+  } catch (e) {
+    if (e.name === 'AbortError') throw e;
     throw new ApiError(0, 'CLIENT_UNREACHABLE');
   }
   const data = await res.json().catch(() => null);

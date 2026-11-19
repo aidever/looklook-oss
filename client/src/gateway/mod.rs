@@ -421,8 +421,12 @@ async fn to_peer(State(app): State<App>, req: Request, next: Next) -> Response {
     if req.extensions().get::<access::Peer>() != Some(&access::Peer::Local) {
         return next.run(req).await;
     }
-    // 宿主白名单接口只给本机插件调用，绝不转发到其他电脑
-    if req.uri().path().starts_with(looklook_protocol::plugin::HOST_PREFIX) {
+    // 宿主白名单接口与本机桌面窗口/RTC 接口只在本机处理，绝不转发到其他电脑
+    let uri_path = req.uri().path();
+    if uri_path.starts_with(looklook_protocol::plugin::HOST_PREFIX)
+        || uri_path.starts_with("/api/desktop/")
+        || uri_path.starts_with("/api/rtc/")
+    {
         return next.run(req).await;
     }
     let Some(session) = app.account.session() else { return next.run(req).await };
@@ -434,6 +438,13 @@ async fn to_peer(State(app): State<App>, req: Request, next: Next) -> Response {
     let pq = req.uri().path_and_query().map(|p| p.as_str()).unwrap_or("/").to_string();
     let (path, hint) = outbound::take_device_hint(&pq);
     let terminal = outbound::terminal_of(req.uri().path()).map(str::to_owned);
+    // 本机已有的会话一律走 127.0.0.1 本机直连，不记成别的电脑、也不经 WebRTC 转发
+    if let Some(id) = terminal.as_deref() {
+        if app.instances.exists(id) {
+            app.outbound.remember(id, &own);
+            return next.run(req).await;
+        }
+    }
     let plugin = looklook_protocol::plugin::plugin_of_path(req.uri().path()).map(|n| format!("p:{n}"));
     let route_key = terminal.or(plugin);
     let header_dev = req.headers().get(looklook_protocol::DEVICE_HEADER).and_then(|v| v.to_str().ok()).map(str::to_owned);

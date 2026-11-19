@@ -471,13 +471,25 @@ async fn account(State(app): State<App>) -> R<Json<Value>> {
 /// 其他方式打开时返回空列表，界面就按单台电脑显示。
 /// “只看本机”时也返回空列表（`local_only: true`），不向平台取，也就不会连其他电脑。
 async fn rtc_devices(State(app): State<App>, req: Request) -> R<Json<Value>> {
-    if req.extensions().get::<Peer>() != Some(&Peer::Local) || app.account.session().is_none() {
+    let Some(session) = (req.extensions().get::<Peer>() == Some(&Peer::Local)).then(|| app.account.session()).flatten() else {
         return Ok(Json(json!({ "items": [], "default": null, "max": 0 })));
-    }
+    };
     if local_only(&app) {
         return Ok(Json(json!({ "items": [], "default": null, "max": 0, "local_only": true })));
     }
+    let own = session.device_id;
+    let local_ids = app.instances.ids();
+    for id in &local_ids {
+        app.outbound.remember(id, &own);
+    }
     let mut d = app.outbound.devices(&app.account, false).await?;
+    if let Some(me) = d.items.iter_mut().find(|x| x.id == own) {
+        for id in local_ids {
+            if !me.terminals.contains(&id) {
+                me.terminals.push(id);
+            }
+        }
+    }
     // ICE 凭证只给本机用，不交给页面
     d.ice_servers.clear();
     let mut v = serde_json::to_value(d).unwrap_or_default();

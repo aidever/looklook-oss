@@ -985,8 +985,13 @@ function Shell() {
         setDown(true);
       });
   }, []);
+  const ownDevRef = useRef(null);
+  if (!rtcMode && !statusDevice && status?.account?.session?.device_id) {
+    ownDevRef.current = status.account.session.device_id;
+  }
   // 远程打开（启动页给的列表）和本机 App（本机客户端连其他电脑，服务端 docs/06 §14）都能切换电脑
-  const devices = useDeviceState(Boolean(status?.account?.logged_in));
+  const devices = useDeviceState(Boolean(status?.account?.logged_in), ownDevRef.current);
+  if (devices.def) ownDevRef.current = devices.def;
   devRef.current = devices;
   // 设备列表加载后、切换电脑后，取选中那台电脑的状态
   useEffect(() => {
@@ -1042,7 +1047,8 @@ function Shell() {
     // 换了登录（退出后重新登录）时重置终端页。远程打开时状态来自选中的那台电脑，选中的电脑一变 device_id 就变，
     // 不能拿它当 key：选中的电脑短暂离线时会自动换到默认电脑，终端页重新挂载，打开着的终端小窗就没了。
     // 多台电脑时状态来自选中的那台，换电脑不能换 key；本机 App 用自己的设备 id（列表的 default）。
-    const login = rtcMode ? 'remote' : devices.multi ? `local:${devices.def}` : (status.account.session?.device_id ?? 'guest');
+    const ownId = devices.def ?? ownDevRef.current ?? status.account.session?.device_id;
+    const login = rtcMode ? 'remote' : status.account.logged_in && ownId ? `local:${ownId}` : 'guest';
     const home = opensInPage() ? <DraftPane key={`start:${login}`} /> : <SessionHome />;
     const pluginMatch = parsePluginRoute(path);
     const page = SESS.test(path)

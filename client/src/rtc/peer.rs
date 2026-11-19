@@ -246,8 +246,8 @@ fn private_addr(a: &str) -> bool {
         return true;
     }
     match a.parse::<std::net::IpAddr>() {
-        Ok(std::net::IpAddr::V4(v)) => v.is_private(),
-        Ok(std::net::IpAddr::V6(v)) => (v.segments()[0] & 0xfe00) == 0xfc00 || (v.segments()[0] & 0xffc0) == 0xfe80,
+        Ok(std::net::IpAddr::V4(v)) => v.is_private() || v.is_loopback(),
+        Ok(std::net::IpAddr::V6(v)) => v.is_loopback() || (v.segments()[0] & 0xfe00) == 0xfc00 || (v.segments()[0] & 0xffc0) == 0xfe80,
         Err(_) => false,
     }
 }

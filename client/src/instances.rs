@@ -423,6 +423,16 @@ impl Instances {
         Ok(self.view(row, sessions.as_ref()))
     }
 
+    /// 这个会话是不是本机的（`127.0.0.1` 直接处理，不往其他电脑转发）。
+    pub fn exists(&self, id: &str) -> bool {
+        lock(&self.procs).contains_key(id) || self.store.instance(id).ok().flatten().is_some()
+    }
+
+    /// 本机全部会话的 id（补齐 `/api/rtc/devices` 里本机的 `terminals`，不等平台下一轮心跳）。
+    pub fn ids(&self) -> Vec<String> {
+        self.store.instances().map(|rows| rows.into_iter().map(|r| r.id).collect()).unwrap_or_default()
+    }
+
     fn view(&self, row: InstanceRow, sessions: Option<&HashMap<String, (i64, i64)>>) -> View {
         let running = lock(&self.procs).contains_key(&row.id);
         let sess = sessions.and_then(|m| m.get(&Self::session_name(&row.id)));

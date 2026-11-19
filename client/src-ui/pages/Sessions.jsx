@@ -153,7 +153,10 @@ export function SessionUiProvider({ children }) {
         full_access: full,
         start: true,
       });
-      if (p.device && r.id) rememberTerminals(p.device, [r]);
+      if (r.id) {
+        rememberTerminals(p.device, [r]);
+        s.rememberItem?.(r, p.device);
+      }
       if (!p.container) s.touchProject(p.device, p.workdir, { launch });
       s.reload();
       s.reloadFolders();
@@ -204,7 +207,10 @@ export function SessionUiProvider({ children }) {
       resume: { id: c.id, fork },
       start: true,
     });
-    if (device && r.id) rememberTerminals(device, [r]);
+    if (r.id) {
+      rememberTerminals(device, [r]);
+      s.rememberItem?.(r, device);
+    }
     s.touchProject(device, c.workdir, { launch: c.agent });
     s.reload();
     s.reloadFolders();
@@ -237,6 +243,7 @@ export function SessionUiProvider({ children }) {
         device={dialog?.device ?? undefined}
         onClose={() => setDialog(null)}
         onSaved={(row) => {
+          if (row?.id) s.rememberItem?.(row, dialog?.device ?? terminalDevice(row.id));
           s.reload();
           if (row) openSession(row.id);
         }}
@@ -272,7 +279,7 @@ export function usePressActivate(fn, disabled) {
 export function useActions(inst) {
   const s = useSessions();
   const ui = useSessionUi();
-  return useInstanceActions(inst, { onChanged: s.reload, onEdit: ui.edit, onLogs: ui.logs, onOpenHere: ui.openSession, onHide: s.hide });
+  return useInstanceActions(inst, { onChanged: s.reload, onRemember: s.rememberItem, onEdit: ui.edit, onLogs: ui.logs, onOpenHere: ui.openSession, onHide: s.hide });
 }
 
 // ---------------- 侧栏：项目和会话 ----------------

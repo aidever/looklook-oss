@@ -5,7 +5,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { X } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
-import { api } from './api.js';
+import { api, localApi, rtcMode } from './api.js';
 import { isTouch } from './KeyBar.jsx';
 import PetPlayer from './pet/PetPlayer.jsx';
 import { agentState, textOf } from './pet/brain.js';
@@ -37,7 +37,7 @@ function liveLoop() {
     live.run = false;
     return;
   }
-  api.get(`/pets/version${live.ver == null ? '' : `?since=${live.ver}`}`).then(
+  (rtcMode ? api : localApi).get(`/pets/version${live.ver == null ? '' : `?since=${live.ver}`}`).then(
     (r) => {
       if (live.ver != null && r?.ver !== live.ver) window.dispatchEvent(new Event(PETS_CHANGED));
       live.ver = r?.ver ?? live.ver;
@@ -73,7 +73,7 @@ export function petNotify(x, open) {
   if (!key) return false;
   for (const f of sinks) if (f(key, x, open)) return true;
   if (desk.on) {
-    api.put('/desktop/pet', { note: { kind: x.kind, title: x.title ?? '', id: x.id } }).catch(() => {});
+    localApi.put('/desktop/pet', { note: { kind: x.kind, title: x.title ?? '', id: x.id } }).catch(() => {});
     return true;
   }
   return false;
@@ -98,7 +98,7 @@ export function useDeskNotify(open) {
       desk.on = Boolean(st?.running && cfg?.pet && cfg.desktop !== false && cfg.notify !== false && cfg.lines !== false);
     };
     const loadCfg = () =>
-      api.get('/pets/current').then(
+      localApi.get('/pets/current').then(
         (r) => {
           cfg = r;
           apply();
@@ -108,7 +108,7 @@ export function useDeskNotify(open) {
     const loop = async () => {
       while (!dead) {
         try {
-          const r = await api.get(`/desktop/pet${st?.seq != null ? `?since=${st.seq}` : ''}`);
+          const r = await localApi.get(`/desktop/pet${st?.seq != null ? `?since=${st.seq}` : ''}`);
           if (dead) return;
           st = r;
           apply();
@@ -180,7 +180,7 @@ function useDeskPet(id, active) {
   useEffect(() => {
     if (!on) return undefined;
     let dead = false;
-    const check = () => api.get('/desktop/pet').then((r) => !dead && setRunning(Boolean(r.running)), () => {});
+    const check = () => localApi.get('/desktop/pet').then((r) => !dead && setRunning(Boolean(r.running)), () => {});
     check();
     const t = setInterval(check, 15000);
     window.addEventListener(PETS_CHANGED, check);
@@ -191,7 +191,7 @@ function useDeskPet(id, active) {
     };
   }, [on]);
   useEffect(() => {
-    if (on && active && id && !document.hidden) api.put('/desktop/pet', { focus: id }).catch(() => {});
+    if (on && active && id && !document.hidden) localApi.put('/desktop/pet', { focus: id }).catch(() => {});
   }, [on, active, id]);
   return on && running;
 }

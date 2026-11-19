@@ -5,7 +5,7 @@
 // - 远程打开（平台 https 的 HTTP/2、WebRTC 经 Service Worker）：没有这个限制，每个对话一条 SSE（和以前一样）。
 // - WebSocket 一直连不上（连续几次一次都没连上）：退回 SSE，但只给显示着的对话开（mode 为 'fallback'），保证占不满。
 
-import { rtcMode, terminalDevice } from './api.js';
+import { isLocalDevice, rtcMode, terminalDevice } from './api.js';
 
 const RETRY = [1000, 2000, 5000, 10000];
 /** 订阅出错、结束后过多久重新订阅 */
@@ -45,7 +45,7 @@ function send(msg) {
 
 function subMsg(id) {
   const device = terminalDevice(id);
-  return device ? { op: 'sub', id, device } : { op: 'sub', id };
+  return device && !isLocalDevice(device) ? { op: 'sub', id, device } : { op: 'sub', id };
 }
 
 function each(id, fn) {

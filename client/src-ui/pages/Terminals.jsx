@@ -30,7 +30,7 @@ import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 
 import { useStatus } from "../App.jsx";
-import { api, deviceApi, rememberTerminals, selectedDevice, terminalDevice } from "../shared/api.js";
+import { api, deviceApi, isLocalDevice, rememberTerminals, rtcMode, selectedDevice, terminalDevice } from "../shared/api.js";
 import { deviceName, osLabel, useDevices } from "../shared/devices.jsx";
 import { urlHost } from "../shared/host.js";
 import { LaunchIcon } from "../shared/brands.jsx";
@@ -243,8 +243,8 @@ const tabUrl = (inst) => `/t/${inst.id}`;
 
 /** DSH 网页界面的地址 /w/{id}/（见 src/gateway/dsh.rs）。多台电脑时带上它所在的电脑（__lldev，启动页 / 本机客户端按它转给那台电脑，之后的请求按会话 id 转）。 */
 export function webSrc(id) {
-  const device = terminalDevice(id) ?? selectedDevice();
-  return device ? `/w/${id}/?__lldev=${encodeURIComponent(device)}` : `/w/${id}/`;
+  const device = terminalDevice(id) ?? (rtcMode ? selectedDevice() : null);
+  return device && !isLocalDevice(device) ? `/w/${id}/?__lldev=${encodeURIComponent(device)}` : `/w/${id}/`;
 }
 
 // 在浏览器中单独打开 DSH（平时在会话标签里打开，见 WebPane.jsx）。
@@ -282,7 +282,7 @@ export async function openDsh(inst, t, toast) {
  * onOpenHere(id)：在本页打开（电脑上进工作台，手机上整页打开）。
  * onHide(id, on)：删除时先从列表里拿掉（不给时等删完再刷新）。
  */
-export function useInstanceActions(inst, { onChanged, onEdit, onLogs, onOpenHere, onHide }) {
+export function useInstanceActions(inst, { onChanged, onRemember, onEdit, onLogs, onOpenHere, onHide }) {
   const { t } = useTranslation();
   const { status } = useStatus();
   const confirm = useConfirm();
@@ -408,9 +408,12 @@ export function useInstanceActions(inst, { onChanged, onEdit, onLogs, onOpenHere
         ...(fork && conv ? { resume: { id: inst.chat.session_id, fork: true } } : {}),
         start: true,
       });
-      if (dev && r.id) rememberTerminals(dev, [r]);
-      // 先刷新列表再打开：不然新会话还没在列表里，标签会先显示“会话不在了”
-      await onChanged();
+      if (r.id) {
+        rememberTerminals(dev, [r]);
+        onRemember?.(r, dev);
+      }
+      // 先记入列表（或单拉这台电脑的列表）再打开：不等其他电脑的 WebRTC 中继协商
+      if (!onRemember) await onChanged(dev);
       onOpenHere(r.id);
       toast(t(fork && conv ? "instance.duplicated_conv" : "instance.duplicated", { name: r.name }), "ok");
     } catch (e) {
@@ -1024,7 +1027,7 @@ export function InstanceDialog({ open, onClose, initial, preset, workdir: wantWo
         : client.post("/instances", { ...body, start: true }),
     );
     if (!r) return;
-    if (dev && r.id) rememberTerminals(dev, [r]);
+    if (r.id) rememberTerminals(dev, [r]);
     onClose();
     // 新建成功后不直接跳转，由列表页询问怎么打开（当前页小窗或新标签页）。
     onSaved?.(editing ? null : r);

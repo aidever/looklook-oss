@@ -2,7 +2,7 @@
 // SSH 主机页添加、修改、删除后发 `ll-ssh-hosts` 事件，这里跟着重新取。
 import { useEffect, useRef, useState } from 'react';
 
-import { deviceApi } from './api.js';
+import { deviceApi, rememberTerminals } from './api.js';
 import { useDevices } from './devices.jsx';
 
 export const SSH_HOSTS_EVENT = 'll-ssh-hosts';
@@ -56,7 +56,9 @@ export function useSshHosts(enabled) {
 /** 打开连这台主机的终端：`fresh` 再开一个，否则已经开着的话回到它。返回会话 id。 */
 export async function openSshHost(device, id, fresh = false) {
   const v = await deviceApi(device).post(`/ssh/hosts/${id}/open${fresh ? '?new=true' : ''}`);
-  return v.row?.id ?? v.id;
+  const sid = v.row?.id ?? v.id;
+  if (sid) rememberTerminals(device, [v.row ?? sid]);
+  return sid;
 }
 
 /** 主机地址：user@host[:port] */
