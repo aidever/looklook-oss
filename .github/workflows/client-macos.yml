@@ -39,13 +39,14 @@ jobs:
 
   build:
     needs: prepare
-    runs-on: macos-14
+    runs-on: macos-15-intel
     timeout-minutes: 60
     defaults:
       run:
         working-directory: client
     env:
-      ZIG_SHA256_MACOS: 3cc2bab367e185cdfb27501c4b30b1b0653c28d9f73df8dc91488e66ece5fa6b
+      ZIG_SHA256_MACOS_ARM64: 3cc2bab367e185cdfb27501c4b30b1b0653c28d9f73df8dc91488e66ece5fa6b
+      ZIG_SHA256_MACOS_X64: 375b6909fc1495d16fc2c7db9538f707456bfc3373b14ee83fdd3e22b3d43f7f
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -82,10 +83,15 @@ jobs:
           python3 -m venv "$RUNNER_TEMP/venv"
           "$RUNNER_TEMP/venv/bin/pip" install --quiet fonttools brotli
           echo "$RUNNER_TEMP/venv/bin" >> "$GITHUB_PATH"
-          curl -fsSL --retry 3 -o /tmp/zig.tar.xz "https://ziglang.org/download/$ZIG_VERSION/zig-aarch64-macos-$ZIG_VERSION.tar.xz"
-          echo "$ZIG_SHA256_MACOS  /tmp/zig.tar.xz" | sha256sum -c -
+          if [[ $(uname -m) == arm64 ]]; then
+            zarch=aarch64; zsum=$ZIG_SHA256_MACOS_ARM64
+          else
+            zarch=x86_64; zsum=$ZIG_SHA256_MACOS_X64
+          fi
+          curl -fsSL --retry 3 -o /tmp/zig.tar.xz "https://ziglang.org/download/$ZIG_VERSION/zig-$zarch-macos-$ZIG_VERSION.tar.xz"
+          echo "$zsum  /tmp/zig.tar.xz" | sha256sum -c -
           mkdir -p "$RUNNER_TEMP/zig" && tar -C "$RUNNER_TEMP/zig" -xJf /tmp/zig.tar.xz
-          echo "$RUNNER_TEMP/zig/zig-aarch64-macos-$ZIG_VERSION" >> "$GITHUB_PATH"
+          echo "$RUNNER_TEMP/zig/zig-$zarch-macos-$ZIG_VERSION" >> "$GITHUB_PATH"
 
       # 代码签名：每个版本都用同一张（自签名）证书签，macOS 才把升级后的看看认成同一个应用，不再重新询问文件夹访问权限。
       # 证书由 client/scripts/macos-sign-cert.sh 生成一次，放在 secrets 里；没有时 ad-hoc 签名（照常能用，只是升级后会再问）。
