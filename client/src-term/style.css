@@ -1,0 +1,179 @@
+html,
+body {
+  height: 100%;
+  min-height: 100%;
+  margin: 0;
+  overflow: hidden;
+}
+
+#terminal-container {
+  position: relative;
+  width: auto;
+  height: 100%;
+  margin: 0 auto;
+  padding: 0;
+}
+
+#terminal-container .terminal {
+  padding: 5px;
+  height: calc(100% - 10px);
+}
+
+/* 进度条（src-term/progress.js） */
+.ll-progress {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 3px;
+  z-index: 10;
+  overflow: hidden;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.3s;
+}
+
+.ll-progress.on {
+  opacity: 1;
+}
+
+.ll-progress i {
+  display: block;
+  height: 100%;
+  width: 0;
+  border-radius: 0 2px 2px 0;
+  transition: width 0.25s ease-out;
+}
+
+.ll-progress.busy i {
+  width: 30%;
+  border-radius: 2px;
+  animation: ll-progress-busy 1.4s ease-in-out infinite;
+}
+
+@keyframes ll-progress-busy {
+  0% { transform: translateX(-100%); }
+  100% { transform: translateX(340%); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ll-progress.busy i {
+    animation: none;
+    width: 100%;
+    opacity: 0.6;
+  }
+}
+
+/* 手机、平板上盖在终端上的文字层（src-term/touch.js）。平时文字透明，看到的是下面画出来的终端；
+   离开最下面（翻看）或有选区时显示出来。 */
+.ll-touch {
+  position: absolute;
+  z-index: 5;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  overflow-anchor: none;
+  scrollbar-width: none;
+  touch-action: pan-y pinch-zoom;
+  -webkit-user-select: text;
+  user-select: text;
+  -webkit-touch-callout: default;
+  -webkit-tap-highlight-color: transparent;
+  background: transparent;
+}
+.ll-touch::-webkit-scrollbar {
+  display: none;
+}
+/* 程序在备用屏幕里 / 开了鼠标：滑动交给程序（滚轮事件），浏览器不滚 */
+.ll-touch[data-mode='app'] {
+  touch-action: pinch-zoom;
+}
+.ll-touch pre {
+  margin: 0;
+  font: inherit;
+  letter-spacing: inherit;
+  line-height: var(--rh);
+  white-space: pre;
+  tab-size: 8;
+}
+.ll-touch .c,
+.ll-touch .live {
+  overflow: hidden;
+  contain: layout paint style;
+}
+.ll-touch i.w {
+  display: inline-block;
+  width: calc(var(--cw) * 2);
+  font-style: inherit;
+  letter-spacing: 0;
+  text-align: center;
+}
+/* 停在最下面时只有屏幕那几行盖在画出来的终端上，只把它们设成透明（回滚区在上面看不见，不用管；
+   切换时不用给几千个节点重算样式，翻看一开始不卡）。 */
+.ll-touch:not(.shown) .live,
+.ll-touch:not(.shown) .live * {
+  color: transparent !important;
+  background: transparent !important;
+  text-decoration-color: transparent !important;
+}
+.ll-touch:not(.shown) .live ::selection,
+.ll-touch:not(.shown) .live::selection {
+  color: transparent;
+  background: var(--sel);
+}
+.ll-touch pre {
+  color: var(--fg);
+}
+.ll-touch.shown {
+  background: var(--bg);
+}
+.ll-touch ::selection {
+  background: var(--sel);
+}
+
+.ll-touch-bottom,
+.ll-touch-copy {
+  position: absolute;
+  z-index: 6;
+  display: none;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  background: rgba(30, 33, 44, 0.92);
+  color: #e6e8ef;
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.4);
+  -webkit-tap-highlight-color: transparent;
+}
+.ll-touch-bottom {
+  right: 14px;
+  bottom: 14px;
+  width: 40px;
+  height: 40px;
+  border-radius: 50%;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+}
+.ll-touch-bottom.on {
+  display: flex;
+}
+.ll-touch-copy {
+  padding: 6px 14px;
+  border-radius: 999px;
+  font: 600 13px/1.4 system-ui, sans-serif;
+}
+.ll-touch-copy.on {
+  display: block;
+}
+.ll-touch-toast {
+  position: fixed;
+  left: 50%;
+  bottom: 24px;
+  transform: translateX(-50%);
+  z-index: 99;
+  padding: 6px 14px;
+  border-radius: 999px;
+  background: rgba(20, 22, 30, 0.86);
+  color: #fff;
+  font: 13px/1.6 system-ui, sans-serif;
+  pointer-events: none;
+  transition: opacity 0.3s;
+}

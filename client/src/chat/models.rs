@@ -1,0 +1,1134 @@
+//! 模型菜单：和 Claude Code 自己的 `/model` 选择器用同一份数据，不打开选择器、不碰终端。
+//!
+//! - **模型目录**：Claude Code 从服务器取来、缓存在 `<配置目录>/cache/model-catalog/<组织>-…-cc.json` 的那份
+//!   （`/model` 列出的就是它：`section: main` 是常用的几个，`overflow` 是“+N models”里的旧版本）。
+//!   每个模型还带着它支持的思考强度。找不到时（第三方接口、没登录过）用几个别名兜底。
+//! - **`~/.claude.json`** 里 Claude Code 缓存的额外选项（`additionalModelOptionsCache`）。
+//! - **环境变量**：`ANTHROPIC_DEFAULT_{OPUS,SONNET,HAIKU,FABLE}_MODEL`（以及 `_NAME`、`_DESCRIPTION`）把别名指向别的模型，
+//!   `ANTHROPIC_CUSTOM_MODEL_OPTION*` 加一项。来源：settings 里的 `env`、正在运行的 claude 进程的环境（Linux）、客户端自己的环境。
+//! - settings 里的 `availableModels`：只留名单里的。
+//! - **第三方接口**：用同一个地址和 Key 请求 `/v1/models`（Claude Code 自己发现模型也是这样），名单里没有的列在“服务商的其他模型”。
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
+use serde::Serialize;
+use serde_json::Value;
+
+/// 别名（`/model opus`）和它在目录里的家族
+const FAMILIES: [&str; 4] = ["opus", "sonnet", "haiku", "fable"];
+/// 服务商的模型列表缓存多久
+const PROVIDER_TTL: Duration = Duration::from_secs(600);
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct Opt {
+    /// 选中时送给 `/model` 的值
+    pub value: String,
+    pub label: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub description: String,
+    /// `main` 常用 / `more` 其他版本 / `provider` 服务商的其他模型
+    pub section: &'static str,
+    /// 实际对应的模型 ID（用来和回复里的模型对上）；别名没有指向时为空
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub model: String,
+    /// 支持的思考强度；为空表示不支持调节
+    pub efforts: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_effort: Option<String>,
+}
+
+/// 读配置用的上下文
+pub struct Ctx<'a> {
+    /// Claude Code 的配置目录（`~/.claude` 或 `CLAUDE_CONFIG_DIR`）
+    pub config_dir: PathBuf,
+    /// 用户级状态文件（`~/.claude.json`）
+    pub state_file: PathBuf,
+    /// 终端的工作目录（项目的 `.claude/settings*.json`）
+    pub workdir: &'a Path,
+    /// claude 进程的环境变量（读不到时为空）
+    pub env: HashMap<String, String>,
+}
+
+impl Ctx<'_> {
+    fn var(&self, k: &str) -> Option<String> {
+        self.env.get(k).cloned().or_else(|| std::env::var(k).ok()).filter(|v| !v.trim().is_empty())
+    }
+}
+
+pub fn config_dir() -> PathBuf {
+    std::env::var_os("CLAUDE_CONFIG_DIR").filter(|v| !v.is_empty()).map(PathBuf::from).unwrap_or_else(|| home().join(".claude"))
+}
+
+pub fn state_file() -> PathBuf {
+    let main = match std::env::var_os("CLAUDE_CONFIG_DIR").filter(|v| !v.is_empty()) {
+        Some(v) => PathBuf::from(v).join(".claude.json"),
+        None => home().join(".claude.json"),
+    };
+    state_in(&config_dir(), main)
+}
+
+/// 配置目录 `dir` 下 Claude Code 实际用的状态文件，`main` 是平常的位置（`.claude.json`）。跟它自己的找法一样（2.1.310）：
+/// `dir` 里有旧版的 `.config.json`、不是空文件（或者 `main` 还不存在）时用它。
+/// `main` 是个目录时也用 `.config.json`：Docker 把宿主机上不存在的文件映射进来会建成目录，Claude Code 存不了，
+/// 引导、信任目录每次都要重来；看看在 `.config.json` 写上内容后，Claude Code 下次启动就改用它。
+pub fn state_in(dir: &Path, main: PathBuf) -> PathBuf {
+    let legacy = dir.join(".config.json");
+    if std::fs::metadata(&legacy).is_ok_and(|m| m.is_file() && (m.len() > 0 || !main.exists())) || main.is_dir() {
+        legacy
+    } else {
+        main
+    }
+}
+
+fn home() -> PathBuf {
+    dirs::home_dir().unwrap_or_else(|| PathBuf::from("."))
+}
+
+fn read_json(p: &Path) -> Option<Value> {
+    serde_json::from_slice(&std::fs::read(p).ok()?).ok()
+}
+
+/// settings 文件（用户级、项目共享、项目本地），后面的覆盖前面的
+fn settings(ctx: &Ctx) -> Vec<Value> {
+    let proj = ctx.workdir.join(".claude");
+    [ctx.config_dir.join("settings.json"), proj.join("settings.json"), proj.join("settings.local.json")].iter().filter_map(|p| read_json(p)).collect()
+}
+
+/// settings 里的 `effortLevel`（用户在 /effort 里存下的默认思考强度，后面的覆盖前面的）
+pub fn settings_effort(ctx: &Ctx) -> Option<String> {
+    settings(ctx).iter().rev().find_map(|s| s["effortLevel"].as_str().map(String::from))
+}
+
+/// settings 里 `env` 的值合进来，盖过进程环境（Claude Code 启动后把 settings 的 `env` 写进自己的环境，
+/// 2.1.325 实测 settings.json 的 `ANTHROPIC_BASE_URL` 盖过启动时给的）；项目的盖过用户的，本地的盖过项目的。
+/// 看看用 `--settings` 传的 `env` 更优先，用 [`overlay_env`] 再盖一层。
+pub fn merge_settings_env(ctx: &mut Ctx) {
+    for s in settings(ctx) {
+        if let Some(env) = s["env"].as_object() {
+            for (k, v) in env {
+                if let Some(v) = v.as_str() {
+                    ctx.env.insert(k.clone(), v.to_string());
+                }
+            }
+        }
+    }
+}
+
+/// `--settings` 里的 `env`（看看按账号加的，见 `claude_profiles::settings_env`）：优先级最高
+pub fn overlay_env(ctx: &mut Ctx, env: Option<&serde_json::Map<String, Value>>) {
+    for (k, v) in env.into_iter().flatten() {
+        if let Some(v) = v.as_str() {
+            ctx.env.insert(k.clone(), v.to_string());
+        }
+    }
+}
+
+/// 模型目录：优先当前登录的组织的那份，否则最近取的那份
+fn catalog(ctx: &Ctx, state: &Value) -> Option<Value> {
+    let dir = ctx.config_dir.join("cache").join("model-catalog");
+    let org = state["oauthAccount"]["organizationUuid"].as_str().unwrap_or("");
+    let mut best: Option<(bool, i64, Value)> = None;
+    for e in std::fs::read_dir(dir).ok()?.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        if !name.ends_with("-cc.json") {
+            continue;
+        }
+        let Some(v) = read_json(&e.path()) else { continue };
+        if !v["catalog"]["config"]["models"].is_array() {
+            continue;
+        }
+        let key = (!org.is_empty() && name.starts_with(org), v["fetchedAt"].as_i64().unwrap_or(0));
+        if best.as_ref().is_none_or(|(o, t, _)| key > (*o, *t)) {
+            best = Some((key.0, key.1, v));
+        }
+    }
+    best.map(|(_, _, v)| v["catalog"].clone())
+}
+
+/// Claude Code 缓存的公开模型目录（`cache/model-catalog/published-*.json`，不用登录也会取）里的模型，取最新的一份
+fn published_models(ctx: &Ctx) -> Option<Value> {
+    let dir = ctx.config_dir.join("cache").join("model-catalog");
+    let mut best: Option<(i64, Value)> = None;
+    for e in std::fs::read_dir(dir).ok()?.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        if !name.starts_with("published-") || name == "published-floor.json" || !name.ends_with(".json") {
+            continue;
+        }
+        let Some(v) = read_json(&e.path()) else { continue };
+        let cfg = &v["document"]["surfaces"]["cc"]["model_selector_config"];
+        let Some(models) = cfg.as_array().and_then(|a| a.iter().find(|c| c["id"] == "cc").or(a.first())).map(|c| c["models"].clone()).filter(Value::is_array) else { continue };
+        let at = v["fetchedAt"].as_i64().unwrap_or(0);
+        if best.as_ref().is_none_or(|(t, _)| at > *t) {
+            best = Some((at, models));
+        }
+    }
+    best.map(|(_, m)| m)
+}
+
+fn efforts_of(m: &Value) -> Vec<String> {
+    let opts = m["thinking"]["effort_options"].as_array().map(|a| a.iter().filter_map(|o| o["id"].as_str().map(String::from)).collect::<Vec<_>>()).unwrap_or_default();
+    if opts.is_empty() {
+        m["runtime"]["effort_levels"].as_array().map(|a| a.iter().filter_map(|o| o.as_str().map(String::from)).collect()).unwrap_or_default()
+    } else {
+        opts
+    }
+}
+
+/// 模型 ID 去掉日期和上下文后缀，用来比较（`claude-haiku-4-5-20251001[1m]` → `claude-haiku-4-5`）
+pub fn base_id(id: &str) -> String {
+    let s = id.trim().to_ascii_lowercase();
+    let s = s.split('[').next().unwrap_or("").to_string();
+    match s.rsplit_once('-') {
+        Some((head, tail)) if tail.len() == 8 && tail.chars().all(|c| c.is_ascii_digit()) => head.to_string(),
+        _ => s,
+    }
+}
+
+fn family_of(id: &str) -> Option<&'static str> {
+    let low = id.to_ascii_lowercase();
+    FAMILIES.into_iter().find(|f| low.contains(f))
+}
+
+/// Claude Code 的选项（不含服务商的）
+pub fn options(ctx: &Ctx) -> Vec<Opt> {
+    let state = read_json(&ctx.state_file).unwrap_or(Value::Null);
+    let mut out: Vec<Opt> = vec![];
+    let cat = catalog(ctx, &state);
+    let models: Vec<Value> = cat.as_ref().and_then(|c| c["config"]["models"].as_array().cloned()).unwrap_or_default();
+    let main: Vec<&Value> = models.iter().filter(|m| m["section"].as_str() != Some("overflow")).collect();
+    // 默认：组织指定的默认模型，否则目录里第一个常用模型
+    let default_model = state["orgModelDefaultCache"]["model"].as_str().map(String::from).or_else(|| main.first().and_then(|m| m["id"].as_str()).map(String::from)).unwrap_or_default();
+    let default_row = models.iter().find(|m| m["id"].as_str() == Some(&default_model));
+    out.push(Opt {
+        value: "default".into(),
+        label: "Default".into(),
+        description: default_row.and_then(|m| m["name"].as_str()).map(String::from).unwrap_or_default(),
+        section: "main",
+        model: default_model.clone(),
+        efforts: default_row.map(efforts_of).unwrap_or_default(),
+        default_effort: default_row.and_then(|m| m["runtime"]["default_effort"].as_str()).map(String::from),
+    });
+    for m in &models {
+        let Some(id) = m["id"].as_str() else { continue };
+        out.push(Opt {
+            value: id.to_string(),
+            label: m["name"].as_str().unwrap_or(id).to_string(),
+            description: m["description"].as_str().unwrap_or("").to_string(),
+            section: if m["section"].as_str() == Some("overflow") { "more" } else { "main" },
+            model: id.to_string(),
+            efforts: efforts_of(m),
+            default_effort: m["runtime"]["default_effort"].as_str().map(String::from),
+        });
+    }
+    if models.is_empty() {
+        // 没有目录：只给别名，名字和描述等环境变量或者回复来补
+        for f in FAMILIES {
+            out.push(Opt { value: f.into(), label: cap(f), description: String::new(), section: "main", model: String::new(), efforts: vec![], default_effort: None });
+        }
+    }
+    // 额外的选项（例如 1M 上下文的版本）
+    for o in state["additionalModelOptionsCache"].as_array().into_iter().flatten() {
+        let (Some(v), Some(l)) = (o["value"].as_str(), o["label"].as_str()) else { continue };
+        if o["disabled"].as_bool() == Some(true) || out.iter().any(|x| x.value == v) {
+            continue;
+        }
+        let like = models.iter().find(|m| m["id"].as_str().is_some_and(|id| base_id(id) == base_id(v)));
+        let label = if v.contains("[1m]") && !l.contains("1M") { format!("{l} · 1M") } else { l.to_string() };
+        out.push(Opt {
+            value: v.into(),
+            label,
+            description: o["description"].as_str().unwrap_or("").into(),
+            section: "main",
+            model: v.into(),
+            efforts: like.map(efforts_of).unwrap_or_default(),
+            default_effort: like.and_then(|m| m["runtime"]["default_effort"].as_str()).map(String::from),
+        });
+    }
+    // 别名被环境变量指到了别的模型：常用里这个家族换成别名那一项
+    for f in FAMILIES {
+        let up = f.to_ascii_uppercase();
+        let Some(target) = ctx.var(&format!("ANTHROPIC_DEFAULT_{up}_MODEL")) else { continue };
+        out.retain(|o| !(o.section == "main" && o.value != "default" && family_of(&o.value) == Some(f)));
+        let like = models.iter().find(|m| m["id"].as_str().is_some_and(|id| base_id(id) == base_id(&target)));
+        out.push(Opt {
+            value: f.into(),
+            label: ctx.var(&format!("ANTHROPIC_DEFAULT_{up}_MODEL_NAME")).unwrap_or_else(|| target.clone()),
+            description: ctx.var(&format!("ANTHROPIC_DEFAULT_{up}_MODEL_DESCRIPTION")).unwrap_or_default(),
+            section: "main",
+            model: target,
+            efforts: like.map(efforts_of).unwrap_or_default(),
+            default_effort: None,
+        });
+    }
+    if let Some(id) = ctx.var("ANTHROPIC_CUSTOM_MODEL_OPTION") {
+        if !out.iter().any(|o| o.value == id) {
+            out.push(Opt {
+                label: ctx.var("ANTHROPIC_CUSTOM_MODEL_OPTION_NAME").unwrap_or_else(|| id.clone()),
+                description: ctx.var("ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION").unwrap_or_default(),
+                value: id.clone(),
+                section: "main",
+                model: id,
+                efforts: vec![],
+                default_effort: None,
+            });
+        }
+    }
+    // 管理员或用户限定的名单：别名、家族、完整 ID 都可能出现在里面
+    let allow: Option<Vec<String>> = settings(ctx).iter().rev().find_map(|s| s["availableModels"].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_ascii_lowercase())).collect()));
+    if let Some(allow) = allow {
+        out.retain(|o| {
+            o.value == "default"
+                || allow.iter().any(|a| *a == o.value.to_ascii_lowercase() || (!o.model.is_empty() && base_id(a) == base_id(&o.model)) || (FAMILIES.contains(&a.as_str()) && family_of(&o.value).or(family_of(&o.model)) == Some(a.as_str())))
+        });
+    }
+    // 常用的排前面（目录里的顺序就是 /model 里的顺序）
+    out.sort_by_key(|o| match o.section {
+        "main" => 0,
+        "more" => 1,
+        _ => 2,
+    });
+    out
+}
+
+/// 上下文窗口从哪来（界面上不是 Claude Code 自己报的就标“约”）
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WindowSource {
+    /// Claude Code / Codex 自己报的（对话模式每轮的 `result.modelUsage.contextWindow`、Codex 的 `token_count`）
+    Reported,
+    /// `CLAUDE_CODE_MAX_CONTEXT_TOKENS`、Codex 的 `model_context_window`（看看的模型设置或用户自己的配置）
+    Setting,
+    /// 模型目录（账号的、公开的；Codex 的 models_cache.json）
+    Catalog,
+    /// 模型名带 `[1m]`
+    OneM,
+    /// 什么都查不到：照 Claude Code 自己的默认（认得出的模型 20 万，认不出的 100 万）
+    Assumed,
+}
+
+/// 上下文窗口（模型本身能装多少），照 Claude Code 2.1.325 的算法（`B1`/`TC`）：
+/// 1. 关了压缩（`DISABLE_COMPACT`）又设了 `CLAUDE_CODE_MAX_CONTEXT_TOKENS`：就是它；
+/// 2. 模型名带 `[1m]`（没设 `CLAUDE_CODE_DISABLE_1M_CONTEXT`）：至少 100 万；
+/// 3. 模型目录（账号的，没有就公开的）里有：它的输入上限，`CLAUDE_CODE_DISABLE_1M_CONTEXT` 时最多 20 万；
+/// 4. 认得出的 Claude 模型（`claude-…`、别名）：20 万；
+/// 5. 认不出的（第三方接口的模型名）：`CLAUDE_CODE_MAX_CONTEXT_TOKENS`，没设时 100 万（关 1M 时 20 万）。
+///    所以这个变量只对认不出的模型有用，Claude 模型设了也不管。
+///
+/// `ctx.env` 要是 Claude Code 实际的环境（进程环境 < settings 的 env < `--settings` 的 env，见 [`merge_settings_env`]）。
+/// 对话模式下 Claude Code 自己报的优先（见 `SdkSt::windows`）。settings 里的 `autoCompactWindow` 不是窗口，是压缩点，见 [`compact`]。
+pub fn window(ctx: &Ctx, model: &str) -> (u64, WindowSource) {
+    let base = base_id(model);
+    let no_1m = truthy(ctx.var("CLAUDE_CODE_DISABLE_1M_CONTEXT"));
+    let set = ctx.var("CLAUDE_CODE_MAX_CONTEXT_TOKENS").and_then(|v| v.trim().parse::<u64>().ok()).filter(|&w| w > 0);
+    if let Some(w) = set.filter(|_| truthy(ctx.var("DISABLE_COMPACT"))) {
+        return (w, WindowSource::Setting);
+    }
+    let state = read_json(&ctx.state_file).unwrap_or(Value::Null);
+    let find = |models: &Value| models.as_array()?.iter().find(|m| m["id"].as_str().is_some_and(|id| base_id(id) == base)).and_then(|m| m["runtime"]["max_input_tokens"].as_u64());
+    // 账号的模型目录；没有（第三方接口不登录账号）时用 Claude Code 缓存的公开目录
+    let from_catalog = catalog(ctx, &state).and_then(|c| find(&c["config"]["models"])).or_else(|| published_models(ctx).and_then(|m| find(&m)));
+    if model.to_ascii_lowercase().contains("[1m]") && !no_1m {
+        return (from_catalog.unwrap_or(0).max(1_000_000), WindowSource::OneM);
+    }
+    if let Some(w) = from_catalog {
+        return (if no_1m { w.min(200_000) } else { w }, WindowSource::Catalog);
+    }
+    if known_model(model) {
+        return match builtin_window(&base) {
+            Some(w) => (if no_1m { w.min(200_000) } else { w }, WindowSource::Catalog),
+            None => (200_000, WindowSource::Assumed),
+        };
+    }
+    match set {
+        Some(w) => (w, WindowSource::Setting),
+        None => (if no_1m { 200_000 } else { 1_000_000 }, WindowSource::Assumed),
+    }
+}
+
+#[cfg(test)]
+pub fn context_window(ctx: &Ctx, model: &str) -> u64 {
+    window(ctx, model).0
+}
+
+/// Claude Code 自带的模型表（2.1.325 的 `context.window`）：没有模型目录缓存时（第三方接口第一次用）它照这个算。
+/// 5 代起（含 haiku-5-5、fable、mythos）和 opus-4-7 / 4-8 原生 100 万，更早的 20 万
+fn builtin_window(base: &str) -> Option<u64> {
+    let b = base.rsplit('/').next().unwrap_or(base);
+    let b = b.strip_prefix("anthropic.").unwrap_or(b);
+    let rest = b.strip_prefix("claude-")?;
+    let (family, ver) = rest.split_once('-')?;
+    let nums: Vec<u32> = ver.split('-').map_while(|x| x.parse().ok()).collect();
+    let major = *nums.first()?;
+    let minor = nums.get(1).copied().unwrap_or(0);
+    if !matches!(family, "opus" | "sonnet" | "haiku" | "fable" | "mythos") {
+        return Some(200_000);
+    }
+    Some(if major >= 5 || (family == "opus" && major == 4 && minor >= 7) { 1_000_000 } else { 200_000 })
+}
+
+/// Claude Code 认得出的模型：`claude-…`、别名
+fn known_model(model: &str) -> bool {
+    let b = base_id(model).to_ascii_lowercase();
+    let b = b.rsplit('/').next().unwrap_or(&b).to_string();
+    b.starts_with("claude-") || b.starts_with("anthropic.claude") || b == "default" || b == "best" || b.starts_with("opusplan") || FAMILIES.iter().any(|f| b == *f)
+}
+
+/// 用量里显示的模型：回复里的模型 ID 不带 `[1m]`，选的是带 `[1m]` 的（`opus[1m]`、`claude-sonnet-4-5[1m]`）时补上，窗口才算得对
+pub fn with_1m(actual: &str, selected: Option<&str>) -> String {
+    let one_m = selected.is_some_and(|s| s.to_ascii_lowercase().contains("[1m]"));
+    if one_m && !actual.to_ascii_lowercase().contains("[1m]") {
+        format!("{actual}[1m]")
+    } else {
+        actual.to_string()
+    }
+}
+
+fn truthy(v: Option<String>) -> bool {
+    v.is_some_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+}
+
+/// “400k”“1M”“400000”→ token 数（Claude Code 的 `/autocompact`、`CLAUDE_CODE_AUTO_COMPACT_WINDOW` 都认 k/M 后缀）
+fn token_count(s: &str) -> Option<u64> {
+    let s = s.trim().to_ascii_lowercase().replace(['_', ','], "");
+    let (num, mul) = match s.chars().last()? {
+        'k' => (&s[..s.len() - 1], 1_000.0),
+        'm' => (&s[..s.len() - 1], 1_000_000.0),
+        _ => (s.as_str(), 1.0),
+    };
+    let n: f64 = num.parse().ok()?;
+    (n > 0.0).then(|| (n * mul).round() as u64)
+}
+
+/// 自动压缩、闲时压缩：Claude Code 照什么设置来（官方 model-config「Set the auto-compact window」、settings-reference 的
+/// `autoCompactEnabled` / `autoCompactWindow` / `modelSettings` / `idleCompaction`）
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Compact {
+    /// 自动压缩开着（`DISABLE_AUTO_COMPACT` / `DISABLE_COMPACT` 或 `autoCompactEnabled: false` 都会关）
+    pub enabled: bool,
+    /// 自己设的压缩点（token，已按窗口封顶）；`None` = 没设，Claude Code 按模型自己定（接近窗口时压缩）
+    pub at: Option<u64>,
+    /// 压缩点从哪来：`env`（启动环境 `CLAUDE_CODE_AUTO_COMPACT_WINDOW`）或设置文件的路径
+    pub source: Option<String>,
+    /// 来源是 `modelSettings` 里给这个模型单独设的（`/autocompact` 存在这里）
+    pub per_model: bool,
+    /// 闲时压缩开着：只在交互式的终端里会发生（对话模式是非交互的 stream-json，不会），闲置约 1 小时、上下文超过 `idle_min` 时
+    pub idle: bool,
+    /// 闲时压缩的门槛：`CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS`，默认 20 万，最少 10 万
+    pub idle_min: u64,
+}
+
+/// 设置文件从高到低（本项目个人的、本项目共享的、用户的），带上显示用的路径（家目录写成 ~）
+fn settings_ranked(ctx: &Ctx) -> Vec<(String, Value)> {
+    let proj = ctx.workdir.join(".claude");
+    let home = home();
+    [proj.join("settings.local.json"), proj.join("settings.json"), ctx.config_dir.join("settings.json")]
+        .into_iter()
+        .filter_map(|p| {
+            let v = read_json(&p)?;
+            let shown = p.strip_prefix(&home).map(|r| format!("~/{}", r.display())).unwrap_or_else(|_| p.display().to_string());
+            Some((shown, v))
+        })
+        .collect()
+}
+
+/// 这个模型的自动压缩设置。`window`：模型的上下文窗口（压缩点封顶用）；`model` 为空时只看所有模型共用的设置
+pub fn compact(ctx: &Ctx, model: &str, window: u64) -> Compact {
+    let ranked = settings_ranked(ctx);
+    let base = base_id(model);
+    let off_env = truthy(ctx.var("DISABLE_AUTO_COMPACT")) || truthy(ctx.var("DISABLE_COMPACT"));
+    let off_file = ranked.iter().find_map(|(_, s)| s["autoCompactEnabled"].as_bool()) == Some(false);
+    let enabled = !off_env && !off_file;
+    let idle_min = ctx.var("CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS").and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(200_000).max(100_000);
+    let idle = enabled && ranked.iter().find_map(|(_, s)| s["idleCompaction"].as_bool()) != Some(false);
+    // 环境变量最优先（看不懂的值 Claude Code 不理，照下面的设置）；10 万以下按 10 万、100 万以上按 100 万
+    let from_env = ctx.var("CLAUDE_CODE_AUTO_COMPACT_WINDOW").and_then(|v| token_count(&v)).map(|n| n.clamp(100_000, 1_000_000));
+    let (mut at, mut source, mut per_model) = (from_env, from_env.map(|_| "env".to_string()), false);
+    if at.is_none() {
+        // 设置文件从高到低，第一份设了的说了算；同一份里给这个模型单独设的优先于共用的。"auto" = 交给 Claude Code
+        let value = |v: &Value| match v {
+            Value::Number(n) => n.as_u64().map(Some),
+            Value::String(s) if s.trim().eq_ignore_ascii_case("auto") => Some(None),
+            Value::String(s) => token_count(s).map(Some),
+            _ => None,
+        };
+        for (path, s) in &ranked {
+            let mine = (!base.is_empty())
+                .then(|| s["modelSettings"].as_object().and_then(|m| m.iter().find(|(k, _)| base_id(k) == base)).and_then(|(_, v)| value(&v["autoCompactWindow"])))
+                .flatten();
+            let found = mine.map(|v| (v, true)).or_else(|| value(&s["autoCompactWindow"]).map(|v| (v, false)));
+            if let Some((v, m)) = found {
+                at = v.map(|n| n.clamp(100_000, 1_000_000));
+                source = Some(path.clone());
+                per_model = m;
+                break;
+            }
+        }
+    }
+    Compact { enabled, at: at.map(|n| n.min(window)), source: at.and(source), per_model, idle, idle_min }
+}
+
+/// 用户自己的配置文件里和上下文、压缩有关的设置（“模型设置”里各项不填时 Claude Code 照的就是这些）。
+/// 只看设置文件和它们的 `env`、看看自己的启动环境，不含看看按“模型设置”加的环境变量。
+pub fn user_tuning(ctx: &Ctx) -> Value {
+    let all = compact(ctx, "", 1_000_000);
+    let mut per_model: Vec<Value> = vec![];
+    for (_, s) in settings_ranked(ctx) {
+        for k in s["modelSettings"].as_object().map(|m| m.keys().cloned().collect::<Vec<_>>()).unwrap_or_default() {
+            let base = base_id(&k);
+            if per_model.iter().any(|v| v["model"] == base.as_str()) {
+                continue;
+            }
+            let c = compact(ctx, &base, 1_000_000);
+            if c.per_model {
+                per_model.push(serde_json::json!({ "model": base, "at": c.at, "source": c.source }));
+            }
+        }
+    }
+    let num = |k: &str| ctx.var(k).and_then(|v| token_count(&v));
+    serde_json::json!({
+        "compact": all,
+        "compact_models": per_model,
+        "no_1m": truthy(ctx.var("CLAUDE_CODE_DISABLE_1M_CONTEXT")),
+        "context_window": num("CLAUDE_CODE_MAX_CONTEXT_TOKENS"),
+        "max_output": num("CLAUDE_CODE_MAX_OUTPUT_TOKENS"),
+        "model": settings_ranked(ctx).iter().find_map(|(_, s)| s["model"].as_str().map(String::from)),
+    })
+}
+
+/// 订阅的用量（5 小时、7 天）：Claude Code 自己缓存在 `.claude.json` 里的（只认当前登录的账号的），
+/// 和最近一次 [`refresh_limits`] 时它报出来的，哪个新用哪个（`.claude.json` 写不进去时，比如 Docker 里被挂成了目录，就只有后者）。
+/// 不拿 `.credentials.json` 里的令牌去问 Anthropic：Anthropic 不允许第三方应用使用 claude.ai 的凭据（docs/CLAUDE_ACCOUNTS.md）。
+pub fn limits(ctx: &Ctx) -> Value {
+    let state = read_json(&ctx.state_file).unwrap_or(Value::Null);
+    let c = &state["cachedUsageUtilization"];
+    let cached = (!c["accountUuid"].is_null() && c["accountUuid"] == state["oauthAccount"]["accountUuid"]).then(|| {
+        let u = &c["utilization"];
+        let win = |k: &str| (u[k]["utilization"].clone(), u[k]["resets_at"].clone());
+        (c["fetchedAtMs"].as_i64().unwrap_or(0), win("five_hour"), win("seven_day"), u["extra_usage"].clone())
+    });
+    let reported = REPORTED.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|m| m.get(&ctx.config_dir).cloned());
+    let Some((fetched, five, seven, extra)) = cached.into_iter().chain(reported).max_by_key(|r| r.0) else { return Value::Null };
+    // 可能是几天前取的：已经过了重置时间的窗口不再显示（数字早就不对了）
+    let now = time::OffsetDateTime::now_utc();
+    let pick = |(used, resets_at): Window| {
+        let expired = resets_at.as_str().and_then(|s| time::OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339).ok()).is_some_and(|t| t <= now);
+        if used.is_number() && !expired {
+            serde_json::json!({ "used": used, "resets_at": resets_at })
+        } else {
+            Value::Null
+        }
+    };
+    serde_json::json!({ "five_hour": pick(five), "seven_day": pick(seven), "extra": extra_usage(&extra), "fetched_at": fetched })
+}
+
+/// 额外用量（Extra usage，Claude Code 里叫 usage credits）：订阅额度用完后按量付费，按月封顶。
+/// 接口里的金额是货币的最小单位（美元是美分），这里换成元：`{ enabled, used, limit, percent, currency }`，
+/// `limit` 为空是没设上限。账号没有这项（API、旧版 Claude Code）时 null
+fn extra_usage(e: &Value) -> Value {
+    let Some(enabled) = e["is_enabled"].as_bool() else { return Value::Null };
+    let scale = 10f64.powi(e["decimal_places"].as_i64().unwrap_or(2).clamp(0, 6) as i32);
+    let amount = |v: &Value| v.as_f64().map(|x| x / scale);
+    serde_json::json!({
+        "enabled": enabled,
+        "used": amount(&e["used_credits"]),
+        "limit": amount(&e["monthly_limit"]),
+        "percent": e["utilization"],
+        "currency": e["currency"].as_str().filter(|c| !c.is_empty()).map(str::to_uppercase).unwrap_or_else(|| "USD".into()),
+    })
+}
+
+/// 订阅账号（claude.ai 登录）的邮箱和组织：`.claude.json` 里的 `oauthAccount`；没登录、用 API 时没有
+pub fn account(ctx: &Ctx) -> Value {
+    let state = read_json(&ctx.state_file).unwrap_or(Value::Null);
+    let a = &state["oauthAccount"];
+    match a["emailAddress"].as_str() {
+        Some(email) if !email.is_empty() => serde_json::json!({ "email": email, "org": a["organizationName"] }),
+        _ => Value::Null,
+    }
+}
+
+/// 一个窗口：用了百分之几、什么时候重置
+type Window = (Value, Value);
+
+/// [`refresh_limits`] 时 Claude Code 报出来的用量，按配置目录：（取到的时间，5 小时，7 天，额外用量原样）
+static REPORTED: Mutex<Option<HashMap<PathBuf, Reported>>> = Mutex::new(None);
+type Reported = (i64, Window, Window, Value);
+
+/// 用量缓存多旧就请 Claude Code 重新取
+pub const LIMITS_STALE_MS: i64 = 2 * 60 * 1000;
+
+/// 请 Claude Code 自己去取用量：`claude -p /usage`（本地命令，不调用模型、不消耗额度）。它会写进这个配置目录的
+/// `.claude.json`，stream-json 输出里也有一份（`usage_report`），记下来，之后 [`limits`] 就能读到。
+/// 不留对话记录、不启动 MCP 服务器；在 `cwd`（一个空目录）里运行。
+/// 每个配置目录两分钟最多一次，同时只跑一个。`account_dir` 为 None 时是本机默认账号（不改 `CLAUDE_CONFIG_DIR`）。
+pub async fn refresh_limits(shell: &str, config_dir: &Path, account_dir: Option<&Path>, cwd: &Path) {
+    static LAST: Mutex<Option<HashMap<PathBuf, Instant>>> = Mutex::new(None);
+    {
+        let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+        let m = last.get_or_insert_with(HashMap::new);
+        if m.get(config_dir).is_some_and(|t| t.elapsed() < Duration::from_millis(LIMITS_STALE_MS as u64)) {
+            return;
+        }
+        m.insert(config_dir.to_path_buf(), Instant::now());
+    }
+    let _ = fetch_limits(shell, config_dir, account_dir, cwd).await;
+}
+
+/// 跑一次 `claude -p /usage`（不限频率），取到的记下来。`Ok(true)` 取到了；`Ok(false)` 跑完了但输出里没有用量
+/// （没登录或登录失效、用的是 API Key、旧版 Claude Code 没有 `usage_report`）；`Err` 没装 Claude Code、超时或出错。
+pub async fn fetch_limits(shell: &str, config_dir: &Path, account_dir: Option<&Path>, cwd: &Path) -> Result<bool, ()> {
+    let Some(cli) = crate::agents::claude_cli(shell).await else { return Err(()) };
+    let _ = std::fs::create_dir_all(cwd);
+    let env: Vec<(&str, Option<&std::ffi::OsStr>)> = account_dir.map(|d| ("CLAUDE_CONFIG_DIR", Some(d.as_os_str()))).into_iter().collect();
+    let args = ["-p", "/usage", "--no-session-persistence", "--strict-mcp-config", "--output-format", "stream-json", "--verbose"];
+    let mut cmd = crate::agents::cli_command(shell, &cli, &args, &env);
+    cmd.current_dir(cwd).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null()).kill_on_drop(true);
+    match tokio::time::timeout(Duration::from_secs(30), cmd.output()).await {
+        Ok(Ok(out)) if out.status.success() => match parse_usage_report(&String::from_utf8_lossy(&out.stdout)) {
+            Some((five, seven, extra)) => {
+                REPORTED.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).insert(config_dir.to_path_buf(), (crate::util::system_ms(), five, seven, extra));
+                Ok(true)
+            }
+            None => {
+                tracing::debug!("claude -p /usage 的输出里没有用量（没登录、登录失效，或旧版 Claude Code 没有 usage_report），只能读 .claude.json");
+                Ok(false)
+            }
+        },
+        r => {
+            tracing::debug!(result = ?r.map(|o| o.map(|o| o.status)), "claude -p /usage 没有成功");
+            Err(())
+        }
+    }
+}
+
+/// `claude -p /usage --output-format stream-json` 输出里的 `usage_report.rate_limits.limits`：
+/// `session` 是 5 小时的，`weekly_all` 是 7 天的（按 `kind` 认，不看显示的文字），还有额外用量（`extra_usage`，原样）。
+/// 一个窗口都没有时 None。
+fn parse_usage_report(out: &str) -> Option<(Window, Window, Value)> {
+    let rl = out.lines().filter_map(|l| serde_json::from_str::<Value>(l).ok()).find_map(|v| v["usage_report"]["rate_limits"]["limits"].is_array().then(|| v["usage_report"]["rate_limits"].clone()))?;
+    let limits = rl["limits"].as_array()?;
+    let win = |kind: &str| limits.iter().find(|l| l["kind"] == kind).map(|l| (l["percent"].clone(), l["resets_at"].clone())).unwrap_or_default();
+    let (five, seven) = (win("session"), win("weekly_all"));
+    (five.0.is_number() || seven.0.is_number()).then(|| (five, seven, rl["extra_usage"].clone()))
+}
+
+/// 权限规则（各 settings 文件里的，按来源）和 MCP 服务器（`~/.claude.json` 的用户级、这个项目的，以及项目的 `.mcp.json`）
+pub fn config(ctx: &Ctx) -> Value {
+    let proj = ctx.workdir.join(".claude");
+    let mut rules = vec![];
+    for (src, p) in [("user", ctx.config_dir.join("settings.json")), ("project", proj.join("settings.json")), ("local", proj.join("settings.local.json"))] {
+        let Some(s) = read_json(&p) else { continue };
+        for kind in ["allow", "ask", "deny"] {
+            for r in s["permissions"][kind].as_array().into_iter().flatten().filter_map(Value::as_str) {
+                rules.push(serde_json::json!({ "kind": kind, "rule": r, "source": src }));
+            }
+        }
+    }
+    let state = read_json(&ctx.state_file).unwrap_or(Value::Null);
+    let mut mcp = vec![];
+    let mut add = |servers: &Value, src: &str| {
+        for (name, v) in servers.as_object().into_iter().flatten() {
+            let kind = v["type"].as_str().unwrap_or(if v["url"].is_string() { "http" } else { "stdio" });
+            mcp.push(serde_json::json!({ "name": name, "type": kind, "source": src }));
+        }
+    };
+    add(&state["mcpServers"], "user");
+    let wd = ctx.workdir.to_string_lossy();
+    add(&state["projects"][wd.as_ref()]["mcpServers"], "local");
+    if let Some(m) = read_json(&ctx.workdir.join(".mcp.json")) {
+        add(&m["mcpServers"], "project");
+    }
+    // 额外允许读写的目录（/add-dir 存下来的样子）：permissions.additionalDirectories
+    let mut dirs = vec![];
+    for (src, p) in [("user", ctx.config_dir.join("settings.json")), ("project", proj.join("settings.json")), ("local", proj.join("settings.local.json"))] {
+        for d in read_json(&p).into_iter().flat_map(|s| s["permissions"]["additionalDirectories"].as_array().cloned().unwrap_or_default()) {
+            if let Some(d) = d.as_str() {
+                dirs.push(serde_json::json!({ "path": d, "source": src }));
+            }
+        }
+    }
+    // 记忆文件（/memory 列的那几份）：用户级、项目根的 CLAUDE.md 总是列出（没有的 `exists: false`，可以新建，跟 TUI 的 /memory
+    // 选了没有的文件会新建一样）；`.claude/CLAUDE.md`、`CLAUDE.local.md` 有的才列
+    let memory: Vec<Value> = [
+        ("user", ctx.config_dir.join("CLAUDE.md"), true),
+        ("project", ctx.workdir.join("CLAUDE.md"), true),
+        ("project", proj.join("CLAUDE.md"), false),
+        ("local", ctx.workdir.join("CLAUDE.local.md"), false),
+    ]
+    .into_iter()
+    .filter(|(_, p, always)| *always || p.is_file())
+    .map(|(src, p, _)| serde_json::json!({ "path": p.to_string_lossy(), "source": src, "exists": p.is_file() }))
+    .collect();
+    serde_json::json!({ "rules": rules, "mcp": mcp, "dirs": dirs, "memory": memory })
+}
+
+/// 改一条权限规则 / 额外目录：`list` 是 permissions 下的 allow、ask、deny 或 additionalDirectories，`add` 加上、否则删掉。
+/// 写哪个文件按 `source`（user = 配置目录的 settings.json，project / local = 项目 `.claude/` 的）。文件里别的设置原样留着，
+/// Claude Code 自己盯着这些文件，改了马上生效（和终端里 /permissions、/add-dir 存下来一样）
+pub fn edit_permission(ctx: &Ctx, source: &str, list: &str, value: &str, add: bool) -> Result<(), crate::error::LocalError> {
+    use crate::error::LocalError;
+    if !matches!(list, "allow" | "ask" | "deny" | "additionalDirectories") {
+        return Err(LocalError::invalid("list", "invalid"));
+    }
+    let value = value.trim();
+    if value.is_empty() || value.len() > 4096 {
+        return Err(LocalError::invalid("value", "invalid"));
+    }
+    edit_settings(ctx, source, |s| {
+        if !s["permissions"].is_object() {
+            s["permissions"] = serde_json::json!({});
+        }
+        if !s["permissions"][list].is_array() {
+            s["permissions"][list] = serde_json::json!([]);
+        }
+        let arr = s["permissions"][list].as_array_mut().expect("array");
+        if add {
+            if !arr.iter().any(|v| v.as_str() == Some(value)) {
+                arr.push(Value::String(value.to_string()));
+            }
+        } else {
+            arr.retain(|v| v.as_str() != Some(value));
+        }
+    })
+}
+
+/// 加 / 删一个命令 hook：`hooks.<事件>` 里 matcher 相同的那组，加一条 `{type: command, command}`；删的时候删掉这条，组空了连组删
+pub fn edit_hook(ctx: &Ctx, source: &str, event: &str, matcher: &str, command: &str, add: bool) -> Result<(), crate::error::LocalError> {
+    use crate::error::LocalError;
+    if event.is_empty() || event.len() > 64 || !event.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return Err(LocalError::invalid("event", "invalid"));
+    }
+    let command = command.trim();
+    if command.is_empty() || command.len() > 4096 || matcher.len() > 512 {
+        return Err(LocalError::invalid("command", "invalid"));
+    }
+    edit_settings(ctx, source, |s| {
+        if !s["hooks"].is_object() {
+            s["hooks"] = serde_json::json!({});
+        }
+        if !s["hooks"][event].is_array() {
+            s["hooks"][event] = serde_json::json!([]);
+        }
+        let groups = s["hooks"][event].as_array_mut().expect("array");
+        let same = |g: &Value| g["matcher"].as_str().unwrap_or("") == matcher;
+        if add {
+            match groups.iter_mut().find(|g| same(g)) {
+                Some(g) => {
+                    if !g["hooks"].is_array() {
+                        g["hooks"] = serde_json::json!([]);
+                    }
+                    let list = g["hooks"].as_array_mut().expect("array");
+                    if !list.iter().any(|h| h["command"].as_str() == Some(command)) {
+                        list.push(serde_json::json!({ "type": "command", "command": command }));
+                    }
+                }
+                None => {
+                    let mut g = serde_json::json!({ "hooks": [{ "type": "command", "command": command }] });
+                    if !matcher.is_empty() {
+                        g["matcher"] = serde_json::json!(matcher);
+                    }
+                    groups.push(g);
+                }
+            }
+        } else {
+            for g in groups.iter_mut().filter(|g| same(g)) {
+                if let Some(list) = g["hooks"].as_array_mut() {
+                    list.retain(|h| h["command"].as_str() != Some(command));
+                }
+            }
+            groups.retain(|g| g["hooks"].as_array().is_some_and(|l| !l.is_empty()));
+        }
+        if s["hooks"][event].as_array().is_some_and(Vec::is_empty) {
+            if let Some(m) = s["hooks"].as_object_mut() {
+                m.remove(event);
+            }
+        }
+    })
+}
+
+/// 新建记忆文件（/memory 里选了还没有的）：user = 配置目录的 CLAUDE.md，project = 项目根的 CLAUDE.md。已经有了就不动它，
+/// 返回路径（界面接着在文件查看器里打开编辑）
+pub fn create_memory(ctx: &Ctx, source: &str) -> Result<PathBuf, crate::error::LocalError> {
+    let path = match source {
+        "user" => ctx.config_dir.join("CLAUDE.md"),
+        "project" => ctx.workdir.join("CLAUDE.md"),
+        _ => return Err(crate::error::LocalError::invalid("source", "invalid")),
+    };
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(e.into()),
+    }
+    Ok(path)
+}
+
+/// 改一个 settings 文件（user = 配置目录的 settings.json，project / local = 项目 `.claude/` 的）：读出来交给 `f` 改，
+/// 别的设置原样留着，原子写回。文件不是合法 JSON 时不动它
+pub fn edit_settings(ctx: &Ctx, source: &str, f: impl FnOnce(&mut Value)) -> Result<(), crate::error::LocalError> {
+    use crate::error::LocalError;
+    let path = match source {
+        "user" => ctx.config_dir.join("settings.json"),
+        "project" => ctx.workdir.join(".claude").join("settings.json"),
+        "local" => ctx.workdir.join(".claude").join("settings.local.json"),
+        _ => return Err(LocalError::invalid("source", "invalid")),
+    };
+    let mut s = match std::fs::read(&path) {
+        Ok(raw) => serde_json::from_slice::<Value>(&raw).map_err(|_| LocalError::invalid("source", "unreadable"))?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
+        Err(e) => return Err(e.into()),
+    };
+    if !s.is_object() {
+        return Err(LocalError::invalid("source", "unreadable"));
+    }
+    f(&mut s);
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let mut out = serde_json::to_vec_pretty(&s).map_err(|e| LocalError::from(anyhow::Error::from(e)))?;
+    out.push(b'\n');
+    Ok(crate::agents::write_atomic(&path, &out)?)
+}
+
+fn cap(s: &str) -> String {
+    let mut c = s.chars();
+    c.next().map(|f| f.to_uppercase().collect::<String>() + c.as_str()).unwrap_or_default()
+}
+
+// ---------------- 第三方接口的模型列表 ----------------
+
+static PROVIDER_CACHE: Mutex<Option<(String, Instant, Vec<String>)>> = Mutex::new(None);
+
+/// 服务商的模型列表里的模型 ID（缓存 10 分钟；取不到时为空，不报错）。`url` 是列表的完整地址：
+/// Anthropic 格式是 `{接口地址}/v1/models`，OpenAI 格式（Codex）是 `{接口地址}/models`；两种格式的返回都是 `data[].id`。
+pub async fn provider_models(url: &str, token: &str) -> Vec<String> {
+    let key = url.to_string();
+    if let Some((k, at, list)) = PROVIDER_CACHE.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+        if *k == key && at.elapsed() < PROVIDER_TTL {
+            return list.clone();
+        }
+    }
+    let list = fetch_models(&key, token).await.unwrap_or_default();
+    *PROVIDER_CACHE.lock().unwrap_or_else(|e| e.into_inner()) = Some((key, Instant::now(), list.clone()));
+    list
+}
+
+async fn fetch_models(url: &str, token: &str) -> Option<Vec<String>> {
+    let c = reqwest::Client::builder().timeout(Duration::from_secs(6)).redirect(reqwest::redirect::Policy::none()).build().ok()?;
+    let r = c
+        .get(url)
+        .header("x-api-key", token)
+        .bearer_auth(token)
+        .header("anthropic-version", "2023-06-01")
+        .send()
+        .await
+        .ok()?;
+    if !r.status().is_success() {
+        tracing::debug!(status = %r.status(), "服务商 /v1/models 取不到");
+        return None;
+    }
+    let v: Value = r.json().await.ok()?;
+    let mut ids: Vec<String> = v["data"].as_array()?.iter().filter_map(|m| m["id"].as_str()).filter(|s| !s.is_empty() && s.len() <= 64).map(String::from).collect();
+    ids.dedup();
+    ids.truncate(200);
+    Some(ids)
+}
+
+/// 服务商的模型里 Claude Code 选项还没有的，作为“服务商的其他模型”
+pub fn provider_options(have: &[Opt], ids: &[String]) -> Vec<Opt> {
+    ids.iter()
+        .filter(|id| id.chars().all(|c| c.is_ascii_alphanumeric() || "._-[]/:".contains(c)))
+        .filter(|id| !have.iter().any(|o| o.value == **id || (!o.model.is_empty() && base_id(&o.model) == base_id(id))))
+        .map(|id| Opt { value: id.clone(), label: id.clone(), description: String::new(), section: "provider", model: id.clone(), efforts: vec![], default_effort: None })
+        .collect()
+}
+
+// ---------------- claude 进程的环境变量 ----------------
+
+/// 面板里的 shell（`pane_pid`）下面的 claude 进程的环境变量。只有 Linux 能直接读，别的系统返回空。
+pub fn claude_env(pane_pid: u32) -> HashMap<String, String> {
+    #[cfg(target_os = "linux")]
+    {
+        let Some(pid) = find_claude(pane_pid) else { return HashMap::new() };
+        let Ok(raw) = std::fs::read(format!("/proc/{pid}/environ")) else { return HashMap::new() };
+        raw.split(|b| *b == 0)
+            .filter_map(|kv| {
+                let s = String::from_utf8_lossy(kv);
+                let (k, v) = s.split_once('=')?;
+                (k.starts_with("ANTHROPIC_") || k.starts_with("CLAUDE_") || matches!(k, "DISABLE_AUTO_COMPACT" | "DISABLE_COMPACT"))
+                    .then(|| (k.to_string(), v.to_string()))
+            })
+            .collect()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pane_pid;
+        HashMap::new()
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn find_claude(root: u32) -> Option<u32> {
+    // 父进程 → 子进程
+    let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
+    for e in std::fs::read_dir("/proc").ok()?.flatten() {
+        let Some(pid) = e.file_name().to_str().and_then(|s| s.parse::<u32>().ok()) else { continue };
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else { continue };
+        // `pid (comm) state ppid …`：comm 里可能有空格和括号，从最后一个 ')' 后面取
+        let Some(ppid) = stat.rsplit_once(')').and_then(|(_, rest)| rest.split_whitespace().nth(1)).and_then(|s| s.parse::<u32>().ok()) else { continue };
+        children.entry(ppid).or_default().push(pid);
+    }
+    let mut queue = vec![(root, 0)];
+    while let Some((pid, depth)) = queue.pop() {
+        let cmd = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
+        let argv0 = cmd.split(|b| *b == 0).next().map(|a| String::from_utf8_lossy(a).into_owned()).unwrap_or_default();
+        let name = argv0.rsplit('/').next().unwrap_or("");
+        if pid != root && (name == "claude" || std::fs::read_link(format!("/proc/{pid}/exe")).is_ok_and(|p| p.to_string_lossy().contains("/claude/versions/"))) {
+            return Some(pid);
+        }
+        if depth < 3 {
+            queue.extend(children.get(&pid).into_iter().flatten().map(|c| (*c, depth + 1)));
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn write(p: &Path, v: &Value) {
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, v.to_string()).unwrap();
+    }
+
+    fn model(id: &str, name: &str, section: &str, efforts: &[&str]) -> Value {
+        json!({ "id": id, "name": name, "description": format!("{name} desc"), "section": section,
+            "thinking": { "type": "effort", "effort_options": efforts.iter().map(|e| json!({ "id": e })).collect::<Vec<_>>() },
+            "runtime": { "default_effort": "medium" } })
+    }
+
+    #[test]
+    fn state_file_follows_claude() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (dir, main) = (tmp.path(), tmp.path().join(".claude.json"));
+        let legacy = dir.join(".config.json");
+        // 平常：.claude.json；空的旧文件在 .claude.json 已经有时不算
+        assert_eq!(state_in(dir, main.clone()), main);
+        std::fs::write(&main, "{}").unwrap();
+        std::fs::write(&legacy, "").unwrap();
+        assert_eq!(state_in(dir, main.clone()), main);
+        // 旧文件有内容：Claude Code 用它
+        std::fs::write(&legacy, "{}").unwrap();
+        assert_eq!(state_in(dir, main.clone()), legacy);
+        // .claude.json 是目录（Docker 映射）：用 .config.json，还没有也是
+        std::fs::remove_file(&main).unwrap();
+        std::fs::remove_file(&legacy).unwrap();
+        std::fs::create_dir(&main).unwrap();
+        assert_eq!(state_in(dir, main.clone()), legacy);
+    }
+
+    #[test]
+    fn limits_from_cache_or_usage_report() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = tmp.path().join(".claude");
+        // .claude.json 写不进去（Docker 里被挂成了目录）：只有 `claude -p /usage` 报出来的
+        let state = tmp.path().join(".claude.json");
+        std::fs::create_dir_all(&state).unwrap();
+        let ctx = Ctx { config_dir: cfg.clone(), state_file: state.clone(), workdir: tmp.path(), env: HashMap::new() };
+        assert!(limits(&ctx).is_null());
+        let out = [
+            json!({ "type": "system", "subtype": "init" }).to_string(),
+            json!({ "type": "assistant", "usage_report": { "rate_limits": { "limits": [
+                { "kind": "session", "group": "session", "percent": 29, "resets_at": "2999-10-25T03:09:59.616161+00:00" },
+                { "kind": "weekly_scoped", "group": "weekly", "percent": 5, "resets_at": "2999-10-27T06:59:59+00:00", "scope": { "model": { "display_name": "Fable" } } },
+                { "kind": "weekly_all", "group": "weekly", "percent": 76, "resets_at": "2020-10-27T06:59:59+00:00" }
+            ], "extra_usage": { "is_enabled": true, "monthly_limit": 5000, "used_credits": 1234.0, "utilization": 24.68, "currency": "usd" } } } }).to_string(),
+        ]
+        .join("\n");
+        let (five, seven, extra) = parse_usage_report(&out).unwrap();
+        assert!(parse_usage_report("not json\n{}").is_none());
+        REPORTED.lock().unwrap().get_or_insert_with(HashMap::new).insert(cfg.clone(), (100, five, seven, extra));
+        let v = limits(&ctx);
+        assert_eq!(v["five_hour"]["used"], 29);
+        assert_eq!(v["extra"], json!({ "enabled": true, "used": 12.34, "limit": 50.0, "percent": 24.68, "currency": "USD" }));
+        assert!(v["seven_day"].is_null(), "已经过了重置时间");
+        assert_eq!(v["fetched_at"], 100);
+
+        // .claude.json 里的更新就用它的
+        std::fs::remove_dir(&state).unwrap();
+        let win = |p: u64| json!({ "utilization": p, "resets_at": "2999-01-01T00:00:00Z" });
+        write(&state, &json!({ "oauthAccount": { "accountUuid": "a" }, "cachedUsageUtilization": { "accountUuid": "a", "fetchedAtMs": 200, "utilization": { "five_hour": win(40), "seven_day": win(80) } } }));
+        let v = limits(&ctx);
+        assert_eq!((v["five_hour"]["used"].clone(), v["seven_day"]["used"].clone(), v["fetched_at"].clone()), (json!(40), json!(80), json!(200)));
+        assert!(v["extra"].is_null(), "缓存里没有额外用量");
+        // 没开的：照样报出来（界面显示“未开启”）
+        let off = json!({ "is_enabled": false, "monthly_limit": null, "used_credits": null, "utilization": null, "currency": null, "decimal_places": null });
+        assert_eq!(extra_usage(&off), json!({ "enabled": false, "used": null, "limit": null, "percent": null, "currency": "USD" }));
+    }
+
+    #[test]
+    fn account_email_only_when_logged_in() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = tmp.path().join(".claude.json");
+        let ctx = Ctx { config_dir: tmp.path().join(".claude"), state_file: state.clone(), workdir: tmp.path(), env: HashMap::new() };
+        assert!(account(&ctx).is_null());
+        write(&state, &json!({ "oauthAccount": { "emailAddress": "a@b.c", "organizationName": "Org" } }));
+        assert_eq!(account(&ctx), json!({ "email": "a@b.c", "org": "Org" }));
+        write(&state, &json!({ "oauthAccount": { "emailAddress": "" } }));
+        assert!(account(&ctx).is_null());
+    }
+
+    #[test]
+    fn options_from_catalog_state_and_env() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = tmp.path().join(".claude");
+        let state = tmp.path().join(".claude.json");
+        write(&state, &json!({ "oauthAccount": { "organizationUuid": "org1" }, "additionalModelOptionsCache": [{ "value": "claude-fable-5-1[1m]", "label": "Fable", "description": "big" }] }));
+        let models = vec![model("claude-opus-5-5", "Opus 5.5", "main", &["low", "medium", "high"]), model("claude-sonnet-5-5", "Sonnet 5.5", "main", &["low"]), model("claude-fable-5-1", "Fable 5.1", "main", &["high"]), model("claude-opus-4-6", "Opus 4.6", "overflow", &["low", "max"])];
+        write(&cfg.join("cache/model-catalog/org1-abc-cc.json"), &json!({ "fetchedAt": 1, "catalog": { "config": { "models": models } } }));
+        // 别的组织的那份更新，但不用它
+        write(&cfg.join("cache/model-catalog/org2-abc-cc.json"), &json!({ "fetchedAt": 9, "catalog": { "config": { "models": [model("claude-x", "X", "main", &[])] } } }));
+        let mut ctx = Ctx { config_dir: cfg.clone(), state_file: state.clone(), workdir: tmp.path(), env: HashMap::new() };
+        let o = options(&ctx);
+        let vals: Vec<&str> = o.iter().map(|x| x.value.as_str()).collect();
+        assert_eq!(vals, ["default", "claude-opus-5-5", "claude-sonnet-5-5", "claude-fable-5-1", "claude-fable-5-1[1m]", "claude-opus-4-6"]);
+        assert_eq!(o[0].description, "Opus 5.5");
+        assert_eq!(o[0].model, "claude-opus-5-5");
+        assert_eq!(o[4].label, "Fable · 1M");
+        assert_eq!(o[4].efforts, ["high"], "1M 版本沿用同一个模型的思考强度");
+        assert_eq!(o[5].section, "more");
+        assert_eq!(o[5].efforts, ["low", "max"]);
+
+        // 环境变量把 sonnet 指到服务商的模型；settings 的 env 也算
+        write(&cfg.join("settings.json"), &json!({ "env": { "ANTHROPIC_DEFAULT_SONNET_MODEL_NAME": "GLM 4.6" } }));
+        ctx.env.insert("ANTHROPIC_DEFAULT_SONNET_MODEL".into(), "glm-4.6".into());
+        merge_settings_env(&mut ctx);
+        let o = options(&ctx);
+        assert!(!o.iter().any(|x| x.value == "claude-sonnet-5-5"));
+        let s = o.iter().find(|x| x.value == "sonnet").unwrap();
+        assert_eq!((s.label.as_str(), s.model.as_str()), ("GLM 4.6", "glm-4.6"));
+
+        // 名单
+        write(&tmp.path().join(".claude/settings.local.json"), &json!({ "availableModels": ["opus"] }));
+        let o = options(&ctx);
+        let vals: Vec<&str> = o.iter().map(|x| x.value.as_str()).collect();
+        assert_eq!(vals, ["default", "claude-opus-5-5", "claude-opus-4-6"]);
+    }
+
+    #[test]
+    fn fallback_aliases_and_provider() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = Ctx { config_dir: tmp.path().join("none"), state_file: tmp.path().join("none.json"), workdir: tmp.path(), env: HashMap::new() };
+        let o = options(&ctx);
+        let vals: Vec<&str> = o.iter().map(|x| x.value.as_str()).collect();
+        assert_eq!(vals, ["default", "opus", "sonnet", "haiku", "fable"]);
+        let p = provider_options(&o, &["glm-4.6".into(), "bad id".into(), "kimi-k2".into()]);
+        assert_eq!(p.iter().map(|x| x.value.as_str()).collect::<Vec<_>>(), ["glm-4.6", "kimi-k2"]);
+    }
+
+    #[test]
+    fn window_without_account_catalog() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = tmp.path().join(".claude");
+        let mut ctx = Ctx { config_dir: cfg.clone(), state_file: tmp.path().join(".claude.json"), workdir: tmp.path(), env: HashMap::new() };
+        // 没有目录缓存：照 Claude Code 自带的表
+        assert_eq!(window(&ctx, "claude-opus-5-5"), (1_000_000, WindowSource::Catalog));
+        assert_eq!(context_window(&ctx, "claude-haiku-4-5-20251001"), 200_000);
+        assert_eq!(context_window(&ctx, "claude-opus-4-7"), 1_000_000);
+        assert_eq!(context_window(&ctx, "claude-sonnet-4-6"), 200_000);
+        assert_eq!(context_window(&ctx, "claude-3-5-sonnet"), 200_000);
+        // 第三方接口：没有账号的目录，用公开目录
+        let models = json!([{ "id": "claude-opus-5-5", "runtime": { "max_input_tokens": 1_000_000 } }]);
+        write(&cfg.join("cache/model-catalog/published-abc.json"), &json!({ "fetchedAt": 1, "document": { "surfaces": { "cc": { "model_selector_config": [{ "id": "cc", "models": models }] } } } }));
+        write(&cfg.join("cache/model-catalog/published-floor.json"), &json!({ "version": 1 }));
+        assert_eq!(context_window(&ctx, "claude-opus-5-5-20261001"), 1_000_000);
+        // 认不出的模型：Claude Code 2.1.325 按 100 万算（关 1M 时 20 万）
+        assert_eq!(window(&ctx, "glm-4.6"), (1_000_000, WindowSource::Assumed));
+        ctx.env.insert("CLAUDE_CODE_MAX_CONTEXT_TOKENS".into(), "128000".into());
+        assert_eq!(window(&ctx, "glm-4.6"), (128_000, WindowSource::Setting));
+        // 认得出的 Claude 模型不管这个变量；关了压缩时才对谁都算
+        assert_eq!(window(&ctx, "claude-opus-5-5"), (1_000_000, WindowSource::Catalog));
+        ctx.env.insert("DISABLE_COMPACT".into(), "1".into());
+        assert_eq!(window(&ctx, "claude-opus-5-5"), (128_000, WindowSource::Setting));
+        ctx.env.clear();
+        ctx.env.insert("CLAUDE_CODE_DISABLE_1M_CONTEXT".into(), "1".into());
+        assert_eq!(window(&ctx, "glm-4.6"), (200_000, WindowSource::Assumed));
+        assert_eq!(window(&ctx, "claude-opus-5-5"), (200_000, WindowSource::Catalog));
+        assert_eq!(with_1m("claude-sonnet-4-5", Some("sonnet[1m]")), "claude-sonnet-4-5[1m]");
+        assert_eq!(with_1m("claude-sonnet-4-5", Some("sonnet")), "claude-sonnet-4-5");
+    }
+
+    /// settings 的 env 盖过进程环境，`--settings` 的再盖过 settings 的（CC Switch 写的服务商）
+    #[test]
+    fn env_layers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = tmp.path().join(".claude");
+        write(&cfg.join("settings.json"), &json!({ "env": { "ANTHROPIC_BASE_URL": "https://ccswitch", "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "64000" } }));
+        let env = HashMap::from([("ANTHROPIC_BASE_URL".to_string(), "https://proc".to_string())]);
+        let mut ctx = Ctx { config_dir: cfg, state_file: tmp.path().join(".claude.json"), workdir: tmp.path(), env };
+        merge_settings_env(&mut ctx);
+        assert_eq!(ctx.var("ANTHROPIC_BASE_URL").as_deref(), Some("https://ccswitch"));
+        let flag = json!({ "ANTHROPIC_BASE_URL": "https://mine", "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "" });
+        overlay_env(&mut ctx, flag.as_object());
+        assert_eq!(ctx.var("ANTHROPIC_BASE_URL").as_deref(), Some("https://mine"));
+        assert_eq!(ctx.var("CLAUDE_CODE_MAX_CONTEXT_TOKENS"), None, "清空的当没设");
+    }
+
+    #[test]
+    fn compact_follows_settings_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = tmp.path().join(".claude");
+        let proj = tmp.path().join("proj");
+        let mut ctx = Ctx { config_dir: cfg.clone(), state_file: tmp.path().join(".claude.json"), workdir: &proj, env: HashMap::new() };
+        let c = compact(&ctx, "claude-opus-5-5", 1_000_000);
+        assert!(c.enabled && c.idle && c.at.is_none() && c.source.is_none());
+        assert_eq!(c.idle_min, 200_000);
+        // 用户的 settings.json：给 Opus 单独设的优先于共用的（就是用户本机的那份）
+        write(&cfg.join("settings.json"), &json!({ "autoCompactWindow": 300000, "modelSettings": { "claude-opus-5-5": { "effortLevel": "medium", "autoCompactWindow": 400000 } } }));
+        let c = compact(&ctx, "claude-opus-5-5[1m]", 1_000_000);
+        assert_eq!((c.at, c.per_model), (Some(400_000), true));
+        assert!(c.source.as_deref().unwrap().ends_with("settings.json"));
+        assert_eq!(compact(&ctx, "claude-sonnet-5-5", 1_000_000).at, Some(300_000), "别的模型用共用的");
+        assert_eq!(compact(&ctx, "claude-sonnet-5-5", 200_000).at, Some(200_000), "按窗口封顶");
+        // 项目里的设置文件优先于用户的；"auto" = 交给 Claude Code
+        write(&proj.join(".claude/settings.local.json"), &json!({ "autoCompactWindow": "auto", "idleCompaction": false }));
+        let c = compact(&ctx, "claude-opus-5-5", 1_000_000);
+        assert_eq!((c.at, c.source.clone(), c.idle), (None, None, false));
+        std::fs::remove_file(proj.join(".claude/settings.local.json")).unwrap();
+        // 启动环境最优先，认 k/M，10 万以下按 10 万
+        ctx.env.insert("CLAUDE_CODE_AUTO_COMPACT_WINDOW".into(), "250k".into());
+        let c = compact(&ctx, "claude-opus-5-5", 1_000_000);
+        assert_eq!((c.at, c.source.as_deref(), c.per_model), (Some(250_000), Some("env"), false));
+        ctx.env.insert("CLAUDE_CODE_AUTO_COMPACT_WINDOW".into(), "50000".into());
+        assert_eq!(compact(&ctx, "claude-opus-5-5", 1_000_000).at, Some(100_000));
+        ctx.env.insert("CLAUDE_CODE_AUTO_COMPACT_WINDOW".into(), "lots".into());
+        assert_eq!(compact(&ctx, "claude-opus-5-5", 1_000_000).at, Some(400_000), "看不懂的值不理");
+        ctx.env.insert("CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS".into(), "5000".into());
+        assert_eq!(compact(&ctx, "claude-opus-5-5", 1_000_000).idle_min, 100_000);
+        // 关掉自动压缩：闲时压缩一起关
+        ctx.env.insert("DISABLE_AUTO_COMPACT".into(), "1".into());
+        let c = compact(&ctx, "claude-opus-5-5", 1_000_000);
+        assert!(!c.enabled && !c.idle);
+        ctx.env.remove("DISABLE_AUTO_COMPACT");
+        write(&cfg.join("settings.json"), &json!({ "autoCompactEnabled": false }));
+        assert!(!compact(&ctx, "claude-opus-5-5", 1_000_000).enabled);
+        // 不再把压缩点当成窗口；关 1M 时最多 20 万
+        assert_eq!(context_window(&ctx, "claude-opus-5-5[1m]"), 1_000_000);
+        ctx.env.insert("CLAUDE_CODE_DISABLE_1M_CONTEXT".into(), "1".into());
+        assert_eq!(context_window(&ctx, "claude-opus-5-5[1m]"), 200_000);
+    }
+
+    #[test]
+    fn base_ids() {
+        assert_eq!(base_id("claude-haiku-4-5-20251001"), "claude-haiku-4-5");
+        assert_eq!(base_id("claude-fable-5-1[1m]"), "claude-fable-5-1");
+        assert_eq!(base_id("Claude-Opus-5-5"), "claude-opus-5-5");
+    }
+}

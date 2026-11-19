@@ -1,0 +1,387 @@
+//! 停止 / 删除终端时结束它启动的所有程序。
+//!
+//! tmux 的 `kill-session` 只给面板里的进程组发 SIGHUP：忽略 SIGHUP 的程序、AI 编程助手开的 MCP 服务、
+//! 后台跑着的开发服务器（`npm run dev &`、`nohup …`、自己 setsid 的守护进程）都会留下来，
+//! 变成没人管的孤儿进程。直接运行（没有 tmux）时 ttyd 被强制结束，它的子进程也一样。
+//!
+//! 做法：动手之前先拍下进程表，找出要结束的进程——
+//! - 面板（或 ttyd）进程和它的所有子孙；
+//! - Linux 上再加上环境里带着这个 tmux 会话标记（`TMUX=<socket>,<服务进程号>,<会话号>`）的进程：
+//!   它们是从这个会话里启动、后来脱离了父子关系（父进程已退出，被 init 收养）的。
+//!
+//! 然后先礼后兵：SIGHUP + SIGTERM（再补一个 SIGCONT，被 Ctrl+Z 挂起的也能收到），等一会儿还在的 SIGKILL。
+//! 客户端自己和它的上级进程永远不动（客户端可能就是从某个终端里启动的）。
+//! Windows 上用 `taskkill /T /F` 结束整棵进程树。
+
+use std::collections::{HashMap, HashSet};
+use std::time::Duration;
+
+/// 先发 SIGTERM，最多等这么久再 SIGKILL。
+const GRACE: Duration = Duration::from_secs(2);
+
+/// 要结束的进程：动手前拍下来的，免得父进程先退出后子孙被 init 收养、再也找不到。
+#[derive(Debug, Default)]
+pub struct Doomed {
+    pids: Vec<u32>,
+}
+
+impl Doomed {
+    pub fn is_empty(&self) -> bool {
+        self.pids.is_empty()
+    }
+
+    pub fn contains(&self, pid: u32) -> bool {
+        self.pids.contains(&pid)
+    }
+
+    pub fn exclude(&mut self, pid: u32) {
+        self.pids.retain(|&p| p != pid);
+    }
+}
+
+/// 找出 `roots` 和它们的所有子孙；`tmux_marker` 为 `Some((服务进程号, 会话号))` 时（仅 Linux）
+/// 再加上环境里带着这个会话标记的进程。
+pub fn collect(roots: &[u32], tmux_marker: Option<(u32, u32)>) -> Doomed {
+    let table = table();
+    let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
+    for &(pid, ppid) in &table {
+        children.entry(ppid).or_default().push(pid);
+    }
+    let mut seen: HashSet<u32> = HashSet::new();
+    let mut stack: Vec<u32> = roots.to_vec();
+    if let Some((server, session)) = tmux_marker {
+        stack.extend(with_tmux_marker(&table, server, session));
+    }
+    while let Some(pid) = stack.pop() {
+        if seen.insert(pid) {
+            if let Some(c) = children.get(&pid) {
+                stack.extend(c);
+            }
+        }
+    }
+    // 永远不碰：init、客户端自己和它的上级（客户端可能就是在要停的终端里启动的）、tmux 服务进程。
+    let mut keep: HashSet<u32> = HashSet::from([0, 1]);
+    let parent: HashMap<u32, u32> = table.iter().copied().collect();
+    let mut p = std::process::id();
+    while keep.insert(p) {
+        match parent.get(&p) {
+            Some(&pp) => p = pp,
+            None => break,
+        }
+    }
+    if let Some((server, _)) = tmux_marker {
+        keep.insert(server);
+    }
+    let mut pids: Vec<u32> = seen.into_iter().filter(|p| !keep.contains(p)).collect();
+    pids.sort_unstable();
+    Doomed { pids }
+}
+
+/// 发出结束信号（不等待）。在 `kill-session` / 结束 ttyd 之前调用，程序能先收到 SIGTERM 自己收尾。
+pub fn signal(d: &Doomed) {
+    #[cfg(unix)]
+    for &pid in &d.pids {
+        unsafe {
+            libc::kill(pid as i32, libc::SIGHUP);
+            libc::kill(pid as i32, libc::SIGTERM);
+            libc::kill(pid as i32, libc::SIGCONT);
+        }
+    }
+    #[cfg(windows)]
+    for &pid in &d.pids {
+        use std::os::windows::process::CommandExt;
+        let _ = std::process::Command::new("taskkill")
+            .args(["/T", "/F", "/PID", &pid.to_string()])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .creation_flags(0x0800_0000)
+            .status();
+    }
+}
+
+/// 等它们退出；超过 [`GRACE`] 还在的强制结束。返回被强制结束的个数。
+pub async fn reap(d: Doomed) -> usize {
+    #[cfg(unix)]
+    {
+        let deadline = std::time::Instant::now() + GRACE;
+        let mut left = d.pids;
+        loop {
+            left.retain(|&p| alive(p));
+            if left.is_empty() || std::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        for &pid in &left {
+            unsafe {
+                libc::kill(pid as i32, libc::SIGKILL);
+            }
+        }
+        left.len()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = d;
+        0
+    }
+}
+
+/// 还活着（僵尸进程不算：它已经结束了，只是等父进程回收）。
+#[cfg(unix)]
+fn alive(pid: u32) -> bool {
+    if unsafe { libc::kill(pid as i32, 0) } != 0 {
+        return false;
+    }
+    if cfg!(target_os = "linux") {
+        if let Ok(s) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            return stat_fields(&s).is_none_or(|(state, _)| state != 'Z');
+        }
+        return false;
+    }
+    true
+}
+
+/// `/proc/{pid}/stat` 里进程名之后的状态与父进程号。进程名可能带空格和括号，从最后一个 `)` 往后解析。
+fn stat_fields(s: &str) -> Option<(char, u32)> {
+    let rest = &s[s.rfind(')')? + 1..];
+    let mut it = rest.split_whitespace();
+    let state = it.next()?.chars().next()?;
+    let ppid = it.next()?.parse().ok()?;
+    Some((state, ppid))
+}
+
+/// 这几个进程下面还有没有别的程序在跑（运行按钮看命令跑完没有：面板里是 `命令; exec shell`，跑完只剩 shell）。
+/// shell 自己常驻的帮手（powerlevel10k 的 gitstatusd）不算。拿不到进程表（Windows）时 None。
+pub fn has_children(roots: &[u32]) -> Option<bool> {
+    let procs = table_with_args();
+    if procs.is_empty() || roots.is_empty() {
+        return None;
+    }
+    let helper = |args: &str| {
+        let prog = args.split_whitespace().next().unwrap_or("");
+        let base = prog.rsplit(['/', '\\']).next().unwrap_or(prog);
+        base.starts_with("gitstatusd")
+    };
+    Some(procs.iter().any(|p| roots.contains(&p.1) && !helper(&p.2)))
+}
+
+/// 进程表：(进程号, 父进程号)。
+fn table() -> Vec<(u32, u32)> {
+    if cfg!(target_os = "linux") {
+        let Ok(dir) = std::fs::read_dir("/proc") else { return vec![] };
+        return dir
+            .flatten()
+            .filter_map(|e| {
+                let pid: u32 = e.file_name().to_str()?.parse().ok()?;
+                let s = std::fs::read_to_string(e.path().join("stat")).ok()?;
+                Some((pid, stat_fields(&s)?.1))
+            })
+            .collect();
+    }
+    if cfg!(unix) {
+        let Ok(out) = std::process::Command::new("ps").args(["-A", "-o", "pid=,ppid="]).output() else { return vec![] };
+        return parse_ps(&String::from_utf8_lossy(&out.stdout));
+    }
+    vec![]
+}
+
+fn parse_ps(s: &str) -> Vec<(u32, u32)> {
+    s.lines()
+        .filter_map(|l| {
+            let mut it = l.split_whitespace();
+            Some((it.next()?.parse().ok()?, it.next()?.parse().ok()?))
+        })
+        .collect()
+}
+
+/// Linux：环境变量 `TMUX` 以 `,<服务进程号>,<会话号>` 结尾的进程（tmux 给会话里启动的每个程序都设了它）。
+fn with_tmux_marker(table: &[(u32, u32)], server: u32, session: u32) -> Vec<u32> {
+    if !cfg!(target_os = "linux") {
+        return vec![];
+    }
+    let suffix = format!(",{server},{session}");
+    table
+        .iter()
+        .filter(|(pid, _)| {
+            std::fs::read(format!("/proc/{pid}/environ")).is_ok_and(|env| {
+                env.split(|&b| b == 0)
+                    .any(|kv| kv.strip_prefix(b"TMUX=").is_some_and(|v| v.ends_with(suffix.as_bytes())))
+            })
+        })
+        .map(|(pid, _)| *pid)
+        .collect()
+}
+
+/// Claude Code 正在跑的 shell 命令（前台的和后台的都有）：面板进程 → claude → `bash -c 'source …/shell-snapshots/… && eval '<命令>' …'`。
+/// 返回 (命令, 已经跑了几秒)。用来列出状态栏上算着、对话记录里却没有的后台命令（/clear、/new 之前启动的）。
+/// Windows 上没有，返回空。
+pub fn claude_shells(pane_pid: u32) -> Vec<(String, Option<u64>)> {
+    let procs = table_with_args();
+    let kids = |p: u32| procs.iter().filter(move |x| x.1 == p);
+    let mut out = vec![];
+    for claude in kids(pane_pid) {
+        for sh in kids(claude.0) {
+            if let Some(cmd) = snapshot_command(&sh.2) {
+                out.push((cmd, sh.3));
+            }
+        }
+    }
+    out
+}
+
+/// Claude Code 包了一层的命令行里 `eval '…'` 的内容（单引号里的 `'\''` 还原成 `'`）。不是这种命令行时为 None。
+fn snapshot_command(args: &str) -> Option<String> {
+    if !args.contains("shell-snapshots") {
+        return None;
+    }
+    let rest = &args[args.find("eval '")? + 5..];
+    let mut out = String::new();
+    let mut chars = rest.chars().peekable();
+    loop {
+        match chars.next()? {
+            '\'' => loop {
+                match chars.next()? {
+                    '\'' => break,
+                    c => out.push(c),
+                }
+            },
+            '\\' => out.push(chars.next()?),
+            c if c.is_whitespace() => break,
+            c => out.push(c),
+        }
+        if chars.peek().is_none_or(|c| c.is_whitespace()) {
+            break;
+        }
+    }
+    let out = out.trim().to_string();
+    (!out.is_empty()).then_some(out)
+}
+
+/// 进程表：(进程号, 父进程号, 命令行, 已经跑了几秒)
+fn table_with_args() -> Vec<(u32, u32, String, Option<u64>)> {
+    #[cfg(target_os = "linux")]
+    {
+        let Ok(dir) = std::fs::read_dir("/proc") else { return vec![] };
+        let uptime = std::fs::read_to_string("/proc/uptime").ok().and_then(|s| s.split_whitespace().next()?.parse::<f64>().ok());
+        let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) } as f64;
+        dir.flatten()
+            .filter_map(|e| {
+                let pid: u32 = e.file_name().to_str()?.parse().ok()?;
+                let stat = std::fs::read_to_string(e.path().join("stat")).ok()?;
+                let ppid = stat_fields(&stat)?.1;
+                let args = std::fs::read(e.path().join("cmdline")).ok()?;
+                let args = String::from_utf8_lossy(&args).replace('\0', " ");
+                // 进程名之后第 20 个字段：启动时间（开机后的时钟滴答数）
+                let start = stat[stat.rfind(')')? + 1..].split_whitespace().nth(19).and_then(|s| s.parse::<f64>().ok());
+                let age = match (uptime, start) {
+                    (Some(u), Some(s)) if hz > 0.0 => Some((u - s / hz).max(0.0) as u64),
+                    _ => None,
+                };
+                Some((pid, ppid, args, age))
+            })
+            .collect()
+    }
+    #[cfg(all(unix, not(target_os = "linux")))]
+    {
+        let Ok(out) = std::process::Command::new("ps").args(["-A", "-ww", "-o", "pid=,ppid=,etime=,command="]).output() else { return vec![] };
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|l| {
+                let mut it = l.split_whitespace();
+                let pid = it.next()?.parse().ok()?;
+                let ppid = it.next()?.parse().ok()?;
+                let age = parse_etime(it.next()?);
+                Some((pid, ppid, it.collect::<Vec<_>>().join(" "), age))
+            })
+            .collect()
+    }
+    #[cfg(not(unix))]
+    {
+        vec![]
+    }
+}
+
+/// `ps -o etime`：`[[dd-]hh:]mm:ss`
+#[cfg_attr(target_os = "linux", allow(dead_code))]
+fn parse_etime(s: &str) -> Option<u64> {
+    let (days, rest) = match s.split_once('-') {
+        Some((d, r)) => (d.parse::<u64>().ok()?, r),
+        None => (0, s),
+    };
+    let mut secs = 0;
+    for part in rest.split(':') {
+        secs = secs * 60 + part.parse::<u64>().ok()?;
+    }
+    Some(days * 86400 + secs)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stat_with_odd_process_name() {
+        assert_eq!(stat_fields("123 (a) b (c)) S 45 123 123 0"), Some(('S', 45)));
+        assert_eq!(stat_fields("9 (zsh) Z 1 9 9"), Some(('Z', 1)));
+        assert_eq!(stat_fields("garbage"), None);
+    }
+
+    #[test]
+    fn ps_output() {
+        assert_eq!(parse_ps("  1     0\n 345   1\nbad\n"), vec![(1, 0), (345, 1)]);
+    }
+
+    #[test]
+    fn never_includes_self_or_ancestors() {
+        let me = std::process::id();
+        let d = collect(&[me, 1], None);
+        assert!(!d.pids.contains(&me));
+        assert!(!d.pids.contains(&1));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn kills_whole_tree_including_sighup_ignorers() {
+        // sh 起一个忽略 SIGHUP/SIGTERM 的孙进程，模拟“关会话也不退出”的后台程序。
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "sh -c 'trap \"\" HUP TERM; sleep 30' & wait"])
+            .spawn()
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        let d = collect(&[child.id()], None);
+        assert!(d.pids.len() >= 3, "{:?}", d.pids); // sh、内层 sh、sleep
+        let pids = d.pids.clone();
+        signal(&d);
+        let _ = child.wait();
+        reap(d).await;
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(pids.iter().all(|&p| !alive(p)), "{pids:?}");
+    }
+
+    #[test]
+    fn reads_claude_snapshot_commands() {
+        let args = r#"/bin/bash -c source /root/.claude/shell-snapshots/snapshot-bash-1-x.sh 2>/dev/null || true && shopt -u extglob 2>/dev/null || true && eval 'until ! pgrep -f "git clone" >/dev/null; do sleep 3; done; echo '\''hi'\''' < /dev/null && pwd -P >| /tmp/claude-e569-cwd"#;
+        assert_eq!(snapshot_command(args).as_deref(), Some(r#"until ! pgrep -f "git clone" >/dev/null; do sleep 3; done; echo 'hi'"#));
+        assert_eq!(snapshot_command("/bin/bash -c eval 'ls'"), None);
+        assert_eq!(parse_etime("01:02"), Some(62));
+        assert_eq!(parse_etime("2-01:00:05"), Some(2 * 86400 + 3605));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn finds_shells_under_claude() {
+        // 模拟：面板进程（sh）→ claude（sh）→ 包了一层的命令
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "sh -c \"bash -c \\\"true shell-snapshots && eval 'sleep 30' < /dev/null && true\\\" ; true\" ; true"])
+            .spawn()
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        let found = claude_shells(child.id());
+        let _ = child.kill();
+        let d = collect(&[child.id()], None);
+        signal(&d);
+        assert_eq!(found.iter().map(|f| f.0.as_str()).collect::<Vec<_>>(), ["sleep 30"], "{found:?}");
+        assert!(found[0].1.is_some_and(|a| a < 5));
+    }
+}

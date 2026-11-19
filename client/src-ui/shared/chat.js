@@ -1,0 +1,825 @@
+// Claude Code 对话界面（docs/CLAUDE_UI.md §5）的纯逻辑：事件合并、工具卡片摘要、diff、哪些命令要到终端里操作。
+// 不依赖 React 和浏览器，`node --test` 直接测。
+
+/** 有对话界面的启动类型（和服务端 instances.rs 的 CHAT_LAUNCHES 一致） */
+export const CHAT_LAUNCHES = ['claude', 'codex', 'dsh', 'agy'];
+
+/** 网页版的 DSH（每台电脑一个，会话标签里显示它自己的网页）；对话模式的 DSH 和 Codex 一样走对话界面 */
+export const isDshWeb = (inst) => inst?.launch === 'dsh' && !inst?.chat_ui;
+
+/** 空的对话状态 */
+export const EMPTY = { status: null, items: [], start: 0, total: 0 };
+
+/**
+ * 合并服务端事件（SSE）：
+ * - snapshot：{ status, items, start, total } 整个替换；
+ * - status：只换状态；
+ * - items：{ start, items }，从全局第 start 条起新增或更新（同一条 assistant 回复会多次更新）。
+ */
+export function applyEvent(state, type, data) {
+  switch (type) {
+    case 'snapshot':
+      return { status: data.status ?? null, items: data.items ?? [], start: data.start ?? 0, total: data.total ?? 0 };
+    case 'status':
+      return { ...state, status: data };
+    case 'items': {
+      const items = state.items.slice();
+      (data.items ?? []).forEach((item, i) => {
+        const p = data.start + i - state.start;
+        if (p < 0) return;
+        if (p < items.length) items[p] = item;
+        else items.push(item);
+      });
+      return { ...state, items, total: Math.max(state.total, state.start + items.length) };
+    }
+    case 'older': {
+      // 往上翻取到的更早的条目
+      const older = data.items ?? [];
+      return { ...state, items: [...older, ...state.items], start: data.start ?? state.start - older.length };
+    }
+    default:
+      return state;
+  }
+}
+
+/** tool_use_id → tool_result 条目 */
+export function resultsById(items) {
+  const m = new Map();
+  for (const i of items) if (i.k === 'tool_result') m.set(i.tool_use_id, i);
+  return m;
+}
+
+/** 列表里出现过的 tool_use id（对应的结果画在卡片里，不单独显示） */
+export function toolUseIds(items) {
+  const s = new Set();
+  for (const i of items) if (i.k === 'assistant') for (const b of i.blocks ?? []) if (b.t === 'tool_use') s.add(b.id);
+  return s;
+}
+
+const short = (s, n = 120) => {
+  const one = String(s ?? '').replace(/\s+/g, ' ').trim();
+  return one.length > n ? `${one.slice(0, n - 1)}…` : one;
+};
+const tail = (p) => String(p ?? '').split(/[\\/]/).filter(Boolean).slice(-2).join('/');
+
+/** 卡片标题后面那一小段：挑最能说明这次调用的参数。认不出的工具取第一个字符串参数。 */
+export function toolSummary(name, input = {}) {
+  const i = input ?? {};
+  switch (name) {
+    case 'Bash':
+      // Claude 自己写的一句说明比命令好读；没有说明时显示命令
+      return short(i.description || i.command);
+    case 'Read':
+    case 'Edit':
+    case 'MultiEdit':
+    case 'Write':
+    case 'NotebookEdit':
+      return tail(i.file_path ?? i.notebook_path);
+    case 'Grep':
+      return short(`${i.pattern ?? ''}${i.path ? ` · ${tail(i.path)}` : ''}`);
+    case 'Glob':
+      return short(i.pattern);
+    case 'WebFetch':
+      return short(i.url);
+    case 'WebSearch':
+      return short(i.query);
+    case 'ImageGen':
+      return short(i.prompt);
+    case 'Task':
+    case 'Agent':
+      return short(i.description ?? i.prompt);
+    case 'TodoWrite':
+      return `${(i.todos ?? []).filter((x) => x.status === 'completed').length}/${(i.todos ?? []).length}`;
+    default: {
+      // MCP 等认不出的工具（Artifact、文档、浏览器……）：先挑常见的说明性参数，再取第一个字符串参数
+      const key = SUMMARY_KEYS.find((k) => typeof i[k] === 'string' && i[k].trim());
+      if (key) return /(^|_)path$/.test(key) ? tail(i[key]) : short(i[key]);
+      const first = Object.values(i).find((v) => typeof v === 'string' && v.trim());
+      return first ? short(first) : '';
+    }
+  }
+}
+const SUMMARY_KEYS = ['file_path', 'path', 'url', 'query', 'command', 'title', 'name', 'description', 'action'];
+
+// ---------------- 工具参数与结果里的富文本 ----------------
+
+/** 整段是 JSON 对象 / 数组时解析出来（MCP 工具的结果常是一整段 JSON），不是就返回 null */
+export function parseJson(text) {
+  const s = typeof text === 'string' ? text.trim() : '';
+  if (!/^[[{]/.test(s) || !/[\]}]$/.test(s)) return null;
+  try {
+    const v = JSON.parse(s);
+    return v && typeof v === 'object' ? v : null;
+  } catch {
+    return null;
+  }
+}
+
+/** 文字里的网址拆出来：[{ text }, { text, url }, …]（末尾的标点不算网址） */
+export function splitLinks(text) {
+  const s = String(text ?? '');
+  const out = [];
+  let at = 0;
+  for (const m of s.matchAll(URL_RE)) {
+    // 紧跟在网址后面的中文（“……/abc。完成”）不算网址
+    const url = m[0].replace(/[\u3000-\u303f\u4e00-\u9fff\uff00-\uffef].*$/, '').replace(/[.,;:!?]+$/, '');
+    if (!url) continue;
+    if (m.index > at) out.push({ text: s.slice(at, m.index) });
+    out.push({ text: url, url });
+    at = m.index + url.length;
+  }
+  if (at < s.length) out.push({ text: s.slice(at) });
+  return out;
+}
+
+/**
+ * 工具参数的一个值怎么显示：json（对象、数组、整段 JSON 字符串，格式化成多行）、block（多行或很长的文字）、
+ * link（网址）、inline（短的文字、数字、开关）。
+ */
+export function fieldKind(v) {
+  if (v && typeof v === 'object') return 'json';
+  if (typeof v !== 'string') return 'inline';
+  if (parseJson(v)) return 'json';
+  if (/^https?:\/\/\S+$/.test(v.trim())) return 'link';
+  return v.includes('\n') || v.length > 120 ? 'block' : 'inline';
+}
+
+/**
+ * 改动的 diff 行：[{ t: '+' | '-' | ' ' | '@', text }]。
+ * 优先用 Claude Code 给的 structuredPatch（toolUseResult），没有就用 old_string / new_string 自己算。
+ */
+export function diffLines(name, input = {}, extra = null) {
+  const patch = extra?.structuredPatch;
+  if (Array.isArray(patch) && patch.length) {
+    const out = [];
+    for (const h of patch) {
+      out.push({ t: '@', text: `@@ -${h.oldStart},${h.oldLines} +${h.newStart},${h.newLines} @@` });
+      // 行号：删掉的行是原文件的行号，其余是改后的行号
+      let o = h.oldStart;
+      let n = h.newStart;
+      for (const l of h.lines ?? []) {
+        const c = l[0];
+        if (c === '-') out.push({ t: '-', text: l.slice(1), no: o++ });
+        else if (c === '+') out.push({ t: '+', text: l.slice(1), no: n++ });
+        else {
+          out.push({ t: ' ', text: l.slice(1), no: n++ });
+          o++;
+        }
+      }
+    }
+    return out;
+  }
+  if (name === 'Edit') return lineDiff(input.old_string ?? '', input.new_string ?? '');
+  if (name === 'MultiEdit') return (input.edits ?? []).flatMap((e, n) => [...(n ? [{ t: '@', text: '…' }] : []), ...lineDiff(e.old_string ?? '', e.new_string ?? '')]);
+  if (name === 'Write') {
+    // 末尾的换行不算一行
+    const lines = String(input.content ?? '').split('\n');
+    if (lines.length > 1 && lines[lines.length - 1] === '') lines.pop();
+    return lines.map((text, i) => ({ t: '+', text, no: i + 1 }));
+  }
+  return [];
+}
+
+/** 行级 diff（最长公共子序列）。太大时不细算，整段删、整段加。 */
+export function lineDiff(a, b) {
+  const x = String(a).split('\n');
+  const y = String(b).split('\n');
+  if (x.length * y.length > 250_000) return [...x.map((text) => ({ t: '-', text })), ...y.map((text) => ({ t: '+', text }))];
+  const n = x.length;
+  const m = y.length;
+  const dp = Array.from({ length: n + 1 }, () => new Uint32Array(m + 1));
+  for (let i = n - 1; i >= 0; i--) for (let j = m - 1; j >= 0; j--) dp[i][j] = x[i] === y[j] ? dp[i + 1][j + 1] + 1 : Math.max(dp[i + 1][j], dp[i][j + 1]);
+  const out = [];
+  let i = 0;
+  let j = 0;
+  while (i < n && j < m) {
+    if (x[i] === y[j]) {
+      out.push({ t: ' ', text: x[i] });
+      i++;
+      j++;
+    } else if (dp[i + 1][j] >= dp[i][j + 1]) out.push({ t: '-', text: x[i++] });
+    else out.push({ t: '+', text: y[j++] });
+  }
+  while (i < n) out.push({ t: '-', text: x[i++] });
+  while (j < m) out.push({ t: '+', text: y[j++] });
+  return out;
+}
+
+/** 增删行数 */
+export function diffStat(lines) {
+  let add = 0;
+  let del = 0;
+  for (const l of lines) {
+    if (l.t === '+') add++;
+    else if (l.t === '-') del++;
+  }
+  return { add, del };
+}
+
+/** 最新的一份待办（TodoWrite），没有时为 null */
+export function latestTodos(items) {
+  for (let i = items.length - 1; i >= 0; i--) {
+    const it = items[i];
+    if (it.k !== 'assistant') continue;
+    for (let j = (it.blocks ?? []).length - 1; j >= 0; j--) {
+      const b = it.blocks[j];
+      if (b.t === 'tool_use' && b.name === 'TodoWrite' && Array.isArray(b.input?.todos)) return b.input.todos;
+    }
+  }
+  return null;
+}
+
+/**
+ * 输入 / 时列出的内置命令。`action`：界面自己处理、不送进 Claude Code 的——
+ * `model` 打开模型菜单，`history` 打开“以前的对话”页，`usage` / `tasks` / `config` 打开右侧面板的那一栏。
+ * 其余照原样送进去；会打开选择框的（/rewind 之类）由界面显示成弹窗。
+ */
+export const COMMANDS = [
+  ['/compact'],
+  ['/clear'],
+  ['/new'],
+  ['/model', 'model'],
+  ['/resume', 'history'],
+  ['/rewind'],
+  ['/context', 'usage'],
+  ['/cost', 'usage'],
+  ['/usage', 'usage'],
+  ['/status', 'status'],
+  ['/tasks', 'tasks'],
+  ['/permissions', 'config'],
+  ['/mcp', 'config'],
+  ['/hooks', 'config'],
+  ['/memory', 'config'],
+  ['/add-dir', 'config'],
+  ['/sandbox', 'config'],
+  ['/experimental', 'config'],
+  ['/agents', 'subagents'],
+  ['/plugin', 'plugins'],
+  ['/plugins', 'plugins'],
+  ['/skills', 'skills'],
+  ['/review'],
+  ['/init'],
+  ['/doctor'],
+  ['/btw'],
+  ['/side'],
+  ['/goal'],
+  ['/fast'],
+  ['/fork'],
+  ['/branch'],
+  ['/rename', 'rename'],
+  ['/diff', 'git'],
+  ['/login', 'login'],
+  ['/logout', 'login'],
+  ['/feedback', 'feedback'],
+  ['/bug', 'feedback'],
+  ['/archive'],
+  ['/delete'],
+  ['/stop'],
+  ['/release-notes', 'release_notes'],
+  ['/upgrade', 'upgrade'],
+  ['/privacy-settings', 'privacy'],
+  ['/worktree', 'worktree'],
+  ['/share', 'share'],
+  ['/export', 'outline'],
+];
+
+/** Codex（走 app-server）认的内置命令：/compact、/clear 由看看换成对应的请求，其余是界面自己的动作 */
+export const CODEX_COMMANDS = [
+  '/compact', '/clear', '/new', '/model', '/permissions', '/resume', '/context', '/usage', '/status', '/worktree', '/share', '/review', '/init', '/goal', '/fork', '/fast',
+  '/mcp', '/export', '/hooks', '/experimental', '/plugins', '/skills', '/agents', '/rename', '/diff', '/login', '/logout', '/feedback', '/archive', '/delete', '/stop', '/btw', '/side',
+];
+
+/** Codex 里意思不一样的命令：/permissions 是换权限（打开权限菜单），不是 Claude 的权限规则 */
+export const CODEX_ACTIONS = { '/permissions': 'mode' };
+
+/** Codex 里交给看看后端做的（不是界面动作）：/logout 退出账号 */
+export const CODEX_PASS = ['/logout'];
+
+/** DSH（走 dsh web）认的：/clear、/new 开新会话，/model 是界面的模型菜单；别的斜杠命令交给 DSH 自己执行 */
+export const DSH_COMMANDS = ['/clear', '/new', '/model', '/share', '/export'];
+/** Antigravity (agy acp) 认的内置命令；其余（/compact、/plan、技能…）从 ACP 的 available_commands_update 来 */
+export const AGY_COMMANDS = ['/clear', '/new', '/model', '/share', '/export'];
+
+/** stream-json 的 Claude Code 里用不了的（`claude -p` 回“isn't available in this environment”）：不列。
+ *  要回到前面用编辑重发（铅笔）或检查点 */
+export const SDK_UNAVAILABLE = ['/rewind'];
+
+/** 只有 Codex 有的（看看在界面里做）：别的工具不列、不拦 */
+export const CODEX_ONLY = ['/worktree', '/archive', '/delete', '/stop', '/experimental', '/side'];
+
+/** 只有 Claude 有的：Codex 不列 */
+export const CLAUDE_ONLY = ['/branch', '/sandbox', '/release-notes', '/upgrade', '/privacy-settings', '/bug', '/plugin'];
+
+/** 只和终端外观有关的命令：不在菜单里列出（自己打出来照样送进去） */
+export const TERMINAL_ONLY = ['/theme', '/vim', '/terminal-setup', '/statusline', '/ide'];
+
+/** 送出的文字是不是界面自己处理的命令：返回 action，否则 null */
+export function slashAction(text, agent) {
+  const s = String(text ?? '').trim();
+  const cmd = s.split(/\s/)[0].toLowerCase();
+  // 带参数的照常送（例如 /model sonnet）
+  if (s !== cmd) return null;
+  if (agent !== 'codex' && CODEX_ONLY.includes(cmd)) return null;
+  if (agent === 'codex' && CODEX_ACTIONS[cmd]) return CODEX_ACTIONS[cmd];
+  if (agent === 'codex' && CODEX_PASS.includes(cmd)) return null;
+  if (agent === 'dsh' && !DSH_COMMANDS.includes(cmd)) return null;
+  if (agent === 'agy' && !AGY_COMMANDS.includes(cmd)) return null;
+  return COMMANDS.find(([c]) => c === cmd)?.[1] ?? null;
+}
+
+/** AskUserQuestion 的答案：{ 问题原文: 选项 label }；多选用 ", " 连起来，自己填的文字直接作为答案。 */
+/** Claude Code 启动时的两个确认框（2.1.310）：信任目录、Bypass Permissions 警告，按“是”那一项的文字认 */
+export const KNOWN_DIALOGS = { trust: 'Yes, I trust this folder', bypass: 'Yes, I accept' };
+
+/** 是认识的确认框时返回 `{ kind, path }`：`path` 是信任框说明的第一段（目录，窄屏时折成几行） */
+export function knownDialog(d) {
+  const kind = Object.keys(KNOWN_DIALOGS).find((k) => d?.options?.some((o) => o.label === KNOWN_DIALOGS[k]));
+  if (!kind) return null;
+  const end = d.body.indexOf('');
+  return { kind, path: kind === 'trust' ? d.body.slice(0, end < 0 ? 1 : end).join('') : '' };
+}
+
+export function questionAnswers(questions, picked, { arrays = false } = {}) {
+  const out = {};
+  (questions ?? []).forEach((q, n) => {
+    const p = picked[n] ?? {};
+    const labels = [...(p.labels ?? [])];
+    // otherOn === false：单选时又点了别的选项，填的字不算
+    if (p.other?.trim() && p.otherOn !== false) labels.push(p.other.trim());
+    // Claude Code 要逗号连起来的一句；Codex、DSH 收数组（选项里带逗号也不会被拆开）
+    if (labels.length) out[q.question] = arrays ? labels : labels.join(', ');
+  });
+  return out;
+}
+
+/**
+ * 回复里指向这台电脑上文件的链接（`[查看会话记录](/Users/a/.codex/sessions/x.jsonl)`、`F:/out/a.pdf`、`file:///…`）：
+ * 返回文件的绝对路径，去掉 Codex 常带的行号（`a.rs:12`、`a.rs:12:3`、`#L12-L20`）。不是绝对路径时返回 null。
+ */
+export function localFilePath(href) {
+  let s = String(href ?? '').trim();
+  try {
+    s = decodeURI(s);
+  } catch {
+    /* 不是合法的转义，按原样用 */
+  }
+  s = s.replace(/^file:\/\/(localhost)?/i, '');
+  if (/^\/[A-Za-z]:[\\/]/.test(s)) s = s.slice(1);
+  if (!/^(\/(?!\/)|[A-Za-z]:[\\/])/.test(s)) return null;
+  return s.replace(/#L\d+(C\d+)?(-L?\d+(C\d+)?)?$/, '').replace(/:\d+(:\d+)?$/, '') || null;
+}
+
+/** 内容里的文字（工具结果的完整原始记录里取） */
+export function contentText(content) {
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) return content.filter((b) => b?.type === 'text').map((b) => b.text).join('\n');
+  return '';
+}
+
+// ---------------- 连续的工具调用合成一组 ----------------
+
+// 两段文字之间连续的工具调用（看文件、搜索、命令、改动、MCP……）合成一组，默认收起，点开看每一次。
+// 子代理（有自己的步骤）、待办、提问、计划、生成的图片不合并：它们各自有专门的显示。
+const NO_GROUP = new Set(['TodoWrite', 'AskUserQuestion', 'ExitPlanMode', 'ImageGen', 'Task', 'Agent']);
+/** 改文件的工具：组的标题上合计增删行数 */
+export const EDIT_TOOLS = new Set(['Edit', 'MultiEdit', 'Write', 'NotebookEdit']);
+
+/** 助理记、忘记忆的工具（两种引擎都翻成这个名字）：不进工具组、不收进处理过程，画成一行“记住了：…” */
+export const MEMORY_TOOL = /^mcp__looklook_assistant__memory_(save|forget)$/;
+
+/** 工具的类别（合并用）；不合并的返回 null */
+export function toolClass(name) {
+  return NO_GROUP.has(name) ? null : 'work';
+}
+
+/**
+ * 把条目展开成要显示的行：assistant 回复拆成文字、思考、工具调用，连续的工具调用合成一组。
+ * 结果已经画在工具卡片里的 tool_result（`used` 里有它的调用）不单独成行，也不打断分组。
+ * 行：{ k: 'item', item } | { k: 'text' | 'thinking' | 'unknown', block } | { k: 'tool' | 'memory', block } | { k: 'group', cls, calls: [block] }
+ */
+export function chatRows(items, used = toolUseIds(items)) {
+  const rows = [];
+  let group = null;
+  const flush = () => {
+    if (!group) return;
+    rows.push(group.calls.length > 1 ? group : { k: 'tool', key: group.calls[0].id, block: group.calls[0] });
+    group = null;
+  };
+  for (const item of items) {
+    if (item.k === 'tool_result' && used.has(item.tool_use_id)) continue;
+    if (item.k !== 'assistant') {
+      flush();
+      rows.push({ k: 'item', key: item.key, item });
+      continue;
+    }
+    (item.blocks ?? []).forEach((b, n) => {
+      const key = b.id ?? `${item.key}:${n}`;
+      if (b.t === 'tool_use') {
+        // 参数被截断的：记下所在的条目，卡片上可以按它取完整参数
+        if (b.truncated && !b.item) b.item = item.key;
+        if (MEMORY_TOOL.test(b.name)) {
+          flush();
+          rows.push({ k: 'memory', key, block: b });
+          return;
+        }
+        const cls = toolClass(b.name);
+        if (cls && group?.cls === cls) {
+          group.calls.push(b);
+          return;
+        }
+        flush();
+        if (cls) group = { k: 'group', key: `g:${b.id}`, cls, calls: [b] };
+        else rows.push({ k: 'tool', key, block: b });
+        return;
+      }
+      // 空白的思考不打断分组
+      if (b.t === 'thinking' && !String(b.text ?? '').trim()) return;
+      flush();
+      rows.push({ k: b.t === 'text' || b.t === 'thinking' ? b.t : 'unknown', key, block: b });
+    });
+  }
+  flush();
+  return rows;
+}
+
+/**
+ * 每一段回复拆成“处理过程”和“回复”（参照 LiveAgent 的 AssistantWorkTrace）：两条记录之间连续的思考、工具、文字是一段，
+ * 结尾连着的文字是回复，前面的都是处理过程。还在跑的那一段（最后一段且 live）全算处理过程，免得中间的说明一会儿进回复一会儿出来。
+ * 返回 [{ k: 'row', n } | { k: 'work', key, rows: [n], running, answer, turn }]，n 是 rows 里的下标；没有处理过程的段原样一行一行。
+ */
+export function workParts(rows, live) {
+  const out = [];
+  for (let n = 0; n < rows.length; ) {
+    // 没配上调用的工具结果也算处理过程
+    if (rows[n].k === 'item' && rows[n].item.k !== 'tool_result') {
+      out.push({ k: 'row', n: n++ });
+      continue;
+    }
+    const from = n;
+    while (n < rows.length && !(rows[n].k === 'item' && rows[n].item.k !== 'tool_result')) n++;
+    const running = live && n === rows.length;
+    let cut = n;
+    if (!running) while (cut > from && rows[cut - 1].k === 'text') cut--;
+    if (cut === from) {
+      for (let i = from; i < n; i++) out.push({ k: 'row', n: i });
+      continue;
+    }
+    const turn = rows[n]?.item?.k === 'turn' ? rows[n].item : null;
+    // 记忆那一行不收进处理过程：放在处理过程后面，收起了也看得到
+    const idx = Array.from({ length: cut - from }, (_, i) => from + i);
+    const work = idx.filter((i) => rows[i].k !== 'memory');
+    if (work.length) out.push({ k: 'work', key: `w:${rows[work[0]].key}`, rows: work, running, answer: cut < n, turn });
+    for (const i of idx) if (rows[i].k === 'memory') out.push({ k: 'row', n: i });
+    for (let i = cut; i < n; i++) out.push({ k: 'row', n: i });
+  }
+  return out;
+}
+
+/** 一组里每种工具各调用了几次：[[名字, 次数]]，按第一次出现的顺序 */
+export function toolCounts(calls) {
+  const m = new Map();
+  for (const c of calls) m.set(c.name, (m.get(c.name) ?? 0) + 1);
+  return [...m];
+}
+
+// ---------------- 模型、思考强度、权限模式 ----------------
+
+const cap = (s) => s.charAt(0).toUpperCase() + s.slice(1).toLowerCase();
+
+/** 模型的显示名：`claude-opus-5-5` → `Opus 5.5`，`sonnet[1m]` → `Sonnet 1M`；认不出的原样返回 */
+export function modelLabel(model) {
+  if (!model) return '';
+  const s = String(model).replace(/^claude-/i, '');
+  const full = s.match(/^(opus|sonnet|haiku|fable)-(\d+)(?:-(\d{1,2}))?(?:-\d{8})?(\[1m\])?$/i);
+  if (full) return `${cap(full[1])} ${full[2]}${full[3] ? `.${full[3]}` : ''}${full[4] ? ' 1M' : ''}`;
+  const alias = s.match(/^(opus|sonnet|haiku|fable)(\[1m\])?$/i);
+  if (alias) return `${cap(alias[1])}${alias[2] ? ' 1M' : ''}`;
+  return s;
+}
+
+/** 模型的系列（opus / sonnet / haiku / fable），判断快捷选项里哪个是当前的 */
+export function modelFamily(model) {
+  return String(model ?? '').match(/opus|sonnet|haiku|fable/i)?.[0].toLowerCase() ?? '';
+}
+
+/** 模型 ID 去掉日期和上下文后缀，用来比较：`claude-haiku-4-5-20251001[1m]` → `claude-haiku-4-5` */
+export function baseModel(id) {
+  const s = String(id ?? '').trim().toLowerCase().split('[')[0];
+  return s.replace(/-\d{8}$/, '');
+}
+
+const ALIASES = ['opus', 'sonnet', 'haiku', 'fable'];
+
+/** 选项是否就是这个模型（选项值、对应的模型 ID、或者别名对上家族） */
+function optionIs(o, model) {
+  const m = String(model ?? '').toLowerCase();
+  if (!m) return false;
+  if (o.value.toLowerCase() === m) return true;
+  if (ALIASES.includes(m)) return o.value === m || (!o.model && modelFamily(o.value) === m);
+  return Boolean(o.model) && baseModel(o.model) === baseModel(m) && o.value !== 'default';
+}
+
+/**
+ * 模型按钮和菜单要显示的：
+ * - checked：菜单里勾选哪一项的 value；
+ * - label：按钮上的名字（最近一条回复实际用的模型；刚在界面上选了、还没有新回复时显示选的）；
+ * - pending：选了还没生效；
+ * - mismatch：在界面上选的模型和回复实际用的对不上（例如服务商把请求转给了别的模型），值是实际模型的名字。
+ * status：对话状态（model、actual_model、model_pending、model_chosen）；options：/chat/models 的选项。
+ */
+export function modelView(status, options = []) {
+  const sel = status?.model ?? null;
+  const act = status?.actual_model ?? null;
+  const pending = Boolean(status?.model_pending);
+  const name = (m) => options.find((o) => o.value !== 'default' && optionIs(o, m))?.label ?? modelLabel(m);
+  // 选的那项指向的就是回复用的模型（或者还没有回复）：勾选的那项；否则（在终端里切过）按回复用的模型找
+  const selOpt = sel ? options.find((o) => o.value === sel) ?? options.find((o) => optionIs(o, sel)) : null;
+  const selIsAct = selOpt && act && (selOpt.model ? baseModel(selOpt.model) === baseModel(act) : modelFamily(selOpt.value) === modelFamily(act));
+  let checked = null;
+  if (selOpt && (pending || !act || selIsAct)) checked = selOpt.value;
+  else if (act) checked = options.find((o) => optionIs(o, act))?.value ?? null;
+  const label = pending || !act ? (sel === 'default' ? options.find((o) => o.value === 'default')?.description || 'Default' : sel ? name(sel) : '') : name(act);
+  let mismatch = null;
+  if (status?.model_chosen && !pending && sel && act && sel !== 'default') {
+    const o = options.find((x) => x.value === sel);
+    const want = o?.model || sel;
+    const same = ALIASES.includes(want.toLowerCase()) ? modelFamily(act) === want.toLowerCase() : baseModel(want) === baseModel(act);
+    if (!same) mismatch = name(act);
+  }
+  return { checked, label, pending, mismatch };
+}
+
+/** token 数的简短写法：`950`、`12.3k`、`1.2M` */
+export function tokens(n) {
+  const v = Number(n) || 0;
+  if (v < 1000) return String(v);
+  if (v < 1e6) return `${(v / 1000).toFixed(v < 1e4 ? 1 : 0)}k`;
+  return `${(v / 1e6).toFixed(1)}M`;
+}
+
+export const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'];
+/** Codex 模型目录里没写强度时的几档 */
+export const CODEX_EFFORTS = ['low', 'medium', 'high', 'xhigh'];
+/**
+ * 这个模型能选的思考强度（没有就返回 []，界面就不显示强度）。
+ * 目录里写了就用它；没写时：第三方接口的模型不知道就不给选，Haiku 没有强度档，
+ * Claude 主力模型用通用五档（目录常缺这一项），Codex 用它常见的四档。
+ */
+export function effortsFor(agent, option) {
+  if (option?.efforts?.length) return option.efforts;
+  if (option?.section === 'provider') return [];
+  if (/haiku/i.test(option?.model || option?.value || '')) return [];
+  if (agent === 'codex') return CODEX_EFFORTS;
+  if (agent === 'agy') return CODEX_EFFORTS;
+  if (agent === 'claude') return EFFORTS;
+  return [];
+}
+
+/**
+ * 要显示的思考强度：会话里设过（或 Codex 报了）就是它；没有时用当前模型的默认强度，标成默认。
+ * 返回 `{ value, isDefault }`，都不知道时 value 为 null。
+ */
+export function effortShown(status, option, setting = null) {
+  if (status?.effort) return { value: status.effort, isDefault: false };
+  // Claude Code：settings 里存的 effortLevel 盖过模型自带的默认
+  const d = setting ?? option?.default_effort ?? null;
+  return { value: d, isDefault: Boolean(d) };
+}
+/** Shift+Tab 能轮换到的权限模式（自动模式、全部权限要启动时开启才有） */
+export const MODE_CHOICES = ['default', 'acceptEdits', 'plan', 'auto', 'bypassPermissions'];
+/** Codex 的权限（和 TUI 的 `/permissions` 一样三档），Shift+Tab 在这三个里轮换 */
+export const CODEX_MODE_CHOICES = ['readOnly', 'workspaceWrite', 'fullAccess'];
+// 助理派出去的 Codex 会话用的两档（codex_chat.rs 的 ASK_COMMANDS、FULL_GUARDED）：只显示，不在菜单里
+export const CODEX_DISPATCH_MODES = ['askCommands', 'fullGuarded'];
+
+/** 光标前面正在打的 `@…`：{ start, q }，start 是 `@` 的位置；不在打就是 null。`@` 要在开头或空白后面（邮箱里的 @ 不算） */
+export function mentionAt(text, caret) {
+  const m = /(^|\s)@([^\s@"]*)$/.exec(text.slice(0, caret));
+  return m ? { start: caret - m[2].length - 1, q: m[2] } : null;
+}
+
+/**
+ * 选中一项：把 `@q` 换成 `@路径`（Claude Code 和 Codex 都按这个认文件；有空格时加引号）。
+ * 选的是目录时不加空格，可以接着往下找。返回 { text, caret }
+ */
+export function insertMention(text, start, caret, path) {
+  const ref = `@${/\s/.test(path) ? `"${path}"` : path}${path.endsWith('/') ? '' : ' '}`;
+  const before = text.slice(0, start) + ref;
+  return { text: before + text.slice(caret), caret: before.length };
+}
+
+/**
+ * Codex 的 `$技能`：光标前是 `$xxx`（前面是开头或空白）时返回 { start, q }；和 @ 一样打了空格就结束。
+ */
+export function skillAt(text, caret) {
+  const m = /(^|\s)\$([^\s$]*)$/.exec(text.slice(0, caret));
+  return m ? { start: caret - m[2].length - 1, q: m[2] } : null;
+}
+
+/** 选中一个技能：把 `$q` 换成 `$名字 `。返回 { text, caret } */
+export function insertSkill(text, start, caret, name) {
+  const before = `${text.slice(0, start)}${name} `;
+  const rest = text.slice(caret).replace(/^ /, '');
+  return { text: before + rest, caret: before.length };
+}
+
+/**
+ * 在开头的 `/命令`：光标在第一个词里（`/` 开头、后面到光标没有空白，光标后面是结尾或空白）时返回这个词，否则 null。
+ * 后面已经有字也能补全（和 TUI 一样），选中后只换掉这个词。
+ */
+export function slashAt(text, caret) {
+  const head = text.slice(0, caret);
+  if (!/^\/\S*$/.test(head) || (caret < text.length && !/\s/.test(text[caret]))) return null;
+  return head;
+}
+
+/** 状态栏上的后台任务个数：{ shell: 1, subagent: 2 } */
+export function backgroundCounts(status) {
+  const out = {};
+  for (const b of status?.background ?? []) out[b.kind] = (out[b.kind] ?? 0) + b.n;
+  // 子代理：hooks 记的个数（前台的也算）和状态栏上的（只算后台的）取大的
+  const agents = Math.max(out.subagent ?? 0, out.agent ?? 0, status?.agents ?? 0);
+  delete out.agent;
+  if (agents) out.subagent = agents;
+  else delete out.subagent;
+  return out;
+}
+
+/** 时长的简短写法：`45s`、`3m12s`、`1h05m` */
+export function duration(ms) {
+  const s = Math.max(0, Math.floor(ms / 1000));
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m${String(s % 60).padStart(2, '0')}s`;
+  return `${Math.floor(m / 60)}h${String(m % 60).padStart(2, '0')}m`;
+}
+
+const URL_RE = /https?:\/\/[^\s<>"'`()[\]{}]+/g;
+const IMAGE_RE = /\.(png|jpe?g|gif|webp|bmp|svg)$/i;
+
+/**
+ * 对话里用到的资源（Codex 的“资源”栏）：网页链接、联网搜索、看过的图片。最近的在前，同一个只列一次。
+ * `turn`：出现在最近一轮（最后一条用户消息之后）时为 true。
+ */
+export function conversationResources(items) {
+  const lastUser = items.map((i) => i.k).lastIndexOf('user');
+  const out = [];
+  const seen = new Set();
+  const add = (kind, value, n, title) => {
+    const v = String(value ?? '').trim().replace(/[.,;:!?。，；：！？]+$/, '');
+    if (!v || seen.has(`${kind}:${v}`)) return;
+    seen.add(`${kind}:${v}`);
+    out.push({ kind, value: v, title: title || '', turn: n > lastUser });
+  };
+  const links = (text, n) => {
+    for (const m of String(text ?? '').match(URL_RE) ?? []) add('link', m, n);
+  };
+  for (let n = items.length - 1; n >= 0; n -= 1) {
+    const it = items[n];
+    if (it.k === 'tool_result') {
+      // 搜索结果是“标题 网址”一行一条
+      for (const line of String(it.content ?? '').split('\n')) {
+        const m = line.match(URL_RE);
+        if (m) add('link', m[0], n, line.replace(m[0], '').trim());
+      }
+    } else if (it.k === 'assistant') {
+      for (const b of [...(it.blocks ?? [])].reverse()) {
+        if (b.t === 'text') links(b.text, n);
+        else if (b.t === 'tool_use' && b.name === 'WebSearch') add('search', b.input?.query, n);
+        else if (b.t === 'tool_use' && b.name === 'Read' && IMAGE_RE.test(b.input?.file_path ?? '')) add('image', b.input.file_path, n);
+        else if (b.t === 'tool_use') links(JSON.stringify(b.input ?? {}), n);
+      }
+    }
+  }
+  return out;
+}
+
+/** 邮箱打码：`jo***@ex***.com`，名字留前两个字、域名留第一段的前两个字和后缀（短的少留一个） */
+export function maskEmail(email) {
+  const keep = (x) => x.slice(0, Math.min(2, Math.max(1, x.length - 1)));
+  const at = email.lastIndexOf('@');
+  if (at < 0) return `${keep(email)}***`;
+  const domain = email.slice(at + 1);
+  const dot = domain.indexOf('.');
+  return `${keep(email.slice(0, at))}***@${keep(dot < 0 ? domain : domain.slice(0, dot))}***${dot < 0 ? '' : domain.slice(dot)}`;
+}
+
+/** 文本里出现的邮箱都打码（组织名常是 `xx@xx.com's Organization`） */
+export function maskEmails(text) {
+  return String(text).replace(/[^\s@'"<>()]+@[^\s@'"<>()]+/g, (m) => maskEmail(m));
+}
+
+/**
+ * 对话里派出的子代理（Agent / Task 工具调用），从已经载入的条目里找，先派的在前。
+ * 同一个子代理（Codex 的子会话 id）再次交回答复会另起一张卡片：合成一个，状态按最后一张。
+ * state：running（还没交回结果、这一轮还在跑）、done、failed、ended（没结果、已经不跑了）。
+ * Claude 后台运行的子代理一启动就有结果，这里看不出是不是还在跑，以服务端的任务列表为准（/chat/tasks）。
+ */
+export function conversationAgents(items, live) {
+  const results = resultsById(items);
+  const out = new Map();
+  for (const it of items) {
+    if (it.k !== 'assistant') continue;
+    for (const b of it.blocks ?? []) {
+      if (b.t !== 'tool_use' || (b.name !== 'Agent' && b.name !== 'Task')) continue;
+      const input = b.input ?? {};
+      const r = results.get(b.id);
+      const id = r?.extra?.agentId ?? input.agent_thread_id ?? null;
+      const key = id ?? b.id;
+      const prev = out.get(key);
+      out.delete(key);
+      out.set(key, {
+        id,
+        tool_use_id: prev?.tool_use_id ?? b.id,
+        description: input.description ?? prev?.description ?? '',
+        type: input.subagent_type ?? prev?.type ?? null,
+        model: input.model ?? prev?.model ?? null,
+        prompt: input.prompt ?? prev?.prompt ?? null,
+        background: input.run_in_background === true || Boolean(r?.extra?.backgroundTaskId),
+        started: prev?.started ?? it.ts ?? null,
+        runs: (prev?.runs ?? 0) + 1,
+        state: r ? (r.is_error ? 'failed' : 'done') : live ? 'running' : 'ended',
+      });
+    }
+  }
+  return [...out.values()];
+}
+
+// ---------------- 划词评论、文件附件（docs/CHAT_UX_2026-11-06.md §1 §2） ----------------
+
+/** 一次最多带几个附件、单个文件多大 */
+export const ATTACH_MAX = 10;
+export const ATTACH_FILE_MAX = 100 * 1024 * 1024;
+/** 引用的一段最多这么多字（多了截断） */
+export const QUOTE_MAX = 2000;
+const ATTACH_LINE = /^\[Attached file: (.+)\]$/;
+
+/** 引用 + 评论 → `> 引用` 若干行，下面一行评论；多段之间空一行 */
+export function quoteText(quotes) {
+  return (quotes ?? [])
+    .map(({ quote, note }) => {
+      let q = String(quote ?? '').trim();
+      if (q.length > QUOTE_MAX) q = `${q.slice(0, QUOTE_MAX)}…`;
+      const lines = q.split('\n').map((l) => (l.trim() ? `> ${l}` : '>'));
+      const n = String(note ?? '').trim();
+      return n ? `${lines.join('\n')}\n${n}` : lines.join('\n');
+    })
+    .join('\n\n');
+}
+
+/** 发出去的正文：引用在前，用户写的在中间，附件（非图片文件）一行一个在最后 */
+export function composeMessage(text, quotes = [], files = []) {
+  const parts = [quoteText(quotes), String(text ?? '').trim()].filter(Boolean);
+  const att = files.map((p) => `[Attached file: ${p}]`).join('\n');
+  if (att) parts.push(att);
+  return parts.join('\n\n');
+}
+
+/** 附件目录里的文件名去掉上传时加的时间前缀（`20261106-101530-a.pdf` → `a.pdf`） */
+export function attachName(path) {
+  const name = String(path ?? '').split(/[\\/]/).pop();
+  return name.replace(/^\d{8}-\d{6}-/, '') || name;
+}
+
+/**
+ * 用户消息拆开显示：末尾的附件行收成文件列表，`> ` 开头的连续几行是引用。
+ * 返回 `{ parts: [{ k: 'quote' | 'text', text }], files: [路径] }`。
+ */
+export function parseUserText(text) {
+  const lines = String(text ?? '').split('\n');
+  const files = [];
+  let end = lines.length;
+  while (end > 0) {
+    const l = lines[end - 1].trim();
+    const m = ATTACH_LINE.exec(l);
+    if (m) files.unshift(m[1]);
+    else if (l) break;
+    end -= 1;
+  }
+  // 没有附件行时，末尾的空行照原样留着
+  const body = files.length ? lines.slice(0, end) : lines;
+  const parts = [];
+  for (const l of body) {
+    const quote = l === '>' || l.startsWith('> ');
+    const k = quote ? 'quote' : 'text';
+    const s = quote ? l.replace(/^> ?/, '') : l;
+    const last = parts[parts.length - 1];
+    if (last && last.k === k) last.text += `\n${s}`;
+    else parts.push({ k, text: s });
+  }
+  // 引用和后面的评论之间不留空行；文字段去掉首尾空行
+  return { parts: parts.map((p) => (p.k === 'text' ? { ...p, text: p.text.replace(/^\n+|\n+$/g, '') } : p)).filter((p) => p.k === 'quote' || p.text), files };
+}
+
+/**
+ * 上下文用了多少：对话框的小圆环和用量面板共用这一个算法。自己设了自动压缩点（Claude：settings.json 的 autoCompactWindow、
+ * /autocompact、模型设置；Codex：model_auto_compact_token_limit）且开着压缩时，按离压缩还有多远算（和 Claude Code 终端里的
+ * “离自动压缩还剩”一致）；没设就按整个窗口。`total` 为 0 = 窗口还不知道（Codex 第一轮之前、第三方模型目录里没有），不瞎按 20 万算。
+ */
+export function contextGauge(used, win, compact) {
+  const window = win || 0;
+  const at = compact?.enabled && compact.at ? Math.min(compact.at, window || compact.at) : null;
+  const total = at || window;
+  const p = total ? Math.min(1, (used || 0) / total) : 0;
+  return { used: used || 0, window, at, total, p, pct: Math.round(p * 100), level: p > 0.85 ? 'high' : p > 0.6 ? 'mid' : 'low' };
+}

@@ -1,0 +1,49 @@
+# 看看客户端 · 转正式版（手动触发；维护者在私有仓库里用 scripts/release.sh promote 触发）。
+#
+# 安装包由 client-linux / client-windows / client-macos 三个工作流各自构建，传到同一个 Pre-release client-v{版本}
+# （beta 通道）。三个平台都构建成功后运行这里：核对三个平台齐全、用同一份源码构建（更新说明不算），
+# 把 release.json 改成 stable 通道（可设最低支持版本）、去掉 Pre-release 标记并设为 Latest。不重新构建。
+# 看看服务端 5 分钟内同步，开了自动更新的客户端会在空闲时自己更新。
+name: client-release
+run-name: client-release ${{ inputs.version }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 版本号（如 1.66.0）
+        type: string
+        required: true
+      min_supported_version:
+        description: 最低支持版本（可选；低于它的客户端被要求更新，且不能登录）
+        type: string
+        required: false
+      allow_mixed:
+        description: 允许各平台用不同源码构建（只在确认无妨时勾选）
+        type: boolean
+        default: false
+
+# 与各平台的合并共用一把锁，不会同时改 release.json
+concurrency:
+  group: client-stage
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  promote:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: client
+    steps:
+      - uses: actions/checkout@v4
+      - name: 转正式版
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+          MIN_SUPPORTED: ${{ inputs.min_supported_version }}
+          ALLOW_MIXED: ${{ inputs.allow_mixed }}
+        run: bash scripts/release-stage.sh promote "$VERSION" "$MIN_SUPPORTED" "$ALLOW_MIXED"

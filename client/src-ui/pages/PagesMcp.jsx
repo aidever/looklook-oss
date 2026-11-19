@@ -1,0 +1,165 @@
+// AI 助手页的 MCP 接口：打开后，Codex / Claude Code / OpenCode / DSH 可以自己查看、添加本机网页，
+// 在允许 AI 使用的 SSH 主机上运行命令（工具清单和开关见 Ai.jsx）。
+// 远程打开也能看令牌、装进 AI 助手（有两步验证），和本机一样。
+import { RefreshCw, Trash2 } from 'lucide-react';
+import { useEffect, useState } from 'react';
+import { useTranslation } from 'react-i18next';
+
+import { api } from '../shared/api.js';
+import { errorText } from '../shared/i18n.js';
+import { More } from '../shared/page.jsx';
+import { Button, Card, CopyButton, ErrorNote, Seg, Skeleton, Switch, useConfirm, useLoad, useToast } from '../shared/ui.jsx';
+
+const AGENT_NAME = { claude: 'Claude Code', codex: 'Codex', opencode: 'OpenCode', dsh: 'DSH (DeepSeek Harness)', agy: 'Antigravity (agy)' };
+
+function AgentRow({ a, skill, enabled, busy, onInstall, onRemove }) {
+  const { t } = useTranslation();
+  const installed = a.mcp !== 'none' || a.skill;
+  let badge;
+  if (!a.available) badge = <span className="badge">{t('pages.mcp.not_found')}</span>;
+  else if (a.mcp === 'ok') badge = <span className="badge badge-ok">{a.skill ? t(`pages.mcp.installed_${a.skill}`) : t('pages.mcp.installed')}</span>;
+  else if (a.mcp === 'stale') badge = <span className="badge badge-warn">{t('pages.mcp.stale')}</span>;
+  else badge = <span className="badge">{t('pages.mcp.not_installed')}</span>;
+  // 已装好且技能就是现在选的：不用再装
+  const current = a.mcp === 'ok' && (a.skill ?? 'none') === skill;
+  return (
+    <li>
+      <span className="grow inline">
+        <b>{AGENT_NAME[a.agent]}</b>
+        {badge}
+      </span>
+      <span className="inline" style={{ flexWrap: 'nowrap' }}>
+        {a.available && (
+          <Button variant={current ? 'ghost' : 'primary'} disabled={!enabled || busy || current} onClick={() => onInstall(a.agent)}>
+            {a.mcp === 'none' ? t('pages.mcp.install') : current ? t('pages.mcp.up_to_date') : t('pages.mcp.reinstall')}
+          </Button>
+        )}
+        {installed && <Button variant="ghost" icon={Trash2} disabled={busy} aria-label={t('pages.mcp.remove')} onClick={() => onRemove(a.agent)} />}
+      </span>
+    </li>
+  );
+}
+
+/** onChange：开关、安装等改动之后（AI 助手页据此刷新工具清单） */
+export default function McpCard({ onChange }) {
+  const { t } = useTranslation();
+  const toast = useToast();
+  const confirm = useConfirm();
+  const [loaded, error] = useLoad(() => api.get('/mcp'));
+  const [view, setView] = useState(null);
+  const [skill, setSkill] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const v = view ?? loaded;
+
+  // 默认选中已经装着的技能；都没装选“先问”
+  useEffect(() => {
+    if (v && skill === null) setSkill(v.agents.find((a) => a.skill)?.skill ?? 'ask');
+  }, [v, skill]);
+
+  const act = async (fn, done) => {
+    setBusy(true);
+    try {
+      setView(await fn());
+      onChange?.();
+      if (done) toast(done);
+    } catch (e) {
+      toast(errorText(t, e), 'error');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const rotate = async () => {
+    if (await confirm({ title: t('pages.mcp.rotate_title'), body: t('pages.mcp.rotate_body'), confirm: t('pages.mcp.rotate') })) {
+      act(() => api.put('/mcp', { rotate: true }), t('pages.mcp.rotated'));
+    }
+  };
+  const remove = async (agent) => {
+    if (await confirm({ title: t('pages.mcp.remove_title', { name: AGENT_NAME[agent] }), body: t('pages.mcp.remove_body', { name: AGENT_NAME[agent] }), confirm: t('pages.mcp.remove'), danger: true })) {
+      act(() => api.post('/mcp/uninstall', { agent }), t('pages.mcp.removed'));
+    }
+  };
+
+  if (error) return <ErrorNote error={error} />;
+  if (!v) return <Skeleton height={120} />;
+  const skills = [
+    ['auto', t('pages.mcp.skill_auto'), t('pages.mcp.skill_auto_hint')],
+    ['ask', t('pages.mcp.skill_ask'), t('pages.mcp.skill_ask_hint')],
+    ['none', t('pages.mcp.skill_none'), t('pages.mcp.skill_none_hint')],
+  ];
+  const hint = skills.find(([k]) => k === skill)?.[2];
+  // 这台电脑上找到的 AI 助手里，还没装好（没装、过期、技能和选的不一样）的：一个按钮全装上
+  const found = v.agents.filter((a) => a.available);
+  const pending = found.filter((a) => !(a.mcp === 'ok' && (a.skill ?? 'none') === skill));
+  const installAll = () =>
+    act(async () => {
+      let r = null;
+      for (const a of pending) r = await api.post('/mcp/install', { agent: a.agent, skill });
+      return r;
+    }, t('pages.mcp.done', { name: pending.map((a) => AGENT_NAME[a.agent]).join('、') }));
+  return (
+    <Card
+      title={t('pages.mcp.title')}
+      sub={t('pages.mcp.intro')}
+      actions={<Switch checked={v.enabled} disabled={busy} label={t('pages.mcp.enable')} onChange={(on) => act(() => api.put('/mcp', { enabled: on }))} />}
+    >
+      {v.enabled && (
+        <>
+          {found.length === 0 ? (
+            <p className="muted small">{t('pages.mcp.none_found')}</p>
+          ) : (
+            <div className="mcp-sum">
+              <span className="grow mcp-agents">
+                {found.map((a) => (
+                  <span key={a.agent} className={`badge ${a.mcp === 'ok' ? 'badge-ok' : a.mcp === 'stale' ? 'badge-warn' : ''}`}>
+                    {AGENT_NAME[a.agent]} · {t(a.mcp === 'ok' ? 'pages.mcp.installed' : a.mcp === 'stale' ? 'pages.mcp.stale' : 'pages.mcp.not_installed')}
+                  </span>
+                ))}
+              </span>
+              {pending.length > 0 ? (
+                <Button busy={busy} onClick={installAll}>
+                  {t('pages.mcp.install_all', { count: pending.length })}
+                </Button>
+              ) : (
+                <span className="small ok-text">{t('pages.mcp.all_done')}</span>
+              )}
+            </div>
+          )}
+          {found.length > 0 && <p className="muted small" style={{ marginBottom: 0 }}>{t('pages.mcp.restart_note')}</p>}
+          <More summary={t('pages.mcp.advanced')}>
+            <div className="field">
+              <span className="field-label">{t('pages.mcp.skill')}</span>
+              <Seg value={skill} label={t('pages.mcp.skill')} onChange={setSkill} options={skills.map(([k, text]) => [k, text])} />
+              <span className="field-hint">{hint}</span>
+            </div>
+            <ul className="list">
+              {v.agents.map((a) => (
+                <AgentRow
+                  key={a.agent}
+                  a={a}
+                  skill={skill}
+                  enabled={v.enabled}
+                  busy={busy}
+                  onInstall={(agent) => act(() => api.post('/mcp/install', { agent, skill }), t('pages.mcp.done', { name: AGENT_NAME[agent] }))}
+                  onRemove={remove}
+                />
+              ))}
+            </ul>
+            <p className="field-label" style={{ marginTop: 16 }}>{t('pages.mcp.manual')}</p>
+            <p className="small muted">{t('pages.mcp.manual_body')}</p>
+            <p className="inline">
+              <span className="muted small">{t('pages.mcp.url')}</span> <code className="mono small">{v.url}</code> <CopyButton text={v.url} label={false} />
+            </p>
+            <p className="inline">
+              <span className="muted small">{t('pages.mcp.header')}</span> <code className="mono small">Authorization: Bearer {v.token.slice(0, 10)}…</code>{' '}
+              <CopyButton text={`Authorization: Bearer ${v.token}`} label={false} />
+            </p>
+            <Button variant="ghost" icon={RefreshCw} disabled={busy} onClick={rotate}>
+              {t('pages.mcp.rotate')}
+            </Button>
+          </More>
+        </>
+      )}
+    </Card>
+  );
+}

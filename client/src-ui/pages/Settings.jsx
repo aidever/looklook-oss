@@ -1,0 +1,372 @@
+// 设置：按分区显示，一次只看一个分区（地址里的 #分区 决定）。
+//   通用：电脑名称、语言、附件；终端：字体与配色、新终端的默认文件夹和 shell、新 AI 会话默认的权限；
+//   网络与访问：远程线路、直连（端口与公网地址）、访问控制；关于：版本、检查更新、问题记录。
+// 和 AI 有关的（账号与模型、通知与飞书、工具与权限、宠物）在“AI 助手”页（Ai.jsx），以前指到这里的锚点转过去。
+// 终端和通用里的选项改了就自动保存，不需要点保存按钮。
+import { Bot, Check, Globe, Info, SlidersHorizontal, SquareTerminal, Eraser } from 'lucide-react';
+import { IdleCleanupDialog } from '../shared/IdleCleanup.jsx';
+import { useEffect, useRef, useState } from 'react';
+import { useTranslation } from 'react-i18next';
+
+import { useStatus } from '../App.jsx';
+import { More, Row } from '../shared/page.jsx';
+import { LocalOnlyToggle, useDevices } from '../shared/devices.jsx';
+import { api } from '../shared/api.js';
+import AccessCard from './Access.jsx';
+import DirectCard from './DirectConnect.jsx';
+import { AttachmentsCard } from '../shared/Attachments.jsx';
+import { MacFoldersCard } from '../shared/MacFolders.jsx';
+import { MOVED_TO_AI } from './Ai.jsx';
+import { FolderField, ShellPicker } from './Terminals.jsx';
+import { setLocale } from '../shared/i18n.js';
+import { termTheme } from '../shared/termTheme.js';
+import { DiagCard } from '../shared/Report.jsx';
+import RelayPicker, { RELAYS_ANCHOR } from '../shared/RelayPicker.jsx';
+import { Link, useRouter } from '../shared/router.jsx';
+import { shouldRemind, UpdateCheck } from '../shared/Update.jsx';
+import { Button, Card, ErrorNote, Seg, useAction, useLoad, useToast } from '../shared/ui.jsx';
+import { useTips } from '../shared/tips.jsx';
+import { SyncCard, SyncLabel } from '../shared/SettingsSync.jsx';
+
+// 开源仓库（客户端 AGPL-3.0-or-later）
+
+const SYSTEM_CJK = '"PingFang SC", "Hiragino Sans GB", "Microsoft YaHei UI", "Microsoft YaHei", "Noto Sans Mono CJK SC", "Noto Sans CJK SC", monospace';
+
+export function fontFamily(font) {
+  return `"JetBrains Mono", ${font === 'wenkai' ? '"LXGW WenKai Mono", ' : ''}${SYSTEM_CJK}`;
+}
+
+/** 在管理台里加载终端字体（用于预览）。 */
+function useTerminalFonts(enabled) {
+  useEffect(() => {
+    if (!enabled || document.getElementById('ll-term-fonts')) return;
+    const l = document.createElement('link');
+    l.id = 'll-term-fonts';
+    l.rel = 'stylesheet';
+    l.href = '/fonts/fonts.css';
+    document.head.appendChild(l);
+  }, [enabled]);
+}
+
+// 分段选择挪到了 shared/ui.jsx；别的页面还从这里引用
+export { Seg };
+
+/** 终端配色：每个选项是一小块终端的样子（栏、提示符、光标、几种 ANSI 颜色） */
+const SECTIONS = [
+  ['general', SlidersHorizontal],
+  ['terminal', SquareTerminal],
+  ['network', Globe],
+  ['about', Info],
+];
+// 别处链接用的锚点（#relays、#access）落到所在的分区
+const ALIAS = { [RELAYS_ANCHOR]: 'network', access: 'network' };
+
+function sectionOf(hash) {
+  const h = hash.replace(/^#/, '');
+  const id = ALIAS[h] ?? h;
+  return SECTIONS.some(([k]) => k === id) ? id : 'general';
+}
+
+// 自动保存的设置项（配色在终端页里换，自动更新、附件保留天数在各自的卡片里单独保存）
+const KEYS = ['font', 'font_size', 'default_workdir', 'default_shell', 'device_name', 'default_full_access', 'idle_stop_days'];
+const differs = (a, b) => (k) => String(a[k] ?? '') !== String(b[k] ?? '');
+const same = (a, b) => !KEYS.some(differs(a, b));
+
+/** 改动停下 600 毫秒后保存；离开页面时把没保存的立即发出去。 */
+function useAutoSave(status, reload) {
+  const [s, setS] = useState(status.settings);
+  const [state, setState] = useState({ phase: 'idle', error: null });
+  const saved = useRef(status.settings);
+  const latest = useRef({ s, status });
+  latest.current = { s, status };
+
+  // 只发改了的项：其余的（包括别的电脑刚同步过来的）由后端沿用现在的值
+  const body = (v) => Object.fromEntries(KEYS.filter(differs(v, saved.current)).map((k) => [k, k === 'font_size' || k === 'idle_stop_days' ? Number(v[k]) : v[k]]));
+
+  // 没有未保存的改动时跟着最新状态走（比如别的电脑同步来了新字号）
+  useEffect(() => {
+    if (same(latest.current.s, saved.current) && !same(status.settings, saved.current)) {
+      saved.current = status.settings;
+      setS(status.settings);
+    }
+  }, [status.settings]);
+
+  useEffect(() => {
+    if (same(s, saved.current)) return;
+    const id = setTimeout(async () => {
+      const sent = s;
+      setState({ phase: 'saving', error: null });
+      try {
+        const r = await api.put('/settings', body(sent));
+        saved.current = r;
+        // 保存期间又改了的话，不覆盖正在输入的内容
+        if (latest.current.s === sent) setS(r);
+        setState({ phase: 'saved', error: null });
+        reload();
+      } catch (e) {
+        setState({ phase: 'error', error: e });
+      }
+    }, 600);
+    return () => clearTimeout(id);
+  }, [s]);
+
+  useEffect(
+    () => () => {
+      if (!same(latest.current.s, saved.current)) api.put('/settings', body(latest.current.s)).then(reload, () => {});
+    },
+    [],
+  );
+
+  return [s, setS, state];
+}
+
+/** 后台会话：几天没打开就自动停掉，以及立即清理（shared/IdleCleanup.jsx） */
+function IdleCard({ value, onChange }) {
+  const { t } = useTranslation();
+  const [open, setOpen] = useState(false);
+  return (
+    <Card title={t('idle.card')}>
+      <Row label={<SyncLabel text={t('idle.auto_label')} />} hint={t('idle.auto_hint')} stack>
+        <Seg
+          value={Number(value)}
+          label={t('idle.auto_label')}
+          onChange={onChange}
+          options={[0, 1, 3, 7, 14, 30].map((d) => [d, d ? t('idle.n_days', { count: d }) : t('idle.never')])}
+        />
+      </Row>
+      <Row label={t('idle.now_label')} hint={t('idle.now_hint')}>
+        <Button variant="ghost" icon={Eraser} onClick={() => setOpen(true)}>
+          {t('idle.pick')}
+        </Button>
+      </Row>
+      {open && <IdleCleanupDialog onClose={() => setOpen(false)} />}
+    </Card>
+  );
+}
+
+/** 使用提示：看过的一次性提示、上手清单都重新出现（shared/tips.jsx）。 */
+function TipsField() {
+  const { t } = useTranslation();
+  const tips = useTips();
+  const toast = useToast();
+  const { busy, run } = useAction();
+  const reset = () =>
+    run(async () => {
+      await tips.reset();
+      toast(t('tips.reset_done'));
+    });
+  return (
+    <Row label={t('tips.reset_label')} hint={t('tips.reset_hint')}>
+      <Button variant="ghost" busy={busy} onClick={reset}>
+        {t('tips.reset')}
+      </Button>
+    </Row>
+  );
+}
+
+function SaveState({ state }) {
+  const { t } = useTranslation();
+  if (state.phase === 'saving') return <span className="save-state">{t('settings.saving')}</span>;
+  if (state.phase === 'saved')
+    return (
+      <span className="save-state ok">
+        <Check size={14} aria-hidden="true" />
+        {t('settings.saved')}
+      </span>
+    );
+  return null;
+}
+
+export default function Settings() {
+  const { t, i18n } = useTranslation();
+  const { status, reload } = useStatus();
+  const { hash, navigate } = useRouter();
+  const devices = useDevices();
+  const [s, setS, saveState] = useAutoSave(status, reload);
+  const [shells] = useLoad(() => api.get('/shells'));
+  const caps = status.capabilities;
+  useTerminalFonts(caps.fonts);
+  const set = (k) => (v) => setS({ ...s, [k]: v });
+  const section = sectionOf(hash);
+  const th = termTheme(s.theme);
+  const updateDot = shouldRemind(status.update);
+
+  const go = (id) => {
+    navigate(`/settings#${id}`, { replace: true });
+  };
+
+  const sections = {
+    general: (
+      <>
+        <Card title={t('settings.general')}>
+          <Row label={t('settings.device_name')} hint={t('settings.device_name_hint')}>
+            <input className="srow2-input" value={s.device_name} onChange={(e) => set('device_name')(e.target.value)} maxLength={64} placeholder={t('settings.device_name_auto')} />
+          </Row>
+          <Row label={t('settings.language')} hint={devices.multi ? t('settings.language_hint') : undefined}>
+            <Seg
+              value={i18n.language?.startsWith('en') ? 'en-US' : 'zh-CN'}
+              label={t('settings.language')}
+              onChange={setLocale}
+              options={[
+                ['zh-CN', '中文'],
+                ['en-US', 'English'],
+              ]}
+            />
+          </Row>
+        </Card>
+        {caps.os === 'darwin' && status.access === 'local' && <MacFoldersCard />}
+        <SyncCard />
+        <IdleCard value={s.idle_stop_days ?? 7} onChange={set('idle_stop_days')} />
+        <AttachmentsCard />
+      </>
+    ),
+    terminal: (
+      <>
+        <Card title={t('settings.terminal')}>
+          <div
+            className="font-preview"
+            style={{ '--preview-font': fontFamily(s.font), '--term-bg': th.bg, '--term-accent': th.accent, color: th.fg, fontSize: `${s.font_size}px` }}
+          >
+            {t('settings.preview')}
+          </div>
+          <Row label={<SyncLabel text={t('settings.font')} />} hint={caps.fonts ? undefined : t('settings.font_missing')}>
+            <Seg
+              value={s.font}
+              label={t('settings.font')}
+              onChange={set('font')}
+              options={[
+                ['wenkai', t('settings.font_wenkai')],
+                ['system', t('settings.font_system')],
+              ]}
+            />
+          </Row>
+          <Row label={<SyncLabel text={t('settings.font_size')} />}>
+            <Seg value={Number(s.font_size)} label={t('settings.font_size')} onChange={set('font_size')} options={[13, 14, 15, 16, 18, 20].map((n) => [n, String(n)])} />
+          </Row>
+        </Card>
+        <Card title={t('settings.new_terminal')}>
+          <FolderField label={t('settings.workdir')} hint={t('settings.workdir_hint')} value={s.default_workdir} onChange={set('default_workdir')} />
+          <ShellPicker value={s.default_shell ?? ''} onChange={set('default_shell')} data={shells} />
+          <Row label={<SyncLabel text={t('settings.default_full_access')} />} hint={t('settings.default_full_access_hint')}>
+            <Seg
+              value={Boolean(s.default_full_access)}
+              label={t('settings.default_full_access')}
+              onChange={set('default_full_access')}
+              options={[
+                [false, t('settings.default_full_access_ask')],
+                [true, t('settings.default_full_access_on')],
+              ]}
+            />
+          </Row>
+        </Card>
+      </>
+    ),
+    network: (
+      <>
+        {(devices.localOnly || (devices.canLocalOnly && (!devices.multi || devices.selected === devices.def))) && (
+          <Card title={t('devices.mine')}>
+            <LocalOnlyToggle menu={false} />
+          </Card>
+        )}
+        <RelayPicker />
+        <DirectCard />
+        <div id="access" className="anchor">
+          <AccessCard />
+        </div>
+      </>
+    ),
+    about: (
+      <>
+        <Card title={t('settings.about')}>
+          <Row
+            label={
+              <span className="mono">
+                {t('settings.version')} {status.version}
+                {/* Windows 版（桌面应用）还在测试阶段 */}
+                {status.target?.startsWith('windows') && <> <span className="badge badge-warn">{t('settings.beta')}</span></>}
+              </span>
+            }
+          />
+          <UpdateCheck />
+          {/* Claude Code、Codex、DSH 的版本和自动更新在 AI 助手页：在这里找更新的人点一下过去 */}
+          <Row label={t('aup.settings_link')} hint={t('aup.settings_link_hint')}>
+            <Link to="/ai#updates">{t('aup.settings_link_go')}</Link>
+          </Row>
+          <TipsField />
+          <More summary={t('settings.details')}>
+            <dl className="kv">
+              <dt>{t('settings.platform')}</dt>
+              <dd className="mono">{status.target}</dd>
+              <dt>{t('settings.backend')}</dt>
+              <dd>{t(caps.persistent ? 'settings.backend_persistent' : 'settings.backend_direct')}</dd>
+              <dt>{t('settings.server')}</dt>
+              <dd className="mono">{status.account.server}</dd>
+              <dt>{t('settings.source')}</dt>
+              <dd>
+                AGPL-3.0
+              </dd>
+            </dl>
+          </More>
+        </Card>
+        <DiagCard />
+      </>
+    ),
+  };
+
+  // 以前在这里的 AI 分区（#ai、#notify、#pet、#claude-accounts 等）搬到了 AI 助手页
+  const moved = MOVED_TO_AI.has(hash.replace(/^#/, ''));
+  useEffect(() => {
+    if (moved) navigate(`/ai${hash}`, { replace: true });
+  }, [moved, hash, navigate]);
+
+  // 从别处带着 #access 跳过来时滚到访问控制
+  useEffect(() => {
+    if (hash === '#access') setTimeout(() => document.getElementById('access')?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 50);
+  }, [hash]);
+
+  return (
+    <>
+      <div className="settings">
+        <nav className="settings-nav" aria-label={t('settings.title')}>
+          {SECTIONS.map(([id, Icon]) => (
+            <a
+              key={id}
+              href={`/settings#${id}`}
+              className={`settings-tab${section === id ? ' active' : ''}`}
+              aria-current={section === id ? 'page' : undefined}
+              onClick={(e) => {
+                e.preventDefault();
+                go(id);
+              }}
+            >
+              <Icon size={18} aria-hidden="true" />
+              <span>{t(`settings.sec_${id}`)}</span>
+              {id === 'about' && updateDot && <span className="dot-badge" aria-label={t('update.badge')} />}
+            </a>
+          ))}
+          {/* AI 账号、通知与飞书、工具、宠物搬到了 AI 助手页：在这里找的人点一下过去 */}
+          <a
+            href="/ai"
+            className="settings-tab"
+            onClick={(e) => {
+              e.preventDefault();
+              navigate('/ai');
+            }}
+          >
+            <Bot size={18} aria-hidden="true" />
+            <span>{t('nav.ai')} →</span>
+          </a>
+        </nav>
+        <div className="settings-body">
+          {(section === 'general' || section === 'terminal') && saveState.phase !== 'idle' && (
+            <div className="settings-note">
+              <SaveState state={saveState} />
+            </div>
+          )}
+          {(section === 'general' || section === 'terminal') && <ErrorNote error={saveState.error} />}
+          {sections[section]}
+        </div>
+      </div>
+    </>
+  );
+}
