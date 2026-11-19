@@ -50,7 +50,7 @@ function fetchProviders(device, withTargets = false) {
   const hit = provCache.get(key);
   if (hit && Date.now() - hit.at < TTL) return hit.job;
   const job = deviceApi(device)
-    .get(withTargets ? '/plugins/_capabilities/open-url?fetch=1' : '/plugins/_capabilities/open-url')
+    .get(withTargets ? '/plugins/_capabilities/open-url?fetch=true' : '/plugins/_capabilities/open-url')
     .then(
       (d) => {
         const list = Array.isArray(d?.providers) ? d.providers : [];

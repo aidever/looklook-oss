@@ -45,9 +45,14 @@ pub fn host_routes() -> Router<App> {
         .route("/_host/data", get(host_data))
 }
 
+fn de_bool_lenient<'de, D: serde::Deserializer<'de>>(d: D) -> Result<bool, D::Error> {
+    let s = Option::<String>::deserialize(d)?;
+    Ok(matches!(s.as_deref(), Some("1" | "true" | "TRUE" | "yes")))
+}
+
 #[derive(Deserialize, Default)]
 struct ListQuery {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_bool_lenient")]
     catalog: bool,
 }
 
@@ -78,7 +83,7 @@ async fn list_plugins(State(app): State<App>, Query(q): Query<ListQuery>) -> Jso
 #[derive(Deserialize, Default)]
 struct OpenUrlQuery {
     /// 为 true 时向已安装的 `open_url` 插件拉取实时 targets（必要时按需拉起插件）。
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_bool_lenient")]
     fetch: bool,
 }
 
@@ -307,6 +312,10 @@ mod tests {
 
     #[test]
     fn readonly_policy_enforced() {
+        let q1: ListQuery = serde_urlencoded::from_str("catalog=1").unwrap();
+        let q2: ListQuery = serde_urlencoded::from_str("catalog=true").unwrap();
+        let q0: ListQuery = serde_urlencoded::from_str("catalog=0").unwrap();
+        assert!(q1.catalog && q2.catalog && !q0.catalog);
         assert!(check_readonly(ReadonlyPolicy::Deny, false, &Method::POST, false));
         assert!(!check_readonly(ReadonlyPolicy::Deny, true, &Method::GET, false));
         assert!(check_readonly(ReadonlyPolicy::ReadMethods, true, &Method::GET, false));

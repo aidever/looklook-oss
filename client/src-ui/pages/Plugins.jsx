@@ -31,7 +31,7 @@ export default function Plugins() {
   const [error, setError] = useState(null);
 
   const load = (withCatalog = true) =>
-    api.get(withCatalog ? '/plugins?catalog=1' : '/plugins').then(
+    api.get(withCatalog ? '/plugins?catalog=true' : '/plugins').then(
       (d) => {
         setData((prev) => ({
           ...d,
