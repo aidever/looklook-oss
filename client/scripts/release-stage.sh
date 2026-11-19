@@ -47,7 +47,7 @@ cmd_preflight() {
     beta) echo "client-v$v 已有 beta，本平台的安装包会被覆盖" ;;
     none) echo "client-v$v 还没有 Release，构建完会新建一个 Pre-release" ;;
   esac
-  echo "构建 $v（现在：$s）" | summary
+  echo "构建 ${v}（现在：${s}）" | summary
 }
 
 cmd_upload() {
@@ -74,7 +74,7 @@ cmd_upload() {
     files+=("$ui")
   fi
   gh release upload "client-v$v" "${files[@]}" --clobber
-  echo "已上传 $platform：${#files[@]} 个文件 → client-v$v" | summary
+  echo "已上传 ${platform}：${#files[@]} 个文件 → client-v$v" | summary
 }
 
 # merge_to <版本> <通道> [release-info merge 的其它参数…]：取回 platform-*.json → 生成 → 上传 → 核对，有变化就重做
@@ -102,7 +102,7 @@ cmd_merge() {
   local v s
   v=$(version)
   s=$(state "$v")
-  [[ $s == beta ]] || die "client-v$v 现在是 $s，不是 beta（已转正式版的不再合并）"
+  [[ $s == beta ]] || die "client-v$v 现在是 ${s}，不是 beta（已转正式版的不再合并）"
   merge_to "$v" beta
 }
 
@@ -113,7 +113,7 @@ cmd_promote() {
   case $s in
     stable) echo "client-v$v 已经是正式版" | summary; exit 0 ;;
     beta) ;;
-    *) die "client-v$v 还没有 beta Release（$s）：先构建三个平台" ;;
+    *) die "client-v$v 还没有 beta Release（${s}）：先构建三个平台" ;;
   esac
   local extra=(--require-all)
   [[ -n $min ]] && extra+=(--min-supported "$min")
