@@ -22,6 +22,7 @@ fn main() {
 
     let server = env::var("LOOKLOOK_SERVER_URL").unwrap_or_default();
     let keys = env::var("LOOKLOOK_PLATFORM_KEYS").unwrap_or_default();
+    // 插件包的离线签名公钥（`pk1=<base64url>`），见 src/plugins.rs
     let plugin_keys = env::var("LOOKLOOK_PLUGIN_KEYS").unwrap_or_default();
     let key = build_key();
 

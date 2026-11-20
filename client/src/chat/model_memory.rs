@@ -111,12 +111,6 @@ pub fn codex_base(codex_home: &Path, p: &crate::codex_profiles::Profile) -> Stri
     json!([top("model"), top("model_reasoning_effort"), top("profile"), p.model, p.tuning.effort]).to_string()
 }
 
-/// Antigravity CLI 的默认模型（`~/.gemini/antigravity-cli/settings.json` 的 `model`）
-pub fn agy_base() -> String {
-    let s = read_json(&crate::agents::agy_data_dir().join("settings.json"));
-    json!([s["model"]]).to_string()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

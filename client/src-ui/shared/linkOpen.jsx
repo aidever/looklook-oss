@@ -1,11 +1,11 @@
-// 对话里的网址：除了照旧在系统浏览器打开，还能交给安装了 `open_url` 能力的插件打开（协议 docs/BROWSER_PLUGIN_DESIGN_2026-11-19.md §3.1）。
+// 对话里的网址（回复里的链接、工具结果里的地址……）除了照旧在系统浏览器（新标签页）打开，还能交给会话所在电脑上
+// 能打开网址的插件（清单里 `open_url: true`，例如远程浏览器）。看看不认识具体插件：菜单里每个这样的插件一行。
 //
-// 交互：
-// - 会话所在的电脑上没有安装声明 `open_url` 能力的插件：完全照旧，不拦点击。
-// - 有插件：点链接弹一个小菜单——系统浏览器 / 各插件的目标列表（正在用的排第一）/ 复制链接，底下“记住选择”。
+// - 会话所在的电脑上没有这样的插件：完全照旧，不拦点击。
+// - 有：点链接弹一个小菜单——系统浏览器 / 用 <插件> 打开 / 复制链接，底下“记住选择”（记在这个浏览器里）。
 // - Ctrl / ⌘ / Shift / 中键点、右键、长按：都交给浏览器自己，不弹菜单。
-// - 调插件 `open` 接口返回 `confirm` 时弹通用确认框，用户同意后带 `confirmed` 重发；返回 `opened` / `navigate` 时跳到对应插件页面。
-import { Check, Copy, Download, ExternalLink } from 'lucide-react';
+// - 交给插件：`POST /api/plugins/<名>/open-url { url }`（插件自己决定在哪个窗口、哪套配置里开），然后跳到插件页。
+import { Check, Copy, ExternalLink } from 'lucide-react';
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { useTranslation } from 'react-i18next';
@@ -17,16 +17,15 @@ import { errorText } from './i18n.js';
 import { isDesktopApp } from './layers.js';
 import { pickLocalized, pluginIcon, pluginRoute } from './plugins.jsx';
 import { useRouter } from './router.jsx';
-import { useConfirm, useToast } from './ui.jsx';
+import { useToast } from './ui.jsx';
 
 const PREF_KEY = 'looklook.chat-links';
 
-/** 对话里的链接默认怎么开：ask（每次问）、system（系统浏览器）、plugin:<名>（直接交给该插件）。 */
+/** 对话里的链接默认怎么开：`ask`（每次问）、`system`（系统浏览器）、`plugin:<名>`（交给这个插件） */
 export function linkPref() {
   try {
     const v = localStorage.getItem(PREF_KEY);
-    if (v === 'system' || (v && v.startsWith('plugin:'))) return v;
-    return 'ask';
+    return v === 'system' || /^plugin:[a-z][a-z0-9-]{1,31}$/.test(v ?? '') ? v : 'ask';
   } catch {
     return 'ask';
   }
@@ -34,144 +33,100 @@ export function linkPref() {
 
 export function setLinkPref(v) {
   try {
-    if (!v || v === 'ask') localStorage.removeItem(PREF_KEY);
+    if (v === 'ask') localStorage.removeItem(PREF_KEY);
     else localStorage.setItem(PREF_KEY, v);
   } catch {
     /* 存不了就每次问 */
   }
 }
 
-// 每台电脑的 open_url 能力提供者（不主动拉起未运行的插件；点开菜单时再拉取实时 targets）
-const provCache = new Map();
+// 每台电脑上能打开网址的插件（`GET /status` 里的 plugins），点链接时不等网络
+const cache = new Map();
 const TTL = 30_000;
-
-function fetchProviders(device, withTargets = false) {
-  const key = `${device ?? ''}:${withTargets ? 1 : 0}`;
-  const hit = provCache.get(key);
-  if (hit && Date.now() - hit.at < TTL) return hit.job;
-  const job = deviceApi(device)
-    .get(withTargets ? '/plugins/_capabilities/open-url?fetch=true' : '/plugins/_capabilities/open-url')
+function fetchTargets(device) {
+  const key = device ?? '';
+  const hit = cache.get(key);
+  if (hit && Date.now() - hit.at < TTL) return;
+  cache.set(key, { at: Date.now(), data: hit?.data ?? null });
+  deviceApi(device)
+    .get('/status')
     .then(
-      (d) => {
-        const list = Array.isArray(d?.providers) ? d.providers : [];
-        provCache.set(key, { at: Date.now(), job: Promise.resolve(list), data: list });
-        return list;
-      },
-      () => {
-        provCache.delete(key);
-        return [];
-      },
+      (s) => cache.set(key, { at: Date.now(), data: (s?.plugins ?? []).filter((p) => p.open_url && !p.incompatible) }),
+      () => cache.delete(key),
     );
-  provCache.set(key, { at: Date.now(), job, data: hit?.data ?? null });
-  return job;
 }
-
-const cachedProviders = (device) => provCache.get(`${device ?? ''}:1`)?.data ?? provCache.get(`${device ?? ''}:0`)?.data ?? null;
+const cachedTargets = (device) => cache.get(device ?? '')?.data ?? [];
 
 const isWebUrl = (u) => /^https?:\/\//i.test(u);
 
-function stripApiPrefix(p) {
-  return String(p || '').replace(/^\/api(?=\/)/, '');
-}
-
-function orderedTargets(targets) {
-  const list = [...(targets ?? [])];
-  const rank = (x) => (x.active ? 0 : x.default ? 1 : 2);
-  return list.sort((a, b) => rank(a) - rank(b));
-}
-
+/**
+ * 对话页用：`device` 是会话所在的电脑（多台电脑时；一台时为 null）。
+ * 返回 { onClickCapture, menu }：onClickCapture 挂在对话的最外层（捕获阶段，各处的 <a> 都不用改），menu 放进页面里。
+ */
 export function useLinkOpen(device) {
   const { t } = useTranslation();
   const { navigate } = useRouter();
   const devices = useDevices();
   const toast = useToast();
-  const confirm = useConfirm();
   const [menu, setMenu] = useState(null);
 
   useEffect(() => {
-    fetchProviders(device, false);
+    fetchTargets(device);
   }, [device]);
 
-  const openInPlugin = useCallback(
-    async (provider, url, targetId) => {
-      const client = deviceApi(device);
-      const path = stripApiPrefix(provider.open_path);
-      const confirmed = [];
+  const open = useCallback(
+    async (url, name) => {
       try {
-        for (let i = 0; i < 4; i++) {
-          const res = await client.post(path, { url, target: targetId ?? undefined, confirmed });
-          if (!res) break;
-          if (res.result === 'confirm') {
-            const ok = await confirm({ title: res.title, body: res.body, confirm: res.confirm, danger: Boolean(res.danger) });
-            if (!ok) return;
-            confirmed.push(res.id);
-            continue;
-          }
-          if (res.result === 'navigate' || (res.result === 'opened' && res.navigate != null)) {
-            if (devices.multi && device && devices.selected !== device) devices.select(device);
-            navigate(pluginRoute(provider.name, res.navigate || ''));
-          }
-          return;
-        }
+        await deviceApi(device).post(`/plugins/${name}/open-url`, { url });
+        if (devices.multi && device && devices.selected !== device) devices.select(device);
+        navigate(pluginRoute(name));
       } catch (e) {
         toast(errorText(t, e), 'error');
       }
     },
-    [device, devices, navigate, confirm, toast, t],
+    [device, devices, navigate, toast, t],
   );
 
   const onClickCapture = useCallback(
     (e) => {
       if (e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+      // 链接里的图片：点了是看大图（usePreviewLinks）；菜单自己（portal 里的点击照样冒泡到对话上）
       if (e.target.closest?.('.md img, .link-menu')) return;
       const a = e.target.closest?.('a[href]');
       if (!a || a.hasAttribute('download') || a.classList.contains('md-file') || a.closest('[contenteditable="true"]')) return;
       const url = a.href;
       if (!isWebUrl(url)) return;
       try {
+        // 管理台自己的地址（文件、下载……）不算
         if (new URL(url).origin === window.location.origin) return;
       } catch {
         return;
       }
-      const providers = cachedProviders(device);
-      if (!providers || providers.length === 0) {
-        fetchProviders(device, false);
-        return;
-      }
+      const targets = cachedTargets(device);
+      fetchTargets(device);
+      if (targets.length === 0) return;
       const pref = linkPref();
       if (pref === 'system') return;
       e.preventDefault();
       e.stopPropagation();
-      if (pref.startsWith('plugin:')) {
-        const want = pref.slice('plugin:'.length);
-        const hit = providers.find((p) => p.name === want);
-        if (hit) {
-          openInPlugin(hit, url, null);
-          return;
-        }
+      const remembered = pref.startsWith('plugin:') && targets.find((p) => `plugin:${p.name}` === pref);
+      if (remembered) {
+        open(url, remembered.name);
+        return;
       }
       const r = a.getBoundingClientRect();
-      setMenu({ url, x: r.left, y: r.bottom + 4, top: r.top - 4, providers });
-      // 点开菜单后刷新实时 targets（按需拉起插件列出全部配置）
-      fetchProviders(device, true).then((fresh) => {
-        if (fresh?.length) setMenu((cur) => (cur && cur.url === url ? { ...cur, providers: fresh } : cur));
-      });
+      setMenu({ url, x: r.left, y: r.bottom + 4, top: r.top - 4, targets });
     },
-    [device, openInPlugin],
+    [device, open],
   );
 
   const node = menu && (
     <LinkMenu
       {...menu}
       onClose={() => setMenu(null)}
-      onPlugin={(provider, targetId, remember) => {
-        if (remember) setLinkPref(`plugin:${provider.name}`);
-        openInPlugin(provider, menu.url, targetId);
-      }}
-      onSetup={(provider, setupPath) => {
-        if (devices.multi && device && devices.selected !== device) devices.select(device);
-        const q = `?open=${encodeURIComponent(menu.url)}`;
-        navigate(`${pluginRoute(provider.name, setupPath || '')}${q}`);
+      onPlugin={(name, remember) => {
+        if (remember) setLinkPref(`plugin:${name}`);
+        open(menu.url, name);
       }}
       onCopy={async () => {
         if (await copyText(menu.url)) toast(t('chat_link.copied'));
@@ -182,21 +137,20 @@ export function useLinkOpen(device) {
   return { onClickCapture, menu: node };
 }
 
-function LinkMenu({ url, x, y, top, providers, onClose, onPlugin, onSetup, onCopy }) {
+function LinkMenu({ url, x, y, top, targets, onClose, onPlugin, onCopy }) {
   const { t, i18n } = useTranslation();
   const ref = useRef(null);
   const [remember, setRemember] = useState(false);
   const [pos, setPos] = useState({ left: x, top: y, visibility: 'hidden' });
-
   useLayoutEffect(() => {
     const el = ref.current;
     if (!el) return;
     const w = el.offsetWidth;
     const h = el.offsetHeight;
+    // 下面放不下就放到链接上面
     const below = y + h + 8 <= window.innerHeight;
     setPos({ left: Math.max(8, Math.min(x, window.innerWidth - w - 8)), top: Math.max(8, below ? y : top - h) });
-  }, [x, y, top, providers]);
-
+  }, [x, y, top]);
   useEffect(() => {
     const away = (e) => !ref.current?.contains(e.target) && onClose();
     const key = (e) => e.key === 'Escape' && onClose();
@@ -211,11 +165,9 @@ function LinkMenu({ url, x, y, top, providers, onClose, onPlugin, onSetup, onCop
       window.removeEventListener('scroll', onClose, true);
     };
   }, [onClose]);
-
   useEffect(() => {
     ref.current?.querySelector('a, button')?.focus({ preventScroll: true });
   }, []);
-
   let host = url;
   try {
     host = new URL(url).host;
@@ -226,13 +178,13 @@ function LinkMenu({ url, x, y, top, providers, onClose, onPlugin, onSetup, onCop
     onClose();
     fn();
   };
-
   return createPortal(
     <ul ref={ref} className="menu-pop-list menu-pop-fixed link-menu" role="menu" style={pos} aria-label={url}>
       <li className="menu-pop-head link-menu-url" role="presentation" title={url}>
         {host}
       </li>
       <li>
+        {/* 真的链接：和原来一样由浏览器（桌面版是系统浏览器）打开，不经 window.open，不会被拦 */}
         <a
           role="menuitem"
           className="link-menu-item"
@@ -248,45 +200,19 @@ function LinkMenu({ url, x, y, top, providers, onClose, onPlugin, onSetup, onCop
           <span className="grow">{t(isDesktopApp ? 'chat_link.system' : 'chat_link.system_tab')}</span>
         </a>
       </li>
-      {providers.map((p) => {
+      {targets.map((p) => {
         const Icon = pluginIcon(p.icon);
-        const title = pickLocalized(p.title, i18n.language) || p.name;
-        const d = p.data;
-        if (d && d.ready === false) {
-          return (
-            <li key={p.name}>
-              <button type="button" role="menuitem" onClick={pick(() => onSetup(p, d.setup_path))}>
-                <Download size={17} aria-hidden="true" />
-                <span className="grow">
-                  {title}
-                  {d.setup_hint && <span className="menu-pop-hint">{d.setup_hint}</span>}
-                </span>
-              </button>
-            </li>
-          );
-        }
-        const targets = orderedTargets(d?.targets).slice(0, 5);
-        if (targets.length === 0) {
-          return (
-            <li key={p.name}>
-              <button type="button" role="menuitem" onClick={pick(() => onPlugin(p, null, remember))}>
-                <Icon size={17} aria-hidden="true" />
-                <span className="grow">{t('chat_link.open_with', { name: title })}</span>
-              </button>
-            </li>
-          );
-        }
-        return targets.map((tg) => (
-          <li key={`${p.name}:${tg.id}`}>
-            <button type="button" role="menuitem" onClick={pick(() => onPlugin(p, tg.id, remember))}>
+        return (
+          <li key={p.name}>
+            <button type="button" role="menuitem" onClick={pick(() => onPlugin(p.name, remember))}>
               <Icon size={17} aria-hidden="true" />
               <span className="grow">
-                {targets.length > 1 ? `${title} · ${tg.label}` : t('chat_link.open_with', { name: title })}
-                {tg.hint && <span className="menu-pop-hint">{tg.hint}</span>}
+                {t('chat_link.open_in', { name: pickLocalized(p.title, i18n.language) || p.name })}
+                {p.running && <span className="menu-pop-hint">{t('plugins.running')}</span>}
               </span>
             </button>
           </li>
-        ));
+        );
       })}
       <li>
         <button type="button" role="menuitem" onClick={pick(onCopy)}>

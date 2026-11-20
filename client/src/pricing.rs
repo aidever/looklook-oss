@@ -305,42 +305,23 @@ pub fn price(c: &Catalog, provider: Option<&str>, model: &str) -> Option<(Cost, 
     })
 }
 
-/// 刚发布、哪里都还没有价格的 Claude / Gemini 模型：按同一系列最新一个的价格估，界面上标“估算”
+/// 刚发布、哪里都还没有价格的 Claude 模型（`claude-opus-6` 之类）：先按同一系列（opus / sonnet / haiku……）最新一个的价格估，
+/// 界面上标“估算”。不是 Claude 的不猜
 pub fn guess_price(c: &Catalog, model: &str) -> Option<(Cost, String)> {
     let model = normalize(model);
-    if let Some(rest) = model.strip_prefix("claude-") {
-        let family = rest.split('-').next()?.to_string();
-        if family.is_empty() || family.chars().all(|ch| ch.is_ascii_digit()) {
-            return None;
-        }
-        let prefix = format!("claude-{family}-");
-        return [CLAUDE_CODE, "anthropic"].iter().find_map(|id| {
-            let p = c.providers.get(*id)?;
-            p.models
-                .iter()
-                .filter(|(k, m)| normalize(k).starts_with(&prefix) && m.cost.is_some_and(|x| x.input > 0.0))
-                .max_by(|a, b| a.1.release_date.cmp(&b.1.release_date).then_with(|| version_key(a.0).cmp(&version_key(b.0))))
-                .and_then(|(_, m)| m.cost.map(|x| (x, format!("{id}~"))))
-        });
+    let family = model.strip_prefix("claude-")?.split('-').next()?.to_string();
+    if family.is_empty() || family.chars().all(|ch| ch.is_ascii_digit()) {
+        return None;
     }
-    if model.starts_with("gemini-") {
-        let flash = model.contains("flash");
-        let p = c.providers.get("google")?;
-        return p
-            .models
+    let prefix = format!("claude-{family}-");
+    [CLAUDE_CODE, "anthropic"].iter().find_map(|id| {
+        let p = c.providers.get(*id)?;
+        p.models
             .iter()
-            .filter(|(k, m)| {
-                let nk = normalize(k);
-                nk.starts_with("gemini-")
-                    && (if flash { nk.contains("flash") } else { nk.contains("pro") })
-                    && !nk.contains("lite")
-                    && !nk.contains("image")
-                    && m.cost.is_some_and(|x| x.input > 0.0)
-            })
+            .filter(|(k, m)| normalize(k).starts_with(&prefix) && m.cost.is_some_and(|x| x.input > 0.0))
             .max_by(|a, b| a.1.release_date.cmp(&b.1.release_date).then_with(|| version_key(a.0).cmp(&version_key(b.0))))
-            .and_then(|(_, m)| m.cost.map(|x| (x, "google~".to_string())));
-    }
-    None
+            .and_then(|(_, m)| m.cost.map(|x| (x, format!("{id}~"))))
+    })
 }
 
 /// 模型名里的版本号（`claude-opus-4-8` → [4, 8]）：同一天发布的按版本号比新旧；带日期的后缀不算

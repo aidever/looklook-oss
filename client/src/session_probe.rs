@@ -345,17 +345,6 @@ impl Detector for Dsh {
     }
 }
 
-struct OpenCode;
-
-impl Detector for OpenCode {
-    fn tool(&self) -> &'static str {
-        "opencode"
-    }
-    fn names(&self) -> &'static [&'static str] {
-        &["opencode"]
-    }
-}
-
 struct Agy;
 
 impl Detector for Agy {
@@ -364,6 +353,17 @@ impl Detector for Agy {
     }
     fn names(&self) -> &'static [&'static str] {
         &["agy"]
+    }
+}
+
+struct OpenCode;
+
+impl Detector for OpenCode {
+    fn tool(&self) -> &'static str {
+        "opencode"
+    }
+    fn names(&self) -> &'static [&'static str] {
+        &["opencode"]
     }
 }
 

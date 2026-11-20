@@ -15,7 +15,7 @@ import { Button, Card, ErrorNote, Seg, Skeleton, useAction, useLoad } from '../s
 
 const RANGES = [1, 7, 30, 90, 365];
 const AGENT_NAME = { claude: 'Claude Code', codex: 'Codex', agy: 'Antigravity' };
-const AGENT_COLOR = { claude: 'var(--brand)', codex: 'var(--brand-2)', agy: '#4285f4' };
+const AGENT_COLOR = { claude: 'var(--brand)', codex: 'var(--brand-2)', agy: 'var(--ok)' };
 const agentName = (a) => AGENT_NAME[a] ?? a;
 const agentColor = (a) => AGENT_COLOR[a] ?? 'var(--info)';
 const VIEWS = ['agents', 'accounts', 'models', 'projects', 'sessions'];

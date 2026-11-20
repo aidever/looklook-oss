@@ -825,6 +825,7 @@ impl Instances {
             if !crate::history::valid_id(&r.id) || !crate::history::AGENTS.contains(&row.launch.as_str()) || prompt.is_some() {
                 return Err(LocalError::invalid("resume", "invalid"));
             }
+            // OpenCode、agy 不能从以前的对话分叉
             if r.fork && matches!(row.launch.as_str(), "opencode" | "agy") {
                 return Err(LocalError::invalid("resume", "invalid"));
             }
@@ -1284,15 +1285,16 @@ impl Instances {
             });
         }
         let launch = match prompt {
-            // 对话模式的 Codex / Claude(SDK) / Antigravity(ACP)：第一句话、接着的会话都由对话界面交给对应进程
+            // 对话模式的 Codex：第一句话、接着的会话都由对话界面交给 app-server，终端里是接上同一个会话的 TUI
             _ if self.codex_app_mode(row) || self.claude_sdk_mode(row) || self.agy_acp_mode(row) => self.launch_command(row),
             None if resume.is_some() => resume.and_then(|r| self.resume_command(row, r)),
             None => self.launch_command(row),
             Some(p) => match row.launch.as_str() {
                 "shell" => Some(p.to_string()),
                 "opencode" => self.launch_command(row).map(|c| format!("{c} --prompt {}", crate::shells::quote_arg(p, shell.family))),
-                "agy" => self.launch_command(row).map(|c| format!("{c} -i {}", crate::shells::quote_arg(p, shell.family))),
                 "claude" | "codex" => self.launch_command(row).map(|c| format!("{c} {}", crate::shells::quote_arg(p, shell.family))),
+                // agy：`-i` 以这句话开始一次交互式会话
+                "agy" => self.launch_command(row).map(|c| format!("{c} -i {}", crate::shells::quote_arg(p, shell.family))),
                 _ => self.launch_command(row),
             },
         };
@@ -1318,7 +1320,6 @@ impl Instances {
         let base = launch_command_line(row, self.opts(&row.id), c.root)?;
         Some(match (prompt, row.launch.as_str()) {
             (Some(p), "opencode") => format!("{base} --prompt {}", crate::docker::quote_inner(p)),
-            (Some(p), "agy") => format!("{base} -i {}", crate::docker::quote_inner(p)),
             (Some(p), "claude" | "codex") => format!("{base} {}", crate::docker::quote_inner(p)),
             _ => base,
         })
@@ -1353,7 +1354,7 @@ impl Instances {
 
     /// 启动类型对应的命令行（含“全部权限”参数）；普通终端为 None。
     pub(crate) fn launch_command(&self, row: &InstanceRow) -> Option<String> {
-        // 对话模式的 Codex（app-server）、Claude Code（stream-json）、Antigravity（ACP）：对话由看看起的进程跑，终端里是普通 shell
+        // 对话模式的 Codex（app-server）、Claude Code（stream-json）、agy（ACP）：对话由看看起的进程跑，终端里是普通 shell，和对话不同步
         if self.codex_app_mode(row) || self.claude_sdk_mode(row) || self.agy_acp_mode(row) {
             return None;
         }
@@ -1387,6 +1388,7 @@ impl Instances {
                 Some(format!("codex {sub}{}{} {}", if flags.is_empty() { "" } else { " " }, flags, r.id))
             }
             "opencode" => Some(format!("{base} --session {}", r.id)),
+            // 对话模式由 agy acp 接着（见 gateway 的新建），终端里是 shell
             "agy" if self.agy_acp_mode(row) => None,
             "agy" => Some(format!("{base} --conversation {}", r.id)),
             _ => None,
@@ -1398,15 +1400,15 @@ impl Instances {
         row.launch == "codex" && self.opts(&row.id).chat_ui && matches!(self.backend, Backend::Tmux(_)) && self.container(&row.id).is_none()
     }
 
+    /// 对话模式的 Antigravity：对话由看看通过 `agy acp` 驱动（chat/agy_chat.rs），终端里是同一个工作目录下的普通 shell。
+    pub fn agy_acp_mode(&self, row: &InstanceRow) -> bool {
+        row.launch == "agy" && self.opts(&row.id).chat_ui && matches!(self.backend, Backend::Tmux(_)) && self.container(&row.id).is_none()
+    }
+
     /// 对话模式的 Claude Code 走 stream-json（docs/CLAUDE_SDK.md）：对话由看看起的 `claude -p` 进程驱动，终端里是 shell。
     pub fn claude_sdk_mode(&self, row: &InstanceRow) -> bool {
         let o = self.opts(&row.id);
         row.launch == "claude" && o.chat_ui && o.sdk && matches!(self.backend, Backend::Tmux(_)) && self.container(&row.id).is_none()
-    }
-
-    /// 对话模式的 Antigravity（agy）：对话由看看通过 `agy acp` 驱动，终端里是同一个工作目录下的普通 shell。
-    pub fn agy_acp_mode(&self, row: &InstanceRow) -> bool {
-        row.launch == "agy" && self.opts(&row.id).chat_ui && matches!(self.backend, Backend::Tmux(_)) && self.container(&row.id).is_none()
     }
 
     /// `--settings` 里要带的账号 `env`（盖过 CC Switch 等写进用户 settings 的服务商，见 claude_profiles::settings_env）。容器里的不加。
@@ -2009,11 +2011,11 @@ pub fn launch_command_line(row: &InstanceRow, opts: Opts, root: bool) -> Option<
         "claude" => Some("claude --allow-dangerously-skip-permissions".into()),
         "opencode" if opts.full_access => Some("opencode --auto".into()),
         "opencode" => Some("opencode".into()),
-        "agy" if opts.full_access => Some("agy --dangerously-skip-permissions".into()),
-        "agy" => Some("agy".into()),
         // 对话模式的 DSH：终端里是 shell（对话走看看共用的 dsh web）
         "dsh" if opts.chat_ui => None,
         "dsh" => opts.web_port.map(|p| format!("dsh web --no-open --port {p}")),
+        "agy" if opts.full_access => Some("agy --dangerously-skip-permissions".into()),
+        "agy" => Some("agy".into()),
         "custom" => Some(row.command.clone()),
         _ => None,
     }

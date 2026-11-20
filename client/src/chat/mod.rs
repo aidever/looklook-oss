@@ -12,7 +12,7 @@
 //! 不跑 TUI、没有 hooks。快照、事件推送、读记录文件（rollout）和审批挂起两边共用；任务面板、后台命令只有 Claude Code 有。
 
 pub mod agent;
-pub mod agy_app;
+pub mod agy_acp;
 pub mod agy_chat;
 pub mod agy_log;
 pub mod board;
@@ -201,7 +201,7 @@ struct State {
     codex: codex_chat::CodexSt,
     /// DSH（dsh web）的跟读、排队的消息、用量
     dsh: dsh_chat::DshSt,
-    /// Antigravity（agy acp）的会话状态、命令列表、用量
+    /// Antigravity（agy acp）的会话设置、排队的消息、用量
     agy: agy_chat::AgySt,
     /// 走 stream-json 的 Claude Code（claude_chat.rs）的进程和状态
     sdk: claude_chat::SdkSt,
@@ -501,7 +501,9 @@ impl Chat {
                 }
             }
             "agy" => {
-                self.agy_release(&inst).await;
+                if let Err(e) = self.agy_interrupt(id).await {
+                    tracing::debug!(id, error = ?e, "停会话：agy 这一轮没停下");
+                }
             }
             _ => Self::sdk_release(&inst),
         }
@@ -590,9 +592,9 @@ impl Chat {
             "context": st.context,
             "title": st.title,
             // Codex：这段对话实际在哪个目录（在托管工作树里时和终端的工作目录不同）
-            "cwd": st.codex.cwd.as_ref().or(st.dsh.cwd.as_ref()).or(st.agy.cwd.as_ref()),
+            "cwd": st.codex.cwd.as_ref().or(st.dsh.cwd.as_ref()),
             // Claude Code 队列里的（读 transcript）；Codex 是插话（`turn/steer`）发出去、还没进对话的
-            "queued": st.queued.iter().chain(&st.codex.steered).chain(&st.dsh.queued).collect::<Vec<_>>(),
+            "queued": st.queued.iter().chain(&st.codex.steered).chain(&st.dsh.queued).chain(Self::agy_queued(st)).collect::<Vec<_>>(),
             // Codex：Tab 排到这一轮之后的（这一轮结束后作为下一轮发出）
             "later": st.codex.later.iter().map(|(t, i)| json!({ "text": t, "images": i.len() })).collect::<Vec<_>>(),
             "limit": (st.limit_wait.is_some() || st.limit_auto_at.is_some() || st.sdk.limit_resume.is_some())
@@ -1206,6 +1208,11 @@ impl Chat {
                 Self::codex_attach_failed(&inst, e);
             }
         }
+        if inst.agent.launch() == "agy" {
+            if let Err(e) = self.agy_attach(id).await {
+                Self::agy_attach_failed(&inst, &e);
+            }
+        }
         if inst.agent.launch() == "dsh" {
             if let Err(e) = self.dsh_attach(id).await {
                 let mut st = lock(&inst.st);
@@ -1221,14 +1228,6 @@ impl Chat {
                     }
                     tokio::time::sleep(Duration::from_millis(50)).await;
                 }
-            }
-        }
-        if inst.agent.launch() == "agy" {
-            if let Err(e) = self.agy_attach(id).await {
-                let mut st = lock(&inst.st);
-                st.error = e.params.get("detail").and_then(Value::as_str).map(|d| d.chars().take(500).collect()).or(Some(e.code.to_string()));
-                let reason = if e.code == "AGY_NOT_FOUND" { "agy_not_found" } else { "agy_unavailable" };
-                Self::set_phase(&inst, &mut st, Phase::Detached, Some(reason));
             }
         }
         self.poll(&inst).await;
@@ -1282,9 +1281,6 @@ impl Chat {
             let rec = self.item(id, key).await?;
             return self.dsh_user_image(id, &rec, n).await;
         }
-        if self.is_agy(id) {
-            return self.agy_user_image(id, key, n);
-        }
         if self.is_codex(id) {
             let inst = self.inst(id);
             let path = {
@@ -1315,7 +1311,7 @@ impl Chat {
         let mut tick = 0u32;
         loop {
             while inst.viewers.load(Ordering::SeqCst) > 0 {
-                // DSH / Antigravity：连接断了就重新接上
+                // DSH：连接断了（DSH 重启）就重新接上
                 if tick.is_multiple_of(10) && inst.agent.launch() == "dsh" {
                     self.dsh_keep(&inst.id).await;
                 }
@@ -1323,7 +1319,7 @@ impl Chat {
                     self.agy_keep(&inst.id).await;
                 }
                 self.poll(&inst).await;
-                // Codex、DSH、Antigravity 的状态来自它们的后台服务，不用看屏幕
+                // Codex、DSH 的状态来自它们的后台服务，不用看屏幕
                 if tick.is_multiple_of(3) && !matches!(inst.agent.launch(), "codex" | "dsh" | "agy") && !inst.sdk.load(Ordering::Relaxed) {
                     self.check_screen(&inst, true).await;
                     if lock(&inst.st).dialog.as_ref().is_some_and(screen::Dialog::is_limit) {
@@ -2206,22 +2202,15 @@ impl Chat {
         if inst.sdk.load(Ordering::Relaxed) {
             return self.sdk_answer(&inst, req);
         }
+        if inst.agent.launch() == "agy" {
+            return self.agy_answer(&inst, req);
+        }
         let mut st = lock(&inst.st);
         let Some(p) = st.pending.as_mut().filter(|p| p.id == req.id) else { return Err(LocalError::new("CHAT_STALE")) };
         // DSH：答复是 waterfall 的结果；不替用户回答时交给 DSH 自己的界面
         if inst.agent.launch() == "dsh" {
             let result = dsh_chat::decision(p.kind, &p.input, req)?;
             p.resolve(result.map(|r| r.to_string()).unwrap_or_default());
-            Self::settle(&inst, &mut st, Phase::Running);
-            return Ok(());
-        }
-        // Antigravity (agy)：答复直接是 ACP `session/request_permission` 的结果
-        if inst.agent.launch() == "agy" {
-            if p.guard.is_some() && req.decision == "allow_session" {
-                return Err(LocalError::invalid("decision", "invalid"));
-            }
-            let result = agy_chat::decision(&p.suggestions, req)?;
-            p.resolve(result.to_string());
             Self::settle(&inst, &mut st, Phase::Running);
             return Ok(());
         }
@@ -2313,6 +2302,7 @@ impl Chat {
             return self.dsh_attach(id).await.map(|_| ());
         }
         if self.is_agy(id) {
+            lock(&self.inst(id).st).agy.generation = 0;
             return self.agy_attach(id).await.map(|_| ());
         }
         if self.is_sdk(id) {
@@ -2340,6 +2330,7 @@ impl Chat {
             return self.dsh_attach(id).await.map(|_| ());
         }
         if self.is_agy(id) {
+            lock(&self.inst(id).st).agy.generation = 0;
             return self.agy_attach(id).await.map(|_| ());
         }
         if self.is_sdk(id) {
@@ -2623,32 +2614,13 @@ impl Chat {
         lock(&self.inst(id).st).hold = on.then(|| Instant::now() + Duration::from_secs(5));
     }
 
-    /// 快捷设置，不用到终端里去：
-    /// - `model`：`/model <名字>`。对话已经有缓存时 Claude Code 会先问“要切换吗”，替用户选第一项（实测 2.1.303）；
-    /// - `effort`：`/effort <级别>`；
-    /// - `mode`：权限模式只能用 Shift+Tab 轮换，按到状态栏显示目标模式为止。
-    /// 助理派出去的会话换到某一档权限（assistant::Level，两种引擎同一个意思）。返回实际用上的模式：
+    /// 助理派出去的会话换成这种引擎的某个权限模式（[`crate::assistant::engine_modes`]）。返回实际用上的模式：
     /// Claude Code 的 auto 模式不是每个账号、每个服务商都有，换不上就退回 acceptEdits
-    pub async fn apply_level(&self, id: &str, level: crate::assistant::Level) -> Result<&'static str, LocalError> {
-        use crate::assistant::Level;
-        if self.inst(id).agent.launch() == "codex" {
-            let perm = match level {
-                Level::ReadOnly => "readOnly",
-                Level::Ask => codex_chat::ASK_COMMANDS,
-                Level::Project => "workspaceWrite",
-                Level::Full => codex_chat::FULL_GUARDED,
-            };
-            self.setting_now(id, "mode", perm).await?;
-            return Ok(perm);
-        }
-        let mode = match level {
-            Level::ReadOnly => "plan",
-            Level::Ask => "acceptEdits",
-            Level::Project => "auto",
-            Level::Full => "bypassPermissions",
-        };
+    pub async fn apply_mode(&self, id: &str, mode: &str) -> Result<&'static str, LocalError> {
+        let engine = self.inst(id).agent.launch();
+        let mode = *crate::assistant::engine_modes(engine).iter().find(|m| **m == mode).ok_or_else(|| LocalError::invalid("mode", "invalid"))?;
         match self.setting_now(id, "mode", mode).await {
-            Err(e) if level == Level::Project => {
+            Err(e) if mode == "auto" && engine != "codex" => {
                 tracing::info!(error = ?e, id, "Claude Code 换不上 auto 模式，退回 acceptEdits");
                 self.setting_now(id, "mode", "acceptEdits").await?;
                 Ok("acceptEdits")
@@ -2657,6 +2629,22 @@ impl Chat {
         }
     }
 
+    /// 助理派出去的会话用这个模型（不记成“上次选的”：不是用户在对话里选的）
+    pub async fn apply_model(&self, id: &str, model: &str) -> Result<(), LocalError> {
+        self.setting_now(id, "model", model).await
+    }
+
+    /// 会话现在的权限模式（界面状态栏上的那个）
+    pub fn mode(&self, id: &str) -> Option<String> {
+        let inst = lock(&self.insts).get(id).cloned()?;
+        let m = lock(&inst.st).mode.clone();
+        m
+    }
+
+    /// 快捷设置，不用到终端里去：
+    /// - `model`：`/model <名字>`。对话已经有缓存时 Claude Code 会先问“要切换吗”，替用户选第一项（实测 2.1.303）；
+    /// - `effort`：`/effort <级别>`；
+    /// - `mode`：权限模式只能用 Shift+Tab 轮换，按到状态栏显示目标模式为止。
     pub async fn setting(&self, id: &str, kind: &str, value: &str) -> Result<(), LocalError> {
         self.setting_now(id, kind, value).await?;
         if kind == "model" || kind == "effort" {
@@ -2856,19 +2844,6 @@ impl Chat {
                     .and_then(|l| model_memory::usable(&l, &opts, &codex_chat::EFFORTS));
                 Ok(json!({ "installed": true, "options": options, "provider": provider, "profile": p.id, "last": last }))
             }
-            "agy" => {
-                if found.agy.is_none() && crate::agents::agy_fallback().is_none() {
-                    return Ok(json!({ "installed": false, "options": [] }));
-                }
-                let options = match self.agy_cached_models().await {
-                    Ok(v) => v,
-                    Err(e) => return Ok(json!({ "installed": true, "options": [], "error": { "code": e.code, "params": e.params } })),
-                };
-                let opts = options.as_array().cloned().unwrap_or_default();
-                let last = model_memory::get(&self.store, "agy", "default", &model_memory::agy_base())
-                    .and_then(|l| model_memory::usable(&l, &opts, &agy_chat::EFFORTS));
-                Ok(json!({ "installed": true, "options": options, "provider": null, "last": last }))
-            }
             _ => Err(LocalError::invalid("agent", "one_of")),
         }
     }
@@ -2898,12 +2873,6 @@ impl Chat {
                 let p = xp::get(&self.store, profile).unwrap_or_else(|| xp::for_instance(&self.store, ""));
                 let base = model_memory::codex_base(&crate::agents::codex_home(), &p);
                 (p.id, base)
-            }
-            "agy" => {
-                if effort.is_some_and(|e| !agy_chat::EFFORTS.contains(&e)) {
-                    return Err(LocalError::invalid("effort", "invalid"));
-                }
-                ("default".to_string(), model_memory::agy_base())
             }
             _ => return Err(LocalError::invalid("agent", "one_of")),
         };

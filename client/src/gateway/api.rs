@@ -42,9 +42,8 @@ pub fn routes(app: App) -> Router<App> {
         .route("/rtc/net", get(crate::rtc::net::get_net).put(crate::rtc::net::put_net))
         .route("/rtc/net/detect", post(crate::rtc::net::post_detect))
         .route("/platform/{*rest}", get(platform_web).post(platform_web).put(platform_web).patch(platform_web).delete(platform_web))
-        // 通用插件管理与转发（gateway/plugins.rs）
-        .merge(super::plugins::api_routes())
         // 助理（assistant.rs）
+        .merge(super::plugins::api_routes())
         .route("/assistant", get(super::assistant::state))
         .route("/assistant/summary", get(super::assistant::summary))
         .route("/assistant/enable", post(super::assistant::enable))
@@ -380,8 +379,8 @@ async fn status(State(app): State<App>, Extension(access): Extension<Access>) ->
         "update": app.updater.view(),
         "metrics": app.metrics.brief(),
         "relay_check": app.relay_watch.view(),
-        // 已安装的插件（菜单入口、运行状态、能力声明；不会拉起未运行的插件）
-        "plugins": app.plugins.brief(),
+        // 装着的插件、在不在跑（工具菜单里的入口和“运行中”）
+        "plugins": app.plugins.brief().await,
         // `looklook restart` 靠它判断已经换成新进程
         "pid": access.is_local().then(std::process::id),
     }))
@@ -668,27 +667,22 @@ pub async fn create_session(app: &App, input: Input, start: bool) -> R<crate::in
             chat.sdk_first(&id, None, resume).await;
         }
     }
+    // 对话模式的 agy：第一句话、接着以前的对话都交给 agy acp
+    if app.instances.agy_acp_mode(&v.row) && (prompt.is_some() || resume.is_some()) {
+        let (chat, id) = (app.chat.clone(), v.row.id.clone());
+        let (prompt, resume) = (prompt.clone(), resume.clone());
+        tokio::spawn(async move { chat.agy_first(&id, prompt, resume).await });
+    }
     // 对话模式的 Codex：第一句话、接着以前的对话都交给 app-server
-    if app.instances.codex_app_mode(&v.row) {
-        if resume.is_some() {
-            app.chat.codex_first(&v.row.id, None, resume).await;
-        } else if prompt.is_some() {
-            let (chat, id) = (app.chat.clone(), v.row.id.clone());
-            tokio::spawn(async move { chat.codex_first(&id, prompt, None).await });
-        }
-        if start {
-            app.chat.codex_warm(&v.row.workdir).await;
-        }
-    } else if app.instances.agy_acp_mode(&v.row) {
-        // 对话模式的 Antigravity（agy）：第一句话、接着以前的对话都交给 agy acp
-        if resume.is_some() {
-            app.instances.forget_first(&v.row.id);
-            app.chat.agy_first(&v.row.id, None, resume).await;
-        } else if prompt.is_some() {
-            app.instances.forget_first(&v.row.id);
-            let (chat, id) = (app.chat.clone(), v.row.id.clone());
-            tokio::spawn(async move { chat.agy_first(&id, prompt, None).await });
-        }
+    if app.instances.codex_app_mode(&v.row) && resume.is_some() {
+        app.chat.codex_first(&v.row.id, None, resume).await;
+    }
+    if app.instances.codex_app_mode(&v.row) && prompt.is_some() {
+        let (chat, id) = (app.chat.clone(), v.row.id.clone());
+        tokio::spawn(async move { chat.codex_first(&id, prompt, None).await });
+    }
+    if start && app.instances.codex_app_mode(&v.row) {
+        app.chat.codex_warm(&v.row.workdir).await;
     }
     Ok(if start { app.instances.start(&v.row.id).await? } else { v })
 }
@@ -2805,12 +2799,9 @@ async fn get_shells(State(app): State<App>) -> Json<Value> {
 
 async fn get_tools(State(app): State<App>) -> Json<Value> {
     let mut d = tools::detect(app.instances.shell()).await;
-    // 不在 PATH 里的 Claude Code / Antigravity（官方安装脚本的位置等）
+    // 不在 PATH 里的 Claude Code（官方安装脚本的位置、Claude 桌面版自带的）
     if d.claude.is_none() {
         d.claude = crate::agents::claude_fallback();
-    }
-    if d.agy.is_none() {
-        d.agy = crate::agents::agy_fallback();
     }
     // 新版能自己装 Node.js：界面上没有 npm 也给“安装”按钮（旧版客户端没有这一项）
     Json(json!({ "tools": d, "can_install_node": true }))

@@ -1,4 +1,4 @@
-//! 用量统计：定时扫 Claude Code 和 Codex 的会话记录，按小时、助手、模型累计 token，按 models.dev 的
+//! 用量统计：定时扫 Claude Code、Codex 和 Antigravity（agy）的会话记录，按小时、助手、模型累计 token，按 models.dev 的
 //! API 价格（[`crate::pricing`]）估算费用。订阅用户看到的是“按 API 价格折算”的数，界面上写明。
 //!
 //! - **Claude Code**：`<配置目录>/projects/**/*.jsonl`（另外登录的官方账号的 `projects/` 链到同一处），
@@ -6,6 +6,9 @@
 //! - **Codex**：`$CODEX_HOME/sessions/**/rollout-*.jsonl` 和 `archived_sessions/`（旧的会被 Codex 压成 `.jsonl.zst`，也读）。`token_count` 事件的 `last_token_usage`
 //!   是一次请求的用量；`total_token_usage` 没变的是重复发的，不算。模型取前面最近的 `turn_context`，
 //!   走的哪家取开头 `session_meta` 的 `model_provider`（看看的第三方接口是 `looklook-<配置 ID>`，见 codex_profiles.rs）。
+//! - **agy**：`~/.gemini/antigravity-cli/brain/<对话>/.system_generated/logs/transcript.jsonl`，每次请求一行
+//!   `PLANNER_RESPONSE`，带 `model`、`input_tokens`（不含缓存）、`cache_read_tokens`、`output_tokens`。模型名后面带着思考强度
+//!   （`gemini-4-neon-high`），去掉后按 models.dev 里 Google 的价格算。标题、目录、子代理属于哪个对话从 `conversation_summaries.db` 查。
 //! - 接着以前的对话、分叉出来的对话会把以前的记录抄进新文件：每条用量记一个指纹，别的文件算过的不再算。
 //! - 只重新读变过（长度或修改时间变了）的文件。删掉的会话记录（Claude Code 默认 30 天清理）统计照样留着。
 //! - 每个文件另外记下工作目录（`cwd`）和标题（Claude Code 的 `custom-title` > `ai-title`；Codex 的在 `session_index.jsonl`），
@@ -286,113 +289,36 @@ fn parse_codex(text: &str, seen: &HashSet<u64>) -> Parsed {
     out
 }
 
-/// 把 Antigravity 的模型 ID 或显示名整理成用于计价和统计的模型名（去掉思考强度后缀）
-fn normalize_agy_model(raw: &str) -> String {
-    let s = raw.trim();
-    if s.is_empty() {
-        return "unknown".into();
-    }
-    // 已经是 ID 形态（无空格，如 gemini-4-neon-high / claude-opus-5-5-medium）
-    if !s.contains(' ') {
-        let lower = s.to_ascii_lowercase();
-        for suf in ["-low", "-medium", "-high", "-xhigh", "-max"] {
-            if let Some(base) = lower.strip_suffix(suf) {
-                if !base.is_empty() {
-                    return base.to_string();
-                }
-            }
-        }
-        return lower;
-    }
-    // 旧版 transcript 只有人类可读名称（如 "Claude Opus 4.6 (Thinking)"、"Gemini 3.8 Flash (Medium)"）
-    let head = s.split('(').next().unwrap_or(s).trim().to_ascii_lowercase();
-    let slug = head.split_whitespace().collect::<Vec<_>>().join("-");
-    // Claude 模型版本号在价格表里用连字符（claude-opus-4-6），Gemini 保留小数点（gemini-3.8-flash）
-    if slug.starts_with("claude-") {
-        slug.replace('.', "-")
-    } else {
-        slug
-    }
+/// agy 的模型名：去掉末尾的思考强度（`gemini-4-neon-high` → `gemini-4-neon`），和 models.dev 的对上
+fn agy_model(m: &str) -> String {
+    const LEVELS: [&str; 6] = ["-minimal", "-low", "-medium", "-high", "-xhigh", "-max"];
+    LEVELS.iter().find_map(|l| m.strip_suffix(l)).unwrap_or(m).to_string()
 }
 
-/// 从 `USER_INPUT` 的 `<USER_SETTINGS_CHANGE>` 行提取模型名
-fn agy_model_change(content: &str) -> Option<String> {
-    let line = content.lines().find(|l| l.contains("Model Selection") && l.contains(" to "))?;
-    let after = line.split(" to ").nth(1)?;
-    let name = after.split(". No need").next().unwrap_or(after).trim().trim_end_matches('.');
-    (!name.is_empty()).then(|| normalize_agy_model(name))
-}
-
-/// 从 `…/brain/<conversation_id>/.system_generated/logs/transcript.jsonl` 取出对话号
-fn agy_conv_of(path: &Path) -> Option<String> {
-    let mut comps = path.components().rev();
-    // transcript.jsonl ← logs ← .system_generated ← <conversation_id> ← brain
-    let _file = comps.next()?;
-    if comps.next()?.as_os_str() != "logs" {
-        return None;
-    }
-    if comps.next()?.as_os_str() != ".system_generated" {
-        return None;
-    }
-    let id = comps.next()?.as_os_str().to_str()?.to_string();
-    (comps.next()?.as_os_str() == "brain" && crate::history::valid_id(&id)).then_some(id)
-}
-
-/// Antigravity (agy) 的会话记录（`transcript.jsonl`）
-fn parse_agy(text: &str, seen: &HashSet<u64>, sid: Option<&str>, meta: Option<&crate::history::AgyMeta>) -> Parsed {
+/// agy 的会话记录（`conv` 是对话号，同一步只算一次）
+fn parse_agy(text: &str, seen: &HashSet<u64>, conv: &str) -> Parsed {
     let mut out = Parsed::default();
-    let mut current_model = String::from("unknown");
-    let conv_key = sid.unwrap_or("");
     for line in text.lines() {
-        if line.contains("\"USER_INPUT\"") && line.contains("Model Selection") {
-            if let Ok(v) = serde_json::from_str::<Value>(line) {
-                if let Some(c) = v["content"].as_str().and_then(agy_model_change) {
-                    current_model = c;
-                }
-            }
-            continue;
-        }
-        if !line.contains("\"PLANNER_RESPONSE\"") {
+        if !line.contains("\"input_tokens\"") {
             continue;
         }
         let Ok(v) = serde_json::from_str::<Value>(line) else { continue };
-        if v["type"] != "PLANNER_RESPONSE" {
-            continue;
-        }
+        let Some(model) = v["model"].as_str().filter(|m| !m.is_empty()) else { continue };
         let Some(ts) = v["created_at"].as_str() else { continue };
         let Some(h) = hour_of(ts) else { continue };
-        let model = match v["model"].as_str().filter(|s| !s.is_empty()) {
-            Some(m) => {
-                let norm = normalize_agy_model(m);
-                current_model = norm.clone();
-                norm
-            }
-            None => current_model.clone(),
-        };
-        let i = n(&v, "input_tokens");
-        let cr = n(&v, "cache_read_tokens");
-        let cw = n(&v, "cache_write_tokens");
-        let o = n(&v, "output_tokens") + n(&v, "thought_tokens");
-        if i + o + cr + cw == 0 {
-            continue;
-        }
-        let step = v["step_index"].as_u64().unwrap_or(0).to_string();
-        let id = fingerprint(&["agy", conv_key, &step, ts, &i.to_string(), &o.to_string()]);
+        let id = fingerprint(&[conv, &v["step_index"].to_string(), ts]);
         if seen.contains(&id) {
             continue;
         }
-        out.add(h, &model, Row { i, o, cr, cw, ..Default::default() });
+        out.add(h, &agy_model(model), Row { i: n(&v, "input_tokens"), o: n(&v, "output_tokens"), cr: n(&v, "cache_read_tokens"), ..Default::default() });
         out.ids.push(id);
     }
-    if let Some(m) = meta {
-        out.cwd = m.workdir.clone();
-        out.title = m.title.clone();
-        // 子代理的用量并入主对话
-        out.sid = m.parent.clone().or_else(|| sid.map(String::from));
-    } else {
-        out.sid = sid.map(String::from);
-    }
     out
+}
+
+/// agy 记录所在的对话号：`brain/<对话>/.system_generated/logs/transcript.jsonl`
+fn agy_conv_of(path: &Path) -> Option<String> {
+    path.ancestors().nth(3)?.file_name().map(|n| n.to_string_lossy().into_owned())
 }
 
 fn walk(dir: &Path, want: &dyn Fn(&Path) -> bool, out: &mut Vec<PathBuf>, depth: u32) {
@@ -425,13 +351,15 @@ fn sources() -> Vec<(PathBuf, &'static str)> {
         walk(&codex.join(d), &rollout, &mut files, 0);
     }
     out.extend(files.drain(..).map(|p| (p, "codex")));
-    let agy_transcript = |p: &Path| {
-        p.file_name().is_some_and(|n| n == "transcript.jsonl")
-            && p.parent().and_then(|d| d.file_name()).is_some_and(|n| n == "logs")
-            && p.parent().and_then(|d| d.parent()).and_then(|d| d.file_name()).is_some_and(|n| n == ".system_generated")
-    };
-    walk(&crate::agents::agy_data_dir().join("brain"), &agy_transcript, &mut files, 0);
-    out.extend(files.into_iter().map(|p| (p, "agy")));
+    // agy：每个对话一个目录，记录在固定的位置
+    if let Ok(rd) = std::fs::read_dir(crate::agents::agy_data_dir().join("brain")) {
+        for e in rd.flatten() {
+            let p = e.path().join(".system_generated").join("logs").join("transcript.jsonl");
+            if p.is_file() {
+                out.push((p, "agy"));
+            }
+        }
+    }
     out
 }
 
@@ -446,10 +374,10 @@ fn load(home: &Path) -> State {
 /// 扫一遍（阻塞，放在 `spawn_blocking` 里跑）
 fn scan_blocking(home: &Path) {
     let mut st = STATE.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_else(|| load(home));
-    let srcs = sources();
-    let agy_meta = if srcs.iter().any(|(_, a)| *a == "agy") { crate::history::agy_meta() } else { HashMap::new() };
     let mut changed = 0;
-    for (path, agent) in srcs {
+    // agy 对话的标题、目录、上一级：有 agy 的记录要重读时才查一次
+    let mut agy_meta: Option<HashMap<String, (String, Option<String>, Option<String>)>> = None;
+    for (path, agent) in sources() {
         let key = path.to_string_lossy().into_owned();
         let Ok(meta) = std::fs::metadata(&path) else { continue };
         let (len, mtime) = (meta.len(), mtime_of(&meta));
@@ -462,13 +390,26 @@ fn scan_blocking(home: &Path) {
         let seen: HashSet<u64> = st.files.iter().filter(|(k, _)| **k != key).flat_map(|(_, f)| f.ids.iter().copied()).collect();
         let parsed = match agent {
             "claude" => parse_claude(&text, &seen),
-            "codex" => parse_codex(&text, &seen),
             "agy" => {
-                let sid = agy_conv_of(&path);
-                let m = sid.as_deref().and_then(|id| agy_meta.get(id));
-                parse_agy(&text, &seen, sid.as_deref(), m)
+                let conv = agy_conv_of(&path).unwrap_or_default();
+                let meta = agy_meta.get_or_insert_with(crate::history::agy_meta);
+                let mut p = parse_agy(&text, &seen, &conv);
+                // 子代理的对话算在开它的那个对话里
+                let mut root = conv.clone();
+                for _ in 0..8 {
+                    match meta.get(&root).and_then(|m| m.2.clone()) {
+                        Some(up) => root = up,
+                        None => break,
+                    }
+                }
+                if let Some((title, cwd, _)) = meta.get(&root) {
+                    p.title = Some(title.clone()).filter(|t| !t.is_empty());
+                    p.cwd = cwd.clone();
+                }
+                p.sid = Some(root);
+                p
             }
-            _ => continue,
+            _ => parse_codex(&text, &seen),
         };
         let mut rows: Vec<Row> = parsed.rows.into_values().collect();
         rows.sort_by(|a, b| (a.h, &a.m).cmp(&(b.h, &b.m)));
@@ -592,9 +533,6 @@ fn claude_conv_of(path: &str) -> Option<String> {
 
 /// 账号的名字和价格按哪家算：(名字, 种类 official / api / unknown, models.dev 的服务商)
 fn account_info(c: Option<&crate::pricing::Catalog>, store: &crate::store::Store, agent: &str, key: &str) -> (String, &'static str, Option<String>) {
-    if agent == "agy" {
-        return ("Antigravity".into(), "official", Some("google".into()));
-    }
     if agent == "codex" {
         let name = match key {
             "openai" => String::new(),
@@ -602,6 +540,10 @@ fn account_info(c: Option<&crate::pricing::Catalog>, store: &crate::store::Store
         };
         let kind = if key == "openai" { "official" } else { "api" };
         return (name, kind, c.and_then(|c| codex_catalog(c, store, Some(key))));
+    }
+    if agent == "agy" {
+        // agy 用 Google 账号登录，模型按 Google 的 API 价格折算
+        return (String::new(), "official", Some("google".into()));
     }
     if let Some(url) = key.strip_prefix("url:") {
         return (url.to_string(), "api", c.and_then(|c| crate::pricing::provider_for_url(c, url)));
@@ -726,15 +668,11 @@ pub fn report(store: &crate::store::Store, days: u32, tz: i32, on: Option<&str>)
         let claude_conv = (f.agent == "claude").then(|| claude_conv_of(path)).flatten();
         let account = match f.agent.as_str() {
             "codex" => f.provider.clone().unwrap_or_else(|| "openai".into()),
-            "agy" => "antigravity".into(),
+            "agy" => "google".into(),
             _ => claude_conv.as_ref().and_then(|c| convs.get(c).cloned()).unwrap_or_else(|| format!("claude:{}", crate::claude_profiles::OFFICIAL)),
         };
         // 一段会话：Claude Code 的子代理算在它的对话里
-        let conv = match f.agent.as_str() {
-            "codex" | "agy" => f.sid.clone(),
-            _ => claude_conv,
-        }
-        .unwrap_or_else(|| path.clone());
+        let conv = if f.agent == "claude" { claude_conv } else { f.sid.clone() }.unwrap_or_else(|| path.clone());
         let sess_key = (f.agent.clone(), conv);
         let project = f.cwd.as_deref().map(crate::history::dir_key).unwrap_or_default();
         let hint = info_of.entry((f.agent.clone(), account.clone())).or_insert_with(|| account_info(cat.as_deref(), store, &f.agent, &account)).2.clone();
@@ -823,7 +761,6 @@ pub fn report(store: &crate::store::Store, days: u32, tz: i32, on: Option<&str>)
         .collect();
     projects.sort_by(by_cost);
     let codex_titles = if by_session.keys().any(|(a, _)| a == "codex") { crate::history::codex_titles() } else { HashMap::new() };
-    let agy_metas = if by_session.keys().any(|(a, _)| a == "agy") { crate::history::agy_meta() } else { HashMap::new() };
     let session_count = by_session.len();
     let mut agents: Vec<Value> = by_agent
         .iter()
@@ -838,18 +775,14 @@ pub fn report(store: &crate::store::Store, days: u32, tz: i32, on: Option<&str>)
     let mut sessions: Vec<Value> = by_session
         .into_iter()
         .map(|((agent, id), s)| {
-            let title = s
-                .title
-                .or_else(|| (agent == "codex").then(|| codex_titles.get(&id).cloned()).flatten())
-                .or_else(|| (agent == "agy").then(|| agy_metas.get(&id).and_then(|m| m.title.clone())).flatten());
-            let dir = s.cwd.or_else(|| (agent == "agy").then(|| agy_metas.get(&id).and_then(|m| m.workdir.clone())).flatten());
+            let title = s.title.or_else(|| (agent == "codex").then(|| codex_titles.get(&id).cloned()).flatten());
             let model = s.models.into_iter().max_by_key(|(_, n)| *n).map(|(m, _)| m);
             let mut v = s.sum.view();
             v["agent"] = json!(agent);
             // 认不出会话号的（文件名不是会话号）不给号，界面上就不能点开
             v["id"] = json!((crate::history::valid_id(&id)).then_some(&id));
             v["title"] = json!(title);
-            v["dir"] = json!(dir);
+            v["dir"] = json!(s.cwd);
             v["model"] = json!(model);
             v["last"] = json!(hour_ts(s.last));
             v
@@ -921,6 +854,31 @@ mod tests {
         assert_eq!((r.i, r.o, r.cr, r.cw, r.c1, r.n), (3, 9, 100, 30, 20, 1));
         // 别的文件算过的不再算
         assert!(parse_claude(&s, &p.ids.iter().copied().collect()).rows.is_empty());
+    }
+
+    #[test]
+    fn agy_planner_responses() {
+        let text = [
+            r#"{"step_index":0,"type":"USER_INPUT","created_at":"2026-11-20T03:18:18Z","content":"hi"}"#,
+            r#"{"step_index":2,"type":"PLANNER_RESPONSE","created_at":"2026-11-20T03:18:27Z","model":"gemini-4-hydrogen-medium","input_tokens":10463,"cache_read_tokens":0,"output_tokens":293}"#,
+            r#"{"step_index":4,"type":"PLANNER_RESPONSE","created_at":"2026-11-20T03:18:33Z","model":"gemini-4-hydrogen-medium","input_tokens":2693,"cache_read_tokens":8409,"output_tokens":201}"#,
+            r#"{"step_index":7,"type":"PLANNER_RESPONSE","created_at":"2026-11-20T04:01:00Z","model":"gemini-4-neon-xhigh","input_tokens":100,"cache_read_tokens":50,"output_tokens":7}"#,
+        ]
+        .join("\n");
+        let p = parse_agy(&text, &HashSet::new(), "c1");
+        assert_eq!(p.ids.len(), 3);
+        let mut rows: Vec<&Row> = p.rows.values().collect();
+        rows.sort_by(|a, b| (a.h, &a.m).cmp(&(b.h, &b.m)));
+        assert_eq!(rows.len(), 2);
+        assert_eq!((rows[0].m.as_str(), rows[0].i, rows[0].cr, rows[0].o, rows[0].n), ("gemini-4-hydrogen", 13156, 8409, 494, 2));
+        assert_eq!(rows[1].m, "gemini-4-neon");
+        // 别的文件算过的不再算
+        let again = parse_agy(&text, &p.ids.iter().copied().collect(), "c1");
+        assert!(again.ids.is_empty() && again.rows.is_empty());
+        assert_eq!(agy_model("gemini-3.8-flash-low"), "gemini-3.8-flash");
+        assert_eq!(agy_model("claude-sonnet-5-5"), "claude-sonnet-5-5");
+        let path = Path::new("/h/.gemini/antigravity-cli/brain/488a4f83-dbb6-4c18-8779-219710d25683/.system_generated/logs/transcript.jsonl");
+        assert_eq!(agy_conv_of(path).as_deref(), Some("488a4f83-dbb6-4c18-8779-219710d25683"));
     }
 
     #[test]
@@ -1079,49 +1037,5 @@ mod tests {
         let adv = p.rows.values().find(|r| r.m == "claude-fable-5-2").unwrap();
         assert_eq!((adv.i, adv.o, adv.f, adv.x), (500, 40, false, 0));
         assert_eq!(p.ids.len(), 1);
-    }
-
-    #[test]
-    fn agy_usage_and_models() {
-        let mut s = line(json!({
-            "step_index": 0,
-            "type": "USER_INPUT",
-            "created_at": "2026-11-19T14:10:38Z",
-            "content": "<USER_REQUEST>\nhi\n</USER_REQUEST>\n<USER_SETTINGS_CHANGE>\nThe user changed setting `Model Selection` from None to Claude Opus 4.6 (Thinking). No need to comment.\n</USER_SETTINGS_CHANGE>"
-        }));
-        s += &line(json!({
-            "step_index": 1,
-            "type": "PLANNER_RESPONSE",
-            "created_at": "2026-11-19T14:10:40Z",
-            "input_tokens": 1000,
-            "cache_read_tokens": 500,
-            "output_tokens": 120
-        }));
-        s += &line(json!({
-            "step_index": 3,
-            "type": "PLANNER_RESPONSE",
-            "created_at": "2026-11-19T14:11:00Z",
-            "model": "gemini-4-neon-high",
-            "input_tokens": 2000,
-            "cache_read_tokens": 3000,
-            "output_tokens": 250
-        }));
-        let meta = crate::history::AgyMeta {
-            title: Some("Add Agent Support".into()),
-            workdir: Some("/workspace/ttyd".into()),
-            parent: None,
-        };
-        let p = parse_agy(&s, &HashSet::new(), Some("76f916f6-9e7b-49a9-894f-ee72a0d8dd4d"), Some(&meta));
-        assert_eq!(p.ids.len(), 2);
-        assert_eq!(p.cwd.as_deref(), Some("/workspace/ttyd"));
-        assert_eq!(p.title.as_deref(), Some("Add Agent Support"));
-        let claude = p.rows.values().find(|r| r.m == "claude-opus-4-6").unwrap();
-        assert_eq!((claude.i, claude.cr, claude.o, claude.n), (1000, 500, 120, 1));
-        let gemini = p.rows.values().find(|r| r.m == "gemini-4-neon").unwrap();
-        assert_eq!((gemini.i, gemini.cr, gemini.o, gemini.n), (2000, 3000, 250, 1));
-        assert_eq!(
-            agy_conv_of(Path::new("/root/.gemini/antigravity-cli/brain/76f916f6-9e7b-49a9-894f-ee72a0d8dd4d/.system_generated/logs/transcript.jsonl")).as_deref(),
-            Some("76f916f6-9e7b-49a9-894f-ee72a0d8dd4d")
-        );
     }
 }

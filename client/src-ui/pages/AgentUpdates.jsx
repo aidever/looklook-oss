@@ -1,6 +1,6 @@
-// AI 工具版本：Claude Code、Codex、DSH 现在的版本、有没有新版本（“当前 → 新版本”）、一键更新，每个一个“自动更新”开关。
+// AI 工具版本：Claude Code、Codex、DSH、Antigravity 现在的版本、有没有新版本（“当前 → 新版本”）、一键更新，每个一个“自动更新”开关。
 // 放在 AI 助手页“账号与模型”最上面（设置 → 关于里也有入口）。后端见 src/agent_update.rs：
-// 按用户实际的安装方式更新（npm / pnpm / bun、Claude Code 安装脚本的 `claude update`、Homebrew）；
+// 按用户实际的安装方式更新（npm / pnpm / bun、Claude Code 安装脚本的 `claude update`、Homebrew、`agy update`）；
 // 自动更新等到没有会话正在用这个工具时才装，不打断在跑的会话。装的进度和“一键安装”共用 `GET /tools/install/{tool}`。
 import { Download, RefreshCw } from 'lucide-react';
 import { useEffect, useState } from 'react';
@@ -142,20 +142,18 @@ function AgentRow({ item, onChanged }) {
       </div>
       {item.installed && item.can_update && (
         <div className="aup-ctl">
-          {!item.self_update && (
-            <label className="aup-auto">
-              <Switch checked={item.auto} disabled={busy === 'auto'} label={t('aup.auto_label', { name })} onChange={setAuto} />
-              <span className="small">{t('aup.auto')}</span>
-            </label>
-          )}
-          {(item.update || item.self_update) && (
+          <label className="aup-auto">
+            <Switch checked={item.auto} disabled={busy === 'auto'} label={t('aup.auto_label', { name })} onChange={setAuto} />
+            <span className="small">{t('aup.auto')}</span>
+          </label>
+          {item.update && (
             <Button className="btn-sm" busy={busy === 'update' || running} onClick={update}>
-              {running ? t('aup.updating') : item.update ? t('aup.update_to', { version: item.latest }) : t('aup.update_now')}
+              {running ? t('aup.updating') : t('aup.update_to', { version: item.latest })}
             </Button>
           )}
         </div>
       )}
-      {!item.installed && item.can_install !== false && (
+      {!item.installed && (
         <div className="aup-ctl">
           <Button className="btn-sm" icon={Download} busy={busy === 'install' || running} onClick={install}>
             {running ? t('aup.installing') : t('aup.install')}

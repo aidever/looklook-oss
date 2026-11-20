@@ -222,7 +222,7 @@ fn send_later(me: Arc<Chat>, id: String, text: String, images: Vec<String>) -> s
 }
 
 /// 权限模式，和 TUI 的 `/permissions` 一样三档：只读（改文件、联网要问）、默认（工作目录里随便改，出了目录要问）、完全访问（不问、不用沙箱），
-/// 另有助理派活用的两档（[`ASK_COMMANDS`]、[`FULL_GUARDED`]，界面上不列出来）
+/// 另有助理派活用的两档（[`ASK_COMMANDS`]、[`FULL_GUARDED`]，菜单里列在后面，Shift+Tab 不轮换到）
 pub const PERMS: [&str; 5] = ["readOnly", "workspaceWrite", "fullAccess", ASK_COMMANDS, FULL_GUARDED];
 /// 动手前问：工作区可写，每条命令都来问（untrusted）；改项目里的文件看看替它放（[`auto_accept`]）
 pub const ASK_COMMANDS: &str = "askCommands";

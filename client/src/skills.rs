@@ -67,6 +67,7 @@ struct Dirs {
     agents: PathBuf,
     opencode: PathBuf,
     dsh: PathBuf,
+    /// Antigravity（agy）：`~/.gemini/config`
     agy: PathBuf,
     /// 会话的项目：工作目录往上到 Git 仓库根（含）的每一层，近的在前；不带项目时为空
     project: Vec<PathBuf>,
@@ -75,15 +76,7 @@ struct Dirs {
 impl Dirs {
     fn real() -> Self {
         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-        Dirs {
-            claude: Agent::Claude.dir(),
-            codex: Agent::Codex.dir(),
-            agents: home.join(".agents"),
-            opencode: Agent::OpenCode.dir(),
-            dsh: Agent::Dsh.dir(),
-            agy: Agent::Agy.dir(),
-            project: vec![],
-        }
+        Dirs { claude: Agent::Claude.dir(), codex: Agent::Codex.dir(), agents: home.join(".agents"), opencode: Agent::OpenCode.dir(), dsh: Agent::Dsh.dir(), agy: Agent::Agy.dir(), project: vec![] }
     }
 
     /// 带上会话的项目目录
@@ -102,16 +95,6 @@ impl Dirs {
             }
             v
         };
-        let agy_on = self.agy.is_dir();
-        let with_proj_agents = |mut v: Vec<&'static str>| {
-            if oc {
-                v.push("opencode");
-            }
-            if agy_on {
-                v.push("agy");
-            }
-            v
-        };
         let mut out = vec![
             Root { skip: &["synced"], ..user("claude", self.claude.join("skills"), with_oc(vec!["claude"])) },
             user("codex", self.codex.join("skills"), vec!["codex"]),
@@ -126,7 +109,7 @@ impl Dirs {
         for (n, d) in self.project.iter().enumerate() {
             let proj = |key: &str, dir: PathBuf, tools: Vec<&'static str>| Root { source: Source::Project, ..user(&format!("project{n}-{key}"), dir, tools) };
             out.push(proj("claude", d.join(".claude").join("skills"), with_oc(vec!["claude"])));
-            out.push(proj("agents", d.join(".agents").join("skills"), with_proj_agents(vec!["codex"])));
+            out.push(proj("agents", d.join(".agents").join("skills"), with_oc(vec!["codex", "agy"])));
             out.push(proj("opencode", d.join(".opencode").join("skills"), vec!["opencode"]));
             out.push(proj("opencode-skill", d.join(".opencode").join("skill"), vec!["opencode"]));
         }
@@ -569,7 +552,7 @@ mod tests {
         let ids: Vec<&str> = items.iter().filter(|i| i.source == Source::Project).map(|i| i.id.as_str()).collect();
         assert_eq!(ids, ["project0-claude/near", "project2-agents/root"]);
         assert!(items.iter().filter(|i| i.source == Source::Project).all(|i| !i.deletable));
-        assert_eq!(detail_in(&dirs, "project2-agents", "root").unwrap().item.tools, ["codex"]);
+        assert_eq!(detail_in(&dirs, "project2-agents", "root").unwrap().item.tools, ["codex", "agy"]);
         assert!(delete_in(&dirs, &d.path().join("trash"), "project0-claude", "near", SystemTime::now()).is_err());
         // 不带项目时没有
         assert!(list_in(&Dirs { project: vec![], ..dirs }).iter().all(|i| i.source != Source::Project));

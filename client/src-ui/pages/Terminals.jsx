@@ -888,7 +888,7 @@ export function ShellPicker({ value, onChange, data, inherit }) {
   );
 }
 
-const STEP_NAMES = { node: "Node.js", claude: "Claude Code", codex: "Codex", opencode: "OpenCode", dsh: "DSH", agy: "Antigravity", "lark-cli": "lark-cli" };
+const STEP_NAMES = { node: "Node.js", claude: "Claude Code", codex: "Codex", opencode: "OpenCode", dsh: "DSH", "lark-cli": "lark-cli" };
 const STEP_MARK = { ok: "✓", failed: "✗", skipped: "–", running: "…", pending: "" };
 /** 分几步装的（先装 Node.js 再装工具、一键装全套）：一行步骤，每步的状态 */
 export function InstallSteps({ steps }) {

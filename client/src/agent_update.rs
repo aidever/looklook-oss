@@ -1,7 +1,9 @@
-//! AI 编程工具（Claude Code、Codex、DSH）的新版本检查和更新：AI 助手页“AI 工具版本”卡片（Ai.jsx）。
+//! AI 编程工具（Claude Code、Codex、DSH、Antigravity）的新版本检查和更新：AI 助手页“AI 工具版本”卡片（Ai.jsx）。
 //!
 //! - **查新版本**：后台每 [`CHECK_EVERY`] 查一次 npm 上的最新版（`latest` 标签；npmmirror 连不上再试官方源），
-//!   界面上也能点“检查更新”立刻查。三个工具都发在 npm 上，别的安装方式（安装脚本、Homebrew）也拿它当新版本号。
+//!   界面上也能点“检查更新”立刻查。前三个工具都发在 npm 上，别的安装方式（安装脚本、Homebrew）也拿它当新版本号。
+//!   Antigravity（agy）不在 npm 上：问它自己的更新服务（[`AGY_UPDATER`] 首页写着 `Stable Version: x.y.z`），
+//!   更新用 `agy update`（agy 自己下载、换掉）。
 //! - **按用户实际的安装方式更新**（[`locate`] 看程序装在哪）：
 //!   - npm / pnpm / bun 全局装的：同一个包管理器装到查到的那个版本，用查到版本的那个源（国内连得上）；
 //!   - Claude Code 官方安装脚本装的（`~/.local/share/claude/versions/<版本>`）、认不出来的 Claude Code：`claude update`；
@@ -27,6 +29,8 @@ use crate::instances::Instances;
 use crate::store::Store;
 
 pub const AGENTS: [&str; 4] = ["claude", "codex", "dsh", "agy"];
+/// agy 自己的更新服务（agy 程序里写的地址）：首页是 `Antigravity CLI auto updater is running! Stable Version: 1.5.13. Rolled out to 100%`
+const AGY_UPDATER: &str = "https://antigravity-cli-auto-updater-974169037036.us-central1.run.app/";
 /// 多久查一次新版本
 const CHECK_EVERY: Duration = Duration::from_secs(6 * 3600);
 /// 自动更新多久看一次（有没有新版本、工具空不空闲）
@@ -120,6 +124,11 @@ fn locate(tool: &str, program: &Path) -> Installed {
     let real = std::fs::canonicalize(program).unwrap_or_else(|_| program.to_path_buf());
     let s = norm(&real);
     let mut out = Installed { path: program.display().to_string(), version: None, method: "unknown", brew: None };
+    // agy 只有官方安装器一种装法，自己能更新（`agy update`）
+    if tool == "agy" {
+        out.method = "native";
+        return out;
+    }
     if tool == "claude" && crate::agents::claude_desktop_bundled().is_some_and(|d| norm(&d) == s || norm(&d) == norm(program)) {
         out.method = "desktop";
         return out;
@@ -148,10 +157,6 @@ fn locate(tool: &str, program: &Path) -> Installed {
             out.method = "native";
             return out;
         }
-    }
-    if tool == "agy" {
-        out.method = "native";
-        return out;
     }
     let Some(pkg) = crate::tools::package(tool) else { return out };
     if let Some(dir) = package_dir(&real, program, pkg) {
@@ -309,10 +314,22 @@ fn cmp_version(a: &str, b: &str) -> Option<std::cmp::Ordering> {
     })
 }
 
-/// npm 上的最新版（`latest` 标签）和查到它的源
+/// agy 更新服务首页上的稳定版本号
+fn agy_stable(page: &str) -> Option<String> {
+    let rest = &page[page.find("Stable Version:")? + "Stable Version:".len()..];
+    let v = rest.split_whitespace().next()?.trim_end_matches(['.', ',']);
+    looks_like_version(v).then(|| v.to_string())
+}
+
+/// npm 上的最新版（`latest` 标签）和查到它的源；agy 问它自己的更新服务
 async fn fetch_latest(tool: &str) -> Option<Latest> {
-    let pkg = crate::tools::package(tool)?;
     let client = reqwest::Client::builder().connect_timeout(Duration::from_secs(5)).timeout(Duration::from_secs(15)).build().ok()?;
+    if tool == "agy" {
+        let r = client.get(AGY_UPDATER).send().await.and_then(reqwest::Response::error_for_status).ok()?;
+        let v = agy_stable(&r.text().await.ok()?)?;
+        return Some(Latest { version: v, mirror: "official".into() });
+    }
+    let pkg = crate::tools::package(tool)?;
     for mirror in ["npmmirror", "official"] {
         let url = format!("{}{}/latest", crate::tools::registry(mirror), pkg.replace('/', "%2f"));
         if let Ok(r) = client.get(&url).send().await.and_then(reqwest::Response::error_for_status) {
@@ -397,17 +414,10 @@ pub async fn start(store: Arc<Store>, instances: Arc<Instances>, chat: Arc<Chat>
     }
     let found = installed(instances.shell()).await.remove(tool).flatten().ok_or_else(|| LocalError::new("AGENT_NOT_INSTALLED"))?;
     let saved = load(&store);
-    let self_update = tool == "agy";
-    let latest = match saved.latest.get(tool).cloned() {
-        Some(l) => {
-            if found.version.as_deref().is_some_and(|v| !newer(&l.version, v)) {
-                return Err(LocalError::new("AGENT_UP_TO_DATE"));
-            }
-            l
-        }
-        None if self_update => Latest { version: "latest".to_string(), mirror: String::new() },
-        None => return Err(LocalError::new("AGENT_UPDATE_CHECK_FAILED")),
-    };
+    let latest = saved.latest.get(tool).cloned().ok_or_else(|| LocalError::new("AGENT_UPDATE_CHECK_FAILED"))?;
+    if found.version.as_deref().is_some_and(|v| !newer(&latest.version, v)) {
+        return Err(LocalError::new("AGENT_UP_TO_DATE"));
+    }
     let Some((shown, line)) = update_command(tool, &found, &latest.version, &latest.mirror) else {
         return Err(LocalError::new(if found.method == "desktop" { "AGENT_UPDATE_DESKTOP" } else { "AGENT_UPDATE_MANUAL" }));
     };
@@ -426,7 +436,7 @@ pub async fn start(store: Arc<Store>, instances: Arc<Instances>, chat: Arc<Chat>
         let now = installed(instances.shell()).await.remove(tool).flatten().and_then(|i| i.version);
         let changed = now.is_some() && now != from;
         let (ok, error) = match job.as_ref().map(|j| j.state) {
-            Some("ok") if changed || now.is_none() || self_update => (true, None),
+            Some("ok") if changed || now.is_none() => (true, None),
             Some("ok") => (false, Some("unchanged".to_string())),
             _ => (false, Some(classify(job.as_ref().map(|j| j.output.as_str()).unwrap_or_default()).to_string())),
         };
@@ -502,7 +512,6 @@ pub async fn view(store: &Store, instances: &Instances, chat: &Chat) -> Value {
             };
             let command = match (&i, latest) {
                 (Some(i), Some(l)) => update_command(tool, i, &l.version, &l.mirror).map(|c| c.0),
-                (Some(i), None) if *tool == "agy" => update_command(tool, i, "latest", "").map(|c| c.0),
                 _ => None,
             };
             // 这种装法看看能不能更新（和查没查到新版本无关）
@@ -517,8 +526,6 @@ pub async fn view(store: &Store, instances: &Instances, chat: &Chat) -> Value {
                 "latest": latest.map(|l| &l.version),
                 "update": update,
                 "can_update": can,
-                "can_install": crate::tools::installable(tool),
-                "self_update": *tool == "agy",
                 "command": command,
                 "auto": saved.auto.get(*tool).copied().unwrap_or(false),
                 "busy": u.busy,
@@ -580,7 +587,8 @@ async fn follow_installed(instances: &Instances, chat: &Chat) {
         let before = SEEN.lock().unwrap_or_else(|e| e.into_inner()).insert(tool, v.clone());
         match tool {
             "claude" => chat.claude_installed(&v),
-            "codex" if before.is_some_and(|b| b != v) => chat.codex_installed(),
+            "codex" if before.as_ref().is_some_and(|b| *b != v) => chat.codex_installed(),
+            "agy" if before.as_ref().is_some_and(|b| *b != v) => chat.agy_installed(),
             _ => {}
         }
     }
@@ -633,6 +641,16 @@ async fn auto_tick(store: &Arc<Store>, instances: &Arc<Instances>, chat: &Arc<Ch
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn agy_updater_page() {
+        assert_eq!(agy_stable("Antigravity CLI auto updater is running! Stable Version: 1.5.13. Rolled out to 100%").as_deref(), Some("1.5.13"));
+        assert_eq!(agy_stable("Stable Version: 2.0.0-rc.1, rolling").as_deref(), Some("2.0.0-rc.1"));
+        assert_eq!(agy_stable("<html>404</html>"), None);
+        let i = locate("agy", Path::new("/home/u/.local/bin/agy"));
+        assert_eq!(i.method, "native");
+        assert_eq!(update_command("agy", &i, "1.6.0", "official").unwrap().0, "agy update");
+    }
+
     use super::*;
 
     #[test]

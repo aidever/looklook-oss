@@ -17,7 +17,7 @@ use sha2::{Digest, Sha256};
 
 use crate::store::Store;
 
-// build.rs 生成：SECRET_KEY_LEN、SECRET_XOR_KEY、SERVER_URL_XOR、PLATFORM_KEYS_XOR。
+// build.rs 生成：SECRET_KEY_LEN、SECRET_XOR_KEY、SERVER_URL_XOR、PLATFORM_KEYS_XOR、PLUGIN_KEYS_XOR。
 include!(concat!(env!("OUT_DIR"), "/secrets.rs"));
 
 fn xor(data: &[u8], key: &[u8; SECRET_KEY_LEN]) -> Vec<u8> {
@@ -41,17 +41,16 @@ pub fn builtin_platform_keys() -> String {
     String::from_utf8_lossy(&xor(PLATFORM_KEYS_XOR, &SECRET_XOR_KEY)).into_owned()
 }
 
-/// 编译期写入的插件包离线签名公钥列表（`kid=base64,kid2=base64`）。
-/// 开发构建（debug）允许用环境变量 `LOOKLOOK_PLUGIN_KEYS` 覆盖以便本地调试插件；正式构建只认内置公钥。
+/// 编译期写入的插件包签名公钥（`LOOKLOOK_PLUGIN_KEYS`）：只装这些私钥签过的插件。没设置时一个插件都装不了。
+/// 开发构建（debug）另外认环境变量 `LOOKLOOK_PLUGIN_KEYS_DEV`，方便本机测试自己签的包。
 pub fn builtin_plugin_keys() -> String {
+    let mut keys = String::from_utf8_lossy(&xor(PLUGIN_KEYS_XOR, &SECRET_XOR_KEY)).into_owned();
     if cfg!(debug_assertions) {
-        if let Ok(v) = std::env::var("LOOKLOOK_PLUGIN_KEYS") {
-            if !v.trim().is_empty() {
-                return v;
-            }
+        if let Ok(dev) = std::env::var("LOOKLOOK_PLUGIN_KEYS_DEV") {
+            keys = format!("{keys},{dev}");
         }
     }
-    String::from_utf8_lossy(&xor(PLUGIN_KEYS_XOR, &SECRET_XOR_KEY)).into_owned()
+    keys
 }
 
 /// dev 构建从不检测；release 构建里设 `LOOKLOOK_ALLOW_DEBUG=1` 可以跳过（比如自己要用调试器

@@ -89,10 +89,10 @@ import { chatEventsMode, onChatEventsMode, subscribeChat } from '../shared/chatE
 import { spinnerText } from '../shared/spinner.js';
 import {
   CODEX_ACTIONS,
-  AGY_COMMANDS,
   CODEX_COMMANDS,
   contextGauge,
   DSH_COMMANDS,
+  AGY_COMMANDS,
   CODEX_ONLY,
   COMMANDS,
   SDK_UNAVAILABLE,
@@ -2268,7 +2268,7 @@ function PendingCard({ id, pending, active }) {
             if (!busy) answer('deny', { message: reason });
           }}
         >
-          {/* DSH / Antigravity 的审批只能答允许 / 拒绝，带不了原因 */}
+          {/* DSH 的审批只能答允许 / 拒绝，带不了原因 */}
           {agentId !== 'dsh' && agentId !== 'agy' && <input className="chat-field grow" placeholder={t('chat.deny_reason')} value={reason} onChange={(e) => setReason(e.target.value)} />}
           <Button type="submit" variant={agentId === 'dsh' || agentId === 'agy' ? 'secondary' : 'ghost'} busy={spin('deny')} disabled={busy}>
             {t('chat.deny')}
@@ -3106,7 +3106,8 @@ function ModeMenu({ id, status, onClose }) {
   const { t } = useT();
   const toast = useToast();
   const { id: agentId } = useContext(AgentCtx);
-  const choices = agentId === 'codex' ? CODEX_MODE_CHOICES : MODE_CHOICES;
+  // Codex：界面三档 + 助理派活用的两档（任何 Codex 会话都能用，Shift+Tab 只在三档里轮换）
+  const choices = agentId === 'codex' ? [...CODEX_MODE_CHOICES, ...CODEX_DISPATCH_MODES] : MODE_CHOICES;
   const [busy, setBusy] = useState(null);
   const ready = status?.phase === 'idle' || status?.phase === 'running';
   const set = async (m) => {
@@ -4199,7 +4200,7 @@ function Composer({ id, active, status, phase, touch, offline, models, usage, it
     });
   };
   const modeChoices = agentId === 'codex' ? CODEX_MODE_CHOICES : MODE_CHOICES;
-  // Codex 的 askCommands / fullGuarded：助理派活用的两档（不在菜单里，只显示）
+  // Codex 的 askCommands / fullGuarded：助理派活用的两档（菜单里在后面，Shift+Tab 不轮换到）
   const modeKnown = modeChoices.includes(status?.mode) || (agentId !== 'codex' && status?.mode === 'dontAsk') || (agentId === 'codex' && CODEX_DISPATCH_MODES.includes(status?.mode));
   const modeText = status?.mode ? t(`chat.mode_${modeKnown ? status.mode : 'other'}`, { mode: status.mode }) : t('chat.mode');
   const ready = phase === 'idle' || phase === 'running';

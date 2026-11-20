@@ -84,6 +84,7 @@ error_codes! {
     SetupStepFailed = 400,
     PluginNotFound = 404,
     PluginNotLicensed = 403,
+    PluginDeviceLimit = 409,
 }
 
 impl ErrorCode {

@@ -1,4 +1,4 @@
-// 注入到会话标签里打开的网页界面（DSH，/w/{id}/）首页的脚本。
+// 注入到会话标签里打开的网页界面（DSH，/w/{id}/）和插件页面（/p/{名}/）首页的脚本。
 // 远程管理台走 WebRTC 时（服务端 docs/06）：普通请求由启动页的 Service Worker 经 DataChannel 转发，WebSocket 不经过它，
 // 这里把页面的 WebSocket 换成经启动页（window.top.__llrtc）打开的替身。其他情况什么也不做。
 // 替身与 term-inject.js 里的 RtcSocket 相同（终端那份还要管重连提示，这里只要接口一致）。

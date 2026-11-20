@@ -95,7 +95,7 @@ pub struct Inner {
     pub sync: Arc<crate::settings_sync::Syncer>,
     /// 飞书通知（src/notify.rs）
     pub notify: Arc<crate::notify::Notifier>,
-    /// 通用插件管理（src/plugins.rs）
+    /// 插件（src/plugins.rs）
     pub plugins: Arc<crate::plugins::Plugins>,
 }
 
@@ -147,15 +147,8 @@ pub fn router(app: App) -> Router {
         )
         .route("/w/{id}/", any(dsh::web))
         .route("/w/{id}/{*rest}", any(dsh::web))
-        // 插件页面与画面（/p/<名>/… → 插件 Unix socket），见 gateway/plugins.rs
-        .route(
-            "/p/{name}",
-            get(|axum::extract::Path(name): axum::extract::Path<String>, uri: axum::http::Uri| async move {
-                Redirect::permanent(&format!("/p/{name}/{}", uri.query().map(|q| format!("?{q}")).unwrap_or_default()))
-            }),
-        )
-        .route("/p/{name}/", any(plugins::page_proxy))
-        .route("/p/{name}/{*rest}", any(plugins::page_proxy))
+        // 插件的页面和画面（`/p/<名>/…` → 插件的 Unix Socket），见 plugins.rs
+        .merge(plugins::page_routes())
         .route(looklook_protocol::rtc::OFFER_PATH, axum::routing::post(crate::rtc::offer))
         .route(mcp::PATH, axum::routing::post(mcp::handle).get(mcp::not_allowed).delete(mcp::not_allowed))
         // 助理的大脑用的工具（只认它的令牌，见 assistant.rs）
@@ -413,7 +406,7 @@ pub fn local_app(app: App) -> Router {
 }
 
 /// 本机管理台发给另一台电脑的请求（服务端 docs/06 §14）：带 `X-LL-Device`（不是本机），或者是那台电脑上的终端
-/// （`/i/{id}…`、`/api/instances/{id}…`）或插件（`/p/{name}…`、`/api/plugins/{name}…`），经 WebRTC 转给它（`rtc::outbound`）。
+/// （`/i/{id}…`、`/api/instances/{id}…`，按终端路由表与地址上的 `__lldev`），经 WebRTC 转给它（`rtc::outbound`）。
 /// 只转发这台电脑自己（`Peer::Local`）打开的管理台的请求；写请求与 WebSocket 先在这里做和本机接口一样的来源检查，
 /// 那台电脑那边不再看来源。
 async fn to_peer(State(app): State<App>, req: Request, next: Next) -> Response {
@@ -421,12 +414,9 @@ async fn to_peer(State(app): State<App>, req: Request, next: Next) -> Response {
     if req.extensions().get::<access::Peer>() != Some(&access::Peer::Local) {
         return next.run(req).await;
     }
-    // 宿主白名单接口与本机桌面窗口/RTC 接口只在本机处理，绝不转发到其他电脑
+    // 本机桌面窗口/RTC 接口、给插件的宿主接口只在本机处理，绝不转发到其他电脑
     let uri_path = req.uri().path();
-    if uri_path.starts_with(looklook_protocol::plugin::HOST_PREFIX)
-        || uri_path.starts_with("/api/desktop/")
-        || uri_path.starts_with("/api/rtc/")
-    {
+    if uri_path.starts_with("/api/desktop/") || uri_path.starts_with("/api/rtc/") || uri_path.starts_with(looklook_protocol::plugin::HOST_PREFIX) {
         return next.run(req).await;
     }
     let Some(session) = app.account.session() else { return next.run(req).await };
@@ -445,14 +435,14 @@ async fn to_peer(State(app): State<App>, req: Request, next: Next) -> Response {
             return next.run(req).await;
         }
     }
-    let plugin = looklook_protocol::plugin::plugin_of_path(req.uri().path()).map(|n| format!("p:{n}"));
-    let route_key = terminal.or(plugin);
-    let header_dev = req.headers().get(looklook_protocol::DEVICE_HEADER).and_then(|v| v.to_str().ok()).map(str::to_owned);
-    let explicit = header_dev.clone().or(hint.clone());
-    if let (Some(k), Some(d)) = (&route_key, &explicit) {
+    // 插件（`/p/<名>/…`、`/api/plugins/<名>/…`）：插件页面在 iframe 里，第一次打开的地址带 `__lldev`，
+    // 之后页面自己的请求（静态文件、接口、画面）不带，按记下的那台电脑转
+    let route_key = terminal.clone().or_else(|| looklook_protocol::plugin::plugin_of_path(req.uri().path()).map(|n| format!("p:{n}")));
+    if let (Some(k), Some(d)) = (&route_key, &hint) {
         app.outbound.remember(k, d);
     }
-    let target = explicit.or_else(|| route_key.as_deref().and_then(|k| app.outbound.owner(k)));
+    let header_dev = req.headers().get(looklook_protocol::DEVICE_HEADER).and_then(|v| v.to_str().ok()).map(str::to_owned);
+    let target = header_dev.or(hint).or_else(|| route_key.as_deref().and_then(|k| app.outbound.owner(k)));
     let Some(dev) = target.filter(|d| *d != own) else { return next.run(req).await };
     let ws = req.headers().get(header::UPGRADE).and_then(|v| v.to_str().ok()).is_some_and(|v| v.eq_ignore_ascii_case("websocket"));
     if ws || !matches!(*req.method(), Method::GET | Method::HEAD) {

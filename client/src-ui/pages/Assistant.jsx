@@ -717,19 +717,48 @@ function CeilingPick({ state, onChange }) {
   );
 }
 
-/** 一个派出去的会话现在是哪一档，点开就能换（调高也行：是你自己点的）。Claude Code 马上生效，Codex 下一轮生效 */
+/** 每种引擎能切的全部权限模式（assistant.rs 的 engine_modes）和各自算哪一档 */
+const ENGINE_MODES = {
+  claude: [['plan', 'read_only'], ['default', 'ask'], ['acceptEdits', 'ask'], ['auto', 'project'], ['bypassPermissions', 'full']],
+  codex: [['readOnly', 'read_only'], ['askCommands', 'ask'], ['workspaceWrite', 'project'], ['fullGuarded', 'full'], ['fullAccess', 'full']],
+};
+// 一档在这种引擎上默认用的模式（assistant.rs 的 native_mode）
+const LEVEL_MODE = {
+  claude: { read_only: 'plan', ask: 'acceptEdits', project: 'auto', full: 'bypassPermissions' },
+  codex: { read_only: 'readOnly', ask: 'askCommands', project: 'workspaceWrite', full: 'fullGuarded' },
+};
+const modeName = (t, engine, m) => (engine === 'codex' && m === 'workspaceWrite' ? t('asst.mode_workspaceWrite') : t(`chat.mode_${m}`));
+/** 这种引擎的全部权限模式，图标按它算的那一档 */
+const engineModeOptions = (t, engine) =>
+  (ENGINE_MODES[engine] ?? ENGINE_MODES.claude).map(([m, level]) => {
+    const Icon = LEVEL_ICON[level];
+    return [
+      m,
+      <span key={m} className="asst-opt">
+        <Icon size={14} aria-hidden="true" />
+        {modeName(t, engine, m)}
+      </span>,
+      { hint: `${t(`asst.level.${level}`)} · ${t(`chat.mode_hint_${m}`)}` },
+    ];
+  });
+const levelOfMode = (engine, m) => (ENGINE_MODES[engine] ?? []).find(([x]) => x === m)?.[1];
+
+/** 一个派出去的会话现在是什么权限，点开能换成这种引擎的任何一种（调高也行：是你自己点的）。Claude Code 马上生效，Codex 下一轮生效 */
 function LevelPick({ x, onChange }) {
   const { t } = useTranslation();
   const toast = useToast();
   const [busy, setBusy] = useState(false);
-  if (!x.level) return null;
-  const set = (level) => {
+  const engine = x.engine;
+  if (!ENGINE_MODES[engine] || x.errand) return null;
+  // 现在实际的模式（对话页设置栏里换过的也算）；还没起来时按助理给的那一档
+  const cur = levelOfMode(engine, x.mode) ? x.mode : x.level ? LEVEL_MODE[engine][x.level] : null;
+  const set = (mode) => {
     setBusy(true);
     api
-      .post(`/assistant/sessions/${x.session}/level`, { level })
+      .post(`/assistant/sessions/${x.session}/level`, { mode })
       .then(
-        () => {
-          toast(t(x.engine === 'codex' ? 'asst.level_switched_next' : 'asst.level_switched', { name: t(`asst.level.${level}`) }), 'success');
+        (r) => {
+          toast(t(engine === 'codex' ? 'asst.level_switched_next' : 'asst.level_switched', { name: modeName(t, engine, r?.mode ?? mode) }), 'success');
           onChange?.();
         },
         (e) => toast(errorText(t, e), 'error'),
@@ -740,15 +769,100 @@ function LevelPick({ x, onChange }) {
     <span className="asst-level" onClick={(e) => e.stopPropagation()}>
       <Select
         className="asst-pick asst-pick-sm"
-        data-level={x.level}
-        value={x.level}
+        data-level={levelOfMode(engine, cur) ?? x.level}
+        value={cur ?? ''}
+        placeholder={t('asst.level_label')}
         disabled={busy}
-        options={levelOptions(t)}
-        onChange={(e) => e.target.value !== x.level && set(e.target.value)}
+        options={engineModeOptions(t, engine)}
+        onChange={(e) => e.target.value !== cur && set(e.target.value)}
         aria-label={t('asst.level_label')}
         title={t('asst.level_label')}
       />
     </span>
+  );
+}
+
+/**
+ * 设置里：派出去的 Claude Code / Codex 会话默认用什么权限、什么模型。改了马上存，下一次派活就用；
+ * 助理按用户的话指定了的（“这个只看”“用 opus”）照指定的
+ */
+function DispatchDefaults({ state, onChange }) {
+  const { t } = useTranslation();
+  const engines = (state.engines ?? []).filter((e) => e.installed).map((e) => e.id);
+  const list = engines.length ? engines : ENGINES;
+  return (
+    <section>
+      <h3 className="asst-h asst-h-sm">
+        <Send size={14} aria-hidden="true" />
+        {t('asst.defaults')}
+      </h3>
+      <p className="muted asst-small">{t('asst.defaults_hint')}</p>
+      {list.map((e) => (
+        <EngineDefaults key={e} engine={e} cur={state.settings?.[e] ?? {}} onChange={onChange} />
+      ))}
+    </section>
+  );
+}
+
+function EngineDefaults({ engine, cur, onChange }) {
+  const { t } = useTranslation();
+  const { busy, save } = useSaveSettings(onChange);
+  const [models, setModels] = useState(null);
+  useEffect(() => {
+    let live = true;
+    api.get(`/draft/models?agent=${engine}`).then(
+      (r) => live && setModels(r?.options ?? []),
+      () => live && setModels([]),
+    );
+    return () => {
+      live = false;
+    };
+  }, [engine]);
+  const name = ENGINE_NAMES[engine];
+  const put = (key, v, label) => save({ defaults: { [engine]: { [key]: v } } }, () => t('asst.defaults_saved', { engine: name, name: label }));
+  const modeOpts = [['', t('asst.defaults_mode_none', { name: t('asst.level.project') }), { hint: t('asst.defaults_mode_none_hint') }], ...engineModeOptions(t, engine)];
+  const known = (models ?? []).filter((o) => o.value && o.value !== 'default');
+  const modelOpts = [
+    ['', t('asst.defaults_model_none'), { hint: t('asst.defaults_model_none_hint') }],
+    ...known.map((o) => [o.value, o.label ?? o.value, o.description ? { hint: o.description } : undefined]),
+    // 存的模型不在现在的列表里（换了服务商、列表没拉到）：照样显示，能换掉
+    ...(cur.model && !known.some((o) => o.value === cur.model) ? [[cur.model, cur.model]] : []),
+  ];
+  return (
+    <div className="asst-defaults">
+      <div className="asst-defaults-name">
+        <LaunchIcon launch={engine} size={15} />
+        <b>{name}</b>
+      </div>
+      <div className="asst-switch">
+        <span>{t('asst.defaults_mode')}</span>
+        <Select
+          className="asst-pick"
+          value={cur.mode ?? ''}
+          disabled={busy}
+          options={modeOpts}
+          onChange={(e) => {
+            const v = e.target.value;
+            if (v !== (cur.mode ?? '')) put('mode', v, v ? modeName(t, engine, v) : t('asst.defaults_mode_none', { name: t('asst.level.project') }));
+          }}
+          aria-label={`${name} ${t('asst.defaults_mode')}`}
+        />
+      </div>
+      <div className="asst-switch">
+        <span>{t('asst.defaults_model')}</span>
+        <Select
+          className="asst-pick"
+          value={cur.model ?? ''}
+          disabled={busy || models == null}
+          options={modelOpts}
+          onChange={(e) => {
+            const v = e.target.value;
+            if (v !== (cur.model ?? '')) put('model', v, v ? (known.find((o) => o.value === v)?.label ?? v) : t('asst.defaults_model_none'));
+          }}
+          aria-label={`${name} ${t('asst.defaults_model')}`}
+        />
+      </div>
+    </div>
   );
 }
 
@@ -991,6 +1105,7 @@ function SettingsTab({ state, onChange }) {
         </div>
         <p className="muted asst-small">{t('asst.restart_hint')}</p>
       </section>
+      <DispatchDefaults state={state} onChange={onChange} />
       <FeishuBot state={state} onChange={onChange} />
       <p className="muted asst-small asst-foot">
         <ChevronRight size={12} aria-hidden="true" />

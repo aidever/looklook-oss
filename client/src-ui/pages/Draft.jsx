@@ -366,8 +366,8 @@ function DraftForm() {
   const willChat = canChat && !termMode;
   // 类型按钮上写清楚开出来的是对话界面还是终端
   const modeName = t(willChat ? 'sess.mode.chat' : 'sess.mode.term_short');
-  // 选模型：那台电脑上的 Claude Code / Codex / Antigravity 自己列的（对话界面才能先选好）
-  const pickModel = willChat && (launch === 'claude' || launch === 'codex' || launch === 'agy');
+  // 选模型：那台电脑上的 Claude Code / Codex 自己列的（对话界面才能先选好）
+  const pickModel = willChat && (launch === 'claude' || launch === 'codex');
   const [models] = useLoad(
     () => (pickModel ? client.get(`/draft/models?agent=${launch}${profile ? `&profile=${encodeURIComponent(profile)}` : ''}`).catch(() => null) : Promise.resolve(null)),
     [pickModel, launch, device, profile],
@@ -441,6 +441,7 @@ function DraftForm() {
     }, 1000);
     return () => clearTimeout(timer);
   }, [job]);
+  // agy 不在 npm 上，没有一键安装（按官方说明装好再来）
   const canInstall = !container && AI_TOOLS.includes(launch) && launch !== 'agy' && Boolean(tools?.tools?.npm || tools?.can_install_node);
   const install = async () => {
     setError(null);

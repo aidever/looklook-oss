@@ -162,10 +162,6 @@ fn opencode_dir() -> PathBuf {
     env_dir("XDG_DATA_HOME").unwrap_or_else(|| home().join(".local").join("share")).join("opencode")
 }
 
-fn agy_dir() -> PathBuf {
-    crate::agents::agy_data_dir()
-}
-
 /// 列出对话：最近有消息的排前面。
 pub async fn list(q: Query) -> Vec<Conv> {
     tokio::task::spawn_blocking(move || {
@@ -283,17 +279,7 @@ fn list_blocking(q: &Query) -> Vec<Conv> {
         out.extend(opencode_list());
     }
     if want("agy") {
-        for mut c in agy_list() {
-            if let Some(w) = deep {
-                let path = agy_transcript_path(&c.id);
-                match find_in_file(&path, w) {
-                    Some(snip) => c.snippet = Some(snip),
-                    None if !matches_text(&c, w) => continue,
-                    None => {}
-                }
-            }
-            out.push(c);
-        }
+        out.extend(agy_list());
     }
     if let Some(w) = workdir {
         out.retain(|c| same_dir(&c.workdir, w));
@@ -761,119 +747,77 @@ fn opencode_db(db: &Path) -> Option<Vec<Conv>> {
     Some(rows.flatten().filter_map(|(id, title, dir, t)| opencode_conv(&id, &title, &dir, t)).collect())
 }
 
-// ---------------- Antigravity (agy) ----------------
+// ---------------- Antigravity（agy） ----------------
+//
+// `~/.gemini/antigravity-cli/conversation_summaries.db`（agy 自己的 SQLite，只读打开）：标题、第一句话、目录、时间。
+// 子代理开的对话（`parent_conversation_id` 不空、`nesting_depth` 大于 0）不列。预览读
+// `brain/<对话>/.system_generated/logs/transcript.jsonl`（一行一步：`USER_INPUT`、`PLANNER_RESPONSE`……）。
 
-const AGY_MSGS: Want = &["\"USER_INPUT\"", "\"PLANNER_RESPONSE\""];
-
-fn agy_transcript_path(id: &str) -> PathBuf {
-    agy_dir().join("brain").join(id).join(".system_generated").join("logs").join("transcript.jsonl")
+fn agy_dir() -> PathBuf {
+    crate::agents::agy_data_dir()
 }
 
-/// 从 `USER_INPUT` 的 `<USER_REQUEST>...</USER_REQUEST>` 中提取用户输入原文
-fn strip_user_request(s: &str) -> String {
-    if let Some(rest) = s.split("<USER_REQUEST>").nth(1) {
-        if let Some(body) = rest.split("</USER_REQUEST>").next() {
-            return body.trim().to_string();
-        }
-    }
-    s.trim().to_string()
+fn agy_transcript(id: &str) -> Option<PathBuf> {
+    valid_id(id).then(|| agy_dir().join("brain").join(id).join(".system_generated").join("logs").join("transcript.jsonl"))
 }
 
-fn agy_msg(v: &Value) -> Option<(&'static str, String)> {
-    match v["type"].as_str()? {
-        "USER_INPUT" => {
-            if v["source"].as_str() != Some("USER_EXPLICIT") {
-                return None;
+/// agy 记的时间：`2026-11-20 03:17:40.049030297+00:00`（UTC）→ 毫秒
+fn agy_time_ms(t: &str) -> Option<i64> {
+    let fmt = time::macros::format_description!("[year]-[month]-[day] [hour]:[minute]:[second]");
+    let dt = time::PrimitiveDateTime::parse(t.get(..19)?, &fmt).ok()?;
+    let ms = dt.assume_utc().unix_timestamp() * 1000;
+    // 年份是 0001 的是“没有”
+    (ms > 0).then_some(ms)
+}
+
+/// `workspace_uris`：`["file:///root/proj"]` → 第一个目录
+fn agy_workdir(uris: &str) -> Option<String> {
+    let v: Vec<String> = serde_json::from_str(uris).ok()?;
+    let u = v.into_iter().next()?;
+    let path = u.strip_prefix("file://")?;
+    Some(percent_decode(path))
+}
+
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            let hex = |c: u8| (c as char).to_digit(16);
+            if let (Some(h), Some(l)) = (hex(b[i + 1]), hex(b[i + 2])) {
+                out.push((h * 16 + l) as u8);
+                i += 3;
+                continue;
             }
-            let text = strip_user_request(v["content"].as_str()?);
-            (!text.is_empty()).then_some(("user", text))
         }
-        "PLANNER_RESPONSE" => {
-            let text = v["content"].as_str()?.trim().to_string();
-            (!text.is_empty()).then_some(("assistant", text))
-        }
-        _ => None,
+        out.push(b[i]);
+        i += 1;
     }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
-/// 解析 SQLite 里的时间戳：`2026-11-19 14:12:22.325356796+00:00` → Unix 毫秒
-fn parse_agy_time_ms(s: &str) -> Option<i64> {
-    let s = s.trim();
-    if s.is_empty() {
-        return None;
-    }
-    // 把中间空格换成 T，再用 RFC3339 解析
-    let iso = if s.len() > 10 && s.as_bytes()[10] == b' ' {
-        format!("{}T{}", &s[..10], &s[11..])
-    } else {
-        s.to_string()
-    };
-    crate::util::parse_time_ms(&iso)
-}
-
-/// `["file:///workspace/ttyd"]` → `/workspace/ttyd`
-fn agy_first_workspace(raw: &str) -> Option<String> {
-    let arr: Vec<String> = serde_json::from_str(raw).ok()?;
-    for u in arr {
-        if let Ok(url) = reqwest::Url::parse(&u) {
-            if url.scheme() == "file" {
-                if let Ok(p) = url.to_file_path() {
-                    let s = p.display().to_string();
-                    if !s.is_empty() {
-                        return Some(s);
-                    }
-                }
-            }
-        } else if !u.trim().is_empty() {
-            return Some(u);
-        }
-    }
-    None
-}
-
-/// Antigravity 会话的元数据（用量统计按项目、按会话聚合用）
-#[derive(Debug, Clone, Default)]
-pub struct AgyMeta {
-    pub title: Option<String>,
-    pub workdir: Option<String>,
-    pub parent: Option<String>,
-}
-
-/// 读出 `conversation_summaries.db` 里所有对话（含子代理）的标题、目录与父会话
-pub fn agy_meta() -> HashMap<String, AgyMeta> {
-    use rusqlite::{Connection, OpenFlags};
+/// agy 每个对话（包括子代理开的）的 (标题, 目录, 上一级对话)：用量统计按项目、按会话归类用
+pub fn agy_meta() -> HashMap<String, (String, Option<String>, Option<String>)> {
     let db = agy_dir().join("conversation_summaries.db");
-    let Ok(conn) = Connection::open_with_flags(&db, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX) else {
+    if !db.is_file() {
         return HashMap::new();
-    };
-    let _ = conn.busy_timeout(Duration::from_millis(500));
-    let sql = "SELECT conversation_id, COALESCE(title, ''), COALESCE(preview, ''), workspace_uris, COALESCE(parent_conversation_id, '') FROM conversation_summaries";
-    let Ok(mut stmt) = conn.prepare(sql) else { return HashMap::new() };
-    let Ok(rows) = stmt.query_map([], |r| {
-        Ok((
-            r.get::<_, String>(0)?,
-            r.get::<_, String>(1)?,
-            r.get::<_, String>(2)?,
-            r.get::<_, String>(3)?,
-            r.get::<_, String>(4)?,
-        ))
-    }) else {
-        return HashMap::new();
-    };
-    let mut out = HashMap::new();
-    for (id, title, preview, uris, parent) in rows.flatten() {
-        let t = if !title.trim().is_empty() {
-            Some(clip(&title, TEXT_MAX))
-        } else if !preview.trim().is_empty() {
-            Some(clip(&preview, TEXT_MAX))
-        } else {
-            None
-        };
-        let workdir = agy_first_workspace(&uris);
-        let parent = (!parent.trim().is_empty()).then_some(parent);
-        out.insert(id, AgyMeta { title: t, workdir, parent });
     }
-    out
+    agy_meta_in(&db).unwrap_or_default()
+}
+
+fn agy_meta_in(db: &Path) -> Option<HashMap<String, (String, Option<String>, Option<String>)>> {
+    use rusqlite::{Connection, OpenFlags};
+    let conn = Connection::open_with_flags(db, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX).ok()?;
+    let _ = conn.busy_timeout(Duration::from_millis(500));
+    let mut stmt = conn.prepare("SELECT conversation_id, title, workspace_uris, parent_conversation_id FROM conversation_summaries").ok()?;
+    let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, String>(3)?))).ok()?;
+    Some(
+        rows.flatten()
+            .filter(|(id, ..)| valid_id(id))
+            .map(|(id, title, uris, parent)| (id, (clip(title.trim(), TEXT_MAX), agy_workdir(&uris), Some(parent).filter(|p| valid_id(p)))))
+            .collect(),
+    )
 }
 
 fn agy_list() -> Vec<Conv> {
@@ -888,53 +832,33 @@ fn agy_db(db: &Path) -> Option<Vec<Conv>> {
     use rusqlite::{Connection, OpenFlags};
     let conn = Connection::open_with_flags(db, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX).ok()?;
     let _ = conn.busy_timeout(Duration::from_millis(500));
-    let sql = "SELECT conversation_id, COALESCE(title, ''), COALESCE(preview, ''), workspace_uris, last_modified_time, status, not_fully_idle \
-               FROM conversation_summaries \
-               WHERE COALESCE(parent_conversation_id, '') = '' AND nesting_depth = 0 AND step_count > 0 \
-               ORDER BY last_modified_time DESC LIMIT 500";
+    let sql = "SELECT conversation_id, title, preview, CAST(last_modified_time AS TEXT), workspace_uris FROM conversation_summaries \
+               WHERE parent_conversation_id = '' AND nesting_depth = 0 ORDER BY last_modified_time DESC LIMIT 500";
     let mut stmt = conn.prepare(sql).ok()?;
-    let now_ms = crate::util::system_ms();
     let rows = stmt
-        .query_map([], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, String>(3)?,
-                r.get::<_, String>(4)?,
-                r.get::<_, String>(5)?,
-                r.get::<_, i64>(6).unwrap_or(0),
-            ))
-        })
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, String>(3)?, r.get::<_, String>(4)?)))
         .ok()?;
+    let now = crate::util::system_ms();
     Some(
         rows.flatten()
-            .filter_map(|(id, title, preview, uris, mtime, status, busy)| {
+            .filter_map(|(id, title, preview, at, uris)| {
                 if !valid_id(&id) {
                     return None;
                 }
-                let workdir = agy_first_workspace(&uris)?;
-                let updated_ms = parse_agy_time_ms(&mtime)?;
-                let title = if !title.trim().is_empty() {
-                    clip(&title, TEXT_MAX)
-                } else if !preview.trim().is_empty() {
-                    clip(&preview, TEXT_MAX)
-                } else {
-                    id.clone()
-                };
-                let live = status == "CASCADE_RUN_STATUS_RUNNING"
-                    || busy != 0
-                    || (now_ms - updated_ms).abs() < (LIVE_SECS as i64 * 1000);
+                let workdir = agy_workdir(&uris)?;
+                let updated_ms = agy_time_ms(&at).unwrap_or(0);
+                let first = preview.trim();
+                let title = if !title.trim().is_empty() { title.trim() } else if !first.is_empty() { first } else { id.as_str() };
                 Some(Conv {
                     agent: "agy",
-                    id,
-                    title,
+                    id: id.clone(),
+                    title: clip(title, TEXT_MAX),
                     workdir,
                     branch: None,
-                    last: None,
+                    last: (!first.is_empty()).then(|| clip(first, TEXT_MAX)),
                     updated_at: crate::util::fmt_ms(updated_ms),
                     updated_ms,
-                    live,
+                    live: now - updated_ms < (LIVE_SECS * 1000) as i64,
                     instance_id: None,
                     started_at: None,
                     snippet: None,
@@ -944,6 +868,24 @@ fn agy_db(db: &Path) -> Option<Vec<Conv>> {
             })
             .collect(),
     )
+}
+
+const AGY_MSGS: Want = &["\"USER_INPUT\"", "\"PLANNER_RESPONSE\""];
+
+/// transcript.jsonl 的一步：你说的话（`USER_INPUT`，正文在 `<USER_REQUEST>` 里）或 agy 的回答（`PLANNER_RESPONSE` 的 `content`）
+fn agy_msg(v: &Value) -> Option<(&'static str, String)> {
+    let content = v["content"].as_str().filter(|c| !c.trim().is_empty())?;
+    match v["type"].as_str()? {
+        "USER_INPUT" => {
+            let text = match (content.find("<USER_REQUEST>"), content.find("</USER_REQUEST>")) {
+                (Some(a), Some(b)) if b > a => &content[a + "<USER_REQUEST>".len()..b],
+                _ => content,
+            };
+            Some(("user", text.trim().to_string()))
+        }
+        "PLANNER_RESPONSE" => Some(("assistant", content.trim().to_string())),
+        _ => None,
+    }
 }
 
 // ---------------- 预览 ----------------
@@ -976,13 +918,7 @@ fn preview_blocking(agent: &str, id: &str, full: bool) -> Option<Vec<Message>> {
             (p, codex_msg, CODEX_MSGS)
         }
         "opencode" => return Some(vec![]),
-        "agy" => {
-            let p = agy_transcript_path(id);
-            if !p.is_file() {
-                return Some(vec![]);
-            }
-            (p, agy_msg, AGY_MSGS)
-        }
+        "agy" => (agy_transcript(id).filter(|p| p.is_file())?, agy_msg, AGY_MSGS),
         _ => return None,
     };
     let (bytes, count, max) = if full { (FULL_BYTES, FULL_COUNT, FULL_MAX) } else { (PREVIEW_BYTES, 6, PREVIEW_MAX) };
@@ -1124,6 +1060,39 @@ pub fn redact_log(path: &Path, text: &str, with: &str) -> std::io::Result<usize>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agy_rows_and_messages() {
+        assert_eq!(agy_time_ms("2026-11-20 03:17:40.049030297+00:00"), Some(1_795_144_660_000));
+        assert_eq!(agy_time_ms("0001-01-01 00:00:00+00:00"), None);
+        assert_eq!(agy_workdir(r#"["file:///root/my%20proj","file:///x"]"#).as_deref(), Some("/root/my proj"));
+        assert_eq!(agy_workdir("[]"), None);
+        assert_eq!(percent_decode("/a%E4%BD%A0%zz%"), "/a你%zz%");
+        let u = serde_json::json!({ "type": "USER_INPUT", "content": "<USER_REQUEST>\nhi there\n</USER_REQUEST>\n<ADDITIONAL_METADATA>x</ADDITIONAL_METADATA>" });
+        assert_eq!(agy_msg(&u), Some(("user", "hi there".to_string())));
+        let a = serde_json::json!({ "type": "PLANNER_RESPONSE", "content": "done" });
+        assert_eq!(agy_msg(&a), Some(("assistant", "done".to_string())));
+        assert_eq!(agy_msg(&serde_json::json!({ "type": "PLANNER_RESPONSE", "tool_calls": [] })), None);
+        assert!(agy_transcript("../x").is_none());
+    }
+
+    #[test]
+    fn agy_db_lists_top_level_conversations() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("c.db");
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE conversation_summaries (conversation_id text, title text NOT NULL DEFAULT '', preview text NOT NULL DEFAULT '', last_modified_time datetime NOT NULL, workspace_uris text NOT NULL, parent_conversation_id text NOT NULL DEFAULT '', nesting_depth integer NOT NULL DEFAULT 0);
+             INSERT INTO conversation_summaries VALUES ('a-1', 'Fix it', 'please fix', '2026-11-20 03:17:40.0+00:00', '[\"file:///w\"]', '', 0);
+             INSERT INTO conversation_summaries VALUES ('b-2', '', 'first words', '2026-11-20 04:00:00+00:00', '[\"file:///w\"]', '', 0);
+             INSERT INTO conversation_summaries VALUES ('c-3', 'sub', '', '2026-11-20 05:00:00+00:00', '[\"file:///w\"]', 'a-1', 1);",
+        )
+        .unwrap();
+        drop(conn);
+        let v = agy_db(&db).unwrap();
+        assert_eq!(v.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(), ["b-2", "a-1"], "子代理的不列，新的在前");
+        assert_eq!((v[0].title.as_str(), v[0].workdir.as_str(), v[0].agent), ("first words", "/w", "agy"));
+    }
 
     fn write(dir: &Path, name: &str, lines: &[Value]) -> PathBuf {
         let p = dir.join(name);

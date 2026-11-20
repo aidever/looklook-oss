@@ -1661,7 +1661,7 @@ mod tests {
             ssh_transfer: Default::default(),
             sync: Default::default(),
             notify: Default::default(),
-            plugins: crate::plugins::Plugins::new(paths.home.clone(), Default::default()),
+            plugins: crate::plugins::Plugins::new(paths.clone(), account.clone(), ""),
         });
         tokio::spawn(crate::gateway::serve(ui, crate::gateway::local_app(app.clone()), shutdown.clone()));
         chat.publish(ui_addr).unwrap();

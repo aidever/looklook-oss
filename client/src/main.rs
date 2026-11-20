@@ -25,11 +25,11 @@
 mod account;
 mod agent_update;
 mod agents;
-mod archive;
 mod assistant;
 mod assistant_index;
 mod assistant_jobs;
 mod assistant_memory;
+mod archive;
 mod chat;
 mod checkpoint;
 mod claude_profiles;
@@ -55,6 +55,7 @@ mod model_tuning;
 mod notify;
 mod feishu_bot;
 mod paths;
+mod plugins;
 mod desk_pet;
 mod pet_github;
 mod pet_lines;
@@ -62,7 +63,6 @@ mod pet_linesets;
 mod pet_transfer;
 mod pets;
 mod platform;
-mod plugins;
 mod ports;
 mod proctree;
 mod session_probe;
@@ -669,8 +669,6 @@ async fn run(home: Option<PathBuf>, listen: Option<SocketAddr>, server: Option<S
     // 首次运行时生成的访问码要存下来，否则每次启动都不一样。
     access.save(&store)?;
     let _ = std::fs::remove_file(paths.home.join("local-token")); // 旧版本的本机访问口令，已不再使用
-    let plugins = plugins::Plugins::new(paths.home.clone(), platform::parse_key_list(&hardening::builtin_plugin_keys()));
-    plugins.set_host_url(format!("http://127.0.0.1:{}", ui_addr.port()));
     let app = Arc::new(Inner {
         account: account.clone(),
         instances: instances.clone(),
@@ -694,8 +692,9 @@ async fn run(home: Option<PathBuf>, listen: Option<SocketAddr>, server: Option<S
         ssh_transfer: Default::default(),
         sync: Default::default(),
         notify: Default::default(),
-        plugins: plugins.clone(),
+        plugins: plugins::Plugins::new(paths.clone(), account.clone(), &hardening::builtin_plugin_keys()),
     });
+    app.plugins.set_host(ui_addr);
     std::fs::write(paths.home.join("run").join("endpoint"), ui_addr.to_string())?;
     if let Err(e) = chat.publish(ui_addr) {
         tracing::warn!(error = %e, "无法写入对话界面的 hook 配置");
@@ -706,7 +705,6 @@ async fn run(home: Option<PathBuf>, listen: Option<SocketAddr>, server: Option<S
             tracing::warn!(error = %e, "无法安装 DSH 插件");
         }
     });
-    plugins.autostart();
     let open_base = app.write_open_file()?;
 
     // `shutdown` 现在是调用者传进来的（不再在这里创建）：托盘的“停止”菜单（任务 7b，
@@ -715,7 +713,6 @@ async fn run(home: Option<PathBuf>, listen: Option<SocketAddr>, server: Option<S
     // 留下的旧任务会和新的并存——两份 rathole 用同一令牌互相挤掉、两份心跳、两份终端守护。
     let mut relay_task = tokio::spawn(relay::run(account.clone(), relay_addr, paths.relay_config(), shutdown.clone()));
     let background = [
-        tokio::spawn(plugins.clone().watch(account.clone(), store.clone(), shutdown.clone())),
         tokio::spawn(account.clone().heartbeat_loop()),
         tokio::spawn(account.clone().report_terminals_loop(instances.subscribe())),
         tokio::spawn(instances.clone().supervise()),
@@ -756,6 +753,11 @@ async fn run(home: Option<PathBuf>, listen: Option<SocketAddr>, server: Option<S
         },
     ];
     let local = tokio::spawn(gateway::serve(ui, gateway::local_app(app.clone()), shutdown.clone()));
+    // 插件清单说要随看看起来的（例如上次退出时浏览器还开着）：网关起来以后再起，插件一起来就能调宿主接口
+    tokio::spawn({
+        let plugins = app.plugins.clone();
+        async move { plugins.autostart().await }
+    });
     let remote = tokio::spawn(gateway::serve(relay, gateway::relay_app(app.clone()), shutdown.clone()));
 
     let url = format!("{open_base}/");
@@ -792,6 +794,8 @@ async fn run(home: Option<PathBuf>, listen: Option<SocketAddr>, server: Option<S
         }
     }
     instances.shutdown().await;
+    // 插件进程跟着看看退出（插件自己的子进程，例如还开着的浏览器，由插件决定留不留，下次启动时接回来）
+    app.plugins.stop_all().await;
     account.persist_clock();
     let _ = tokio::time::timeout(Duration::from_secs(3), async {
         let _ = local.await;

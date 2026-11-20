@@ -21,6 +21,7 @@ pub struct Detected {
     pub claude: Option<String>,
     pub opencode: Option<String>,
     pub dsh: Option<String>,
+    /// Antigravity CLI
     pub agy: Option<String>,
     /// 飞书官方的命令行（`@larksuite/cli`）：AI 助手用它以你本人的身份读、发飞书
     #[serde(rename = "lark-cli")]
@@ -61,7 +62,10 @@ pub async fn detect(shell: &str) -> Detected {
         cmd.args(["-lic", &script]).stdin(std::process::Stdio::null());
         tokio::time::timeout(Duration::from_secs(8), cmd.output()).await
     };
-    let Ok(Ok(out)) = out else { return d };
+    let Ok(Ok(out)) = out else {
+        d.agy = crate::agents::agy_fallback();
+        return d;
+    };
     let text = String::from_utf8_lossy(&out.stdout);
     for line in text.lines() {
         let line = line.trim();
@@ -79,6 +83,10 @@ pub async fn detect(shell: &str) -> Detected {
                 d.set(name, path.to_string());
             }
         }
+    }
+    // agy 的官方安装器装在 `~/.local/bin`，有的 shell 配置里没把它加进 PATH
+    if d.agy.is_none() {
+        d.agy = crate::agents::agy_fallback();
     }
     d
 }

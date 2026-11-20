@@ -1,397 +1,289 @@
-//! 通用插件网关：
-//! - 管理接口：`/api/plugins`、`/api/plugins/_manage/{name}/{install,uninstall,start,stop}`、`/api/plugins/_capabilities/open-url`
-//! - 反向代理：`/api/plugins/{name}/{*rest}`、`/p/{name}/…` → 插件 Unix socket（原样保留路径前缀，支持 WebSocket 与 HTML `web.js` 注入）
-//! - 宿主白名单接口（仅本机 `local_app` 挂载，不经中转/WebRTC）：`/_host/info`、`/_host/notify`、`/_host/license`、`/_host/data`
+//! 插件的网关部分（src/plugins.rs）：
+//!
+//! - 管理：`GET /api/plugin-store`（本机装的 + 服务端目录 + 授权）、`POST /api/plugin-store/{名}/install`（装 / 更新）、
+//!   `DELETE /api/plugin-store/{名}`（卸载，数据留着）、`POST /api/plugin-store/{名}/restart`；
+//! - 转发：`/p/{名}/…`（页面、画面 WebSocket）和 `/api/plugins/{名}/…`（接口，和别的 `/api` 一样过写请求的来源检查）
+//!   → 插件的 Unix Socket。转发前去掉 Cookie 和认证头，加上插件口令和是不是这台电脑打开的；
+//!   插件页面要用 WebRTC 远程打开，HTML 里注入 `/static/web.js`（WebSocket 接到启动页的通道上）；
+//! - 宿主接口：`/_host/license`、`/_host/info`，只在本机、只认看看给插件的口令（不经 WebRTC 转给别的电脑）。
 
-use axum::extract::{Path, Query, Request, State};
-use axum::http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
-use axum::response::{IntoResponse, Response};
+use axum::body::Body;
+use axum::extract::{Path, Request, State};
+use axum::http::{header, HeaderValue, StatusCode};
+use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{any, get, post};
-use axum::{Extension, Json, Router};
-use looklook_protocol::plugin::{self as proto, HostInfo, HostNotify, LicenseRequest, ReadonlyPolicy};
-use serde::Deserialize;
-use serde_json::{json, Value};
+use axum::{Json, Router};
+use looklook_protocol::plugin as proto;
+use serde_json::Value;
 
-use super::access::Peer;
-use super::{assets, origin_matches, proxy, Access, App};
-use crate::account::VERSION;
+use super::{access, assets, origin_matches, proxy, Access, App};
 use crate::error::LocalError;
-use crate::paths;
 
 type R<T> = Result<T, LocalError>;
 
-/// 标明当前请求属于只读访问（如未来的只读分享会话），供网关按 `manifest.readonly_policy` 兜底拦截。
-#[derive(Debug, Clone, Copy)]
-pub struct ReadOnly(pub bool);
-
-/// 挂在 `/api` 下（继承 CSRF `guard` 中间件）。
+/// `/api` 下的管理接口和插件接口转发
 pub fn api_routes() -> Router<App> {
     Router::new()
-        .route("/plugins", get(list_plugins))
-        .route("/plugins/_capabilities/open-url", get(open_url_providers))
-        .route("/plugins/_manage/{name}/install", post(install_plugin))
-        .route("/plugins/_manage/{name}/uninstall", post(uninstall_plugin))
-        .route("/plugins/_manage/{name}/start", post(start_plugin))
-        .route("/plugins/_manage/{name}/stop", post(stop_plugin))
+        .route("/plugin-store", get(list))
+        .route("/plugin-store/{name}", axum::routing::delete(uninstall))
+        .route("/plugin-store/{name}/install", post(install))
+        .route("/plugin-store/{name}/restart", post(restart))
         .route("/plugins/{name}/{*rest}", any(api_proxy))
 }
 
-/// 挂在 `local_app` 顶层（只接受本机直连 + 运行中插件的随机 `HDR_TOKEN`）。
-pub fn host_routes() -> Router<App> {
+/// 页面
+pub fn page_routes() -> Router<App> {
     Router::new()
-        .route("/_host/info", get(host_info))
-        .route("/_host/notify", post(host_notify))
-        .route("/_host/license", post(host_license))
-        .route("/_host/data", get(host_data))
+        .route(
+            "/p/{name}",
+            get(|Path(name): Path<String>, uri: axum::http::Uri| async move { Redirect::permanent(&format!("/p/{name}/{}", uri.query().map(|q| format!("?{q}")).unwrap_or_default())) }),
+        )
+        .route("/p/{name}/", any(page_proxy))
+        .route("/p/{name}/{*rest}", any(page_proxy))
 }
 
-fn de_bool_lenient<'de, D: serde::Deserializer<'de>>(d: D) -> Result<bool, D::Error> {
-    let s = Option::<String>::deserialize(d)?;
-    Ok(matches!(s.as_deref(), Some("1" | "true" | "TRUE" | "yes")))
+/// 宿主接口（只挂在本机入口上）
+pub fn host_routes() -> Router<App> {
+    Router::new().route(proto::HOST_LICENSE_PATH, post(host_license)).route(proto::HOST_INFO_PATH, get(host_info))
 }
 
-#[derive(Deserialize, Default)]
-struct ListQuery {
-    #[serde(default, deserialize_with = "de_bool_lenient")]
-    catalog: bool,
+async fn list(State(app): State<App>, axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>) -> Json<Value> {
+    // `?local=1`：只看本机装的（不问服务端），工具菜单用
+    Json(app.plugins.list(q.get("local").map(String::as_str) != Some("1")).await)
 }
 
-async fn list_plugins(State(app): State<App>, Query(q): Query<ListQuery>) -> Json<Value> {
-    let installed = app.plugins.brief();
-    let jobs = app.plugins.all_jobs();
-    let (catalog, catalog_error) = if q.catalog {
-        match app.account.plugin_catalog(paths::target()).await {
-            Ok(c) => (Some(c.plugins), None),
-            Err(e) => {
-                let le: LocalError = e.into();
-                (None, Some(le.code))
-            }
-        }
-    } else {
-        (None, None)
-    };
-    Json(json!({
-        "target": paths::target(),
-        "protocol": proto::PROTOCOL_VERSION,
-        "installed": installed,
-        "catalog": catalog,
-        "catalog_error": catalog_error,
-        "jobs": jobs,
-    }))
+async fn install(State(app): State<App>, Path(name): Path<String>) -> R<impl IntoResponse> {
+    app.plugins.start_install(&name)?;
+    Ok((StatusCode::ACCEPTED, Json(app.plugins.list(false).await)))
 }
 
-#[derive(Deserialize, Default)]
-struct OpenUrlQuery {
-    /// 为 true 时向已安装的 `open_url` 插件拉取实时 targets（必要时按需拉起插件）。
-    #[serde(default, deserialize_with = "de_bool_lenient")]
-    fetch: bool,
+async fn uninstall(State(app): State<App>, Path(name): Path<String>) -> R<Json<Value>> {
+    app.plugins.uninstall(&name).await?;
+    Ok(Json(app.plugins.list(false).await))
 }
 
-async fn open_url_providers(State(app): State<App>, headers: HeaderMap, Query(q): Query<OpenUrlQuery>) -> Json<Value> {
-    let locale = headers.get(header::ACCEPT_LANGUAGE).and_then(|v| v.to_str().ok()).map(str::to_owned);
-    let mut providers = Vec::new();
-    for p in app.plugins.list_installed() {
-        if p.incompatible.is_some() {
-            continue;
-        }
-        let Some(cap) = p.manifest.capabilities.open_url.clone() else { continue };
-        let targets = if q.fetch {
-            let path = proto::api_url(&p.manifest.name, &cap.targets);
-            match app.plugins.call_json(&p.manifest.name, Method::GET, &path, locale.as_deref(), None).await {
-                Ok((StatusCode::OK, v)) => Some(v),
-                _ => None,
-            }
-        } else {
-            None
-        };
-        providers.push(json!({
-            "name": p.manifest.name,
-            "icon": p.manifest.icon,
-            "title": cap.title,
-            "targets_path": proto::api_url(&p.manifest.name, &cap.targets),
-            "open_path": proto::api_url(&p.manifest.name, &cap.open),
-            "data": targets,
-        }));
-    }
-    Json(json!({ "providers": providers }))
-}
-
-async fn install_plugin(State(app): State<App>, Path(name): Path<String>) -> R<impl IntoResponse> {
-    let job = app.plugins.start_install(app.account.clone(), name)?;
-    Ok((StatusCode::ACCEPTED, Json(json!({ "job": job }))))
-}
-
-#[derive(Deserialize, Default)]
-struct UninstallReq {
-    #[serde(default)]
-    remove_data: bool,
-}
-
-async fn uninstall_plugin(State(app): State<App>, Path(name): Path<String>, body: Option<Json<UninstallReq>>) -> R<Json<Value>> {
-    let remove_data = body.is_some_and(|b| b.remove_data);
-    app.plugins.uninstall(&name, remove_data).await?;
-    Ok(Json(json!({ "installed": app.plugins.brief() })))
-}
-
-async fn start_plugin(State(app): State<App>, Path(name): Path<String>) -> R<Json<Value>> {
-    let _ = app.plugins.ensure_running(&name).await?;
-    Ok(Json(json!({ "installed": app.plugins.brief() })))
-}
-
-async fn stop_plugin(State(app): State<App>, Path(name): Path<String>) -> R<Json<Value>> {
+async fn restart(State(app): State<App>, Path(name): Path<String>) -> R<Json<Value>> {
     app.plugins.stop(&name).await;
-    Ok(Json(json!({ "installed": app.plugins.brief() })))
+    app.plugins.ensure(&name).await?;
+    Ok(Json(app.plugins.list(false).await))
 }
 
-fn access_label(access: &Access, peer: Option<&Peer>) -> proto::Access {
-    match access {
-        Access::Local => match peer {
-            Some(Peer::Local) | None => proto::Access::Local,
-            _ => proto::Access::Lan,
-        },
-        Access::Remote { .. } => proto::Access::Remote,
-        Access::Rtc { .. } => proto::Access::Rtc,
-    }
+async fn api_proxy(State(app): State<App>, Path((name, _)): Path<(String, String)>, req: Request) -> Response {
+    forward(&app, &name, req, false).await
 }
 
-fn check_readonly(policy: ReadonlyPolicy, readonly: bool, method: &Method, ws: bool) -> bool {
-    if !readonly {
-        return true;
-    }
-    match policy {
-        ReadonlyPolicy::Deny => false,
-        ReadonlyPolicy::ReadMethods => !ws && matches!(*method, Method::GET | Method::HEAD),
-        ReadonlyPolicy::Plugin => true,
-    }
+async fn page_proxy(State(app): State<App>, Path(name): Path<String>, req: Request) -> Response {
+    forward(&app, &name, req, true).await
 }
 
-fn apply_plugin_headers(req: &mut Request, token: &str, access: proto::Access, readonly: bool) {
-    let h = req.headers_mut();
-    // 防止浏览器伪造任何插件内部头
-    h.remove(proto::HDR_TOKEN);
-    h.remove(proto::HDR_ACCESS);
-    h.remove(proto::HDR_READONLY);
-    h.remove(header::COOKIE);
-    h.remove(header::AUTHORIZATION);
-    h.remove(header::REFERER);
-    if let Ok(v) = HeaderValue::from_str(token) {
-        h.insert(HeaderName::from_static(proto::HDR_TOKEN), v);
+/// `/p/{name}/{*rest}` 也走这里：路径参数可能有一个或两个
+async fn forward(app: &App, name: &str, req: Request, page: bool) -> Response {
+    if !proto::valid_name(name) {
+        return LocalError::not_found().into_response();
     }
-    h.insert(HeaderName::from_static(proto::HDR_ACCESS), HeaderValue::from_static(access.as_str()));
-    if readonly {
-        h.insert(HeaderName::from_static(proto::HDR_READONLY), HeaderValue::from_static("1"));
-    }
-    if !h.contains_key(proto::HDR_LOCALE) {
-        if let Some(lang) = h.get(header::ACCEPT_LANGUAGE).and_then(|v| v.to_str().ok()).and_then(|s| s.split(',').next()).map(str::trim) {
-            if let Ok(v) = HeaderValue::from_str(lang) {
-                h.insert(HeaderName::from_static(proto::HDR_LOCALE), v);
-            }
-        }
-    }
-}
-
-/// `/api/plugins/{name}/{*rest}` → 插件（恢复 `/api` 前缀原样转给插件）。
-async fn api_proxy(State(app): State<App>, Path((name, _rest)): Path<(String, String)>, mut req: Request) -> Response {
     let access = req.extensions().get::<Access>().cloned().unwrap_or(Access::Local);
-    let peer = req.extensions().get::<Peer>().copied();
-    let readonly = req.extensions().get::<ReadOnly>().is_some_and(|r| r.0);
-    let ws = proxy::is_websocket(req.headers());
-    if ws && !origin_matches(req.headers(), &access) {
+    // 画面的 WebSocket：只接受管理台自己的页面连（防别的网站借浏览器连进来）
+    if proxy::is_websocket(req.headers()) && !origin_matches(req.headers(), &access) {
         return LocalError::new("CSRF_FAILED").into_response();
     }
-    let handle = match app.plugins.ensure_running(&name).await {
-        Ok(h) => h,
+    let p = match app.plugins.ensure(name).await {
+        Ok(p) => p,
+        Err(e) if page => return plugin_error_page(&e),
         Err(e) => return e.into_response(),
     };
-    if !check_readonly(handle.manifest.readonly_policy, readonly, req.method(), ws) {
-        return LocalError::new("FORBIDDEN").into_response();
+    #[cfg(unix)]
+    {
+        unix::forward(req, &p.socket, &p.token, access.is_local(), page).await
     }
-    // Axum `.nest("/api", ...)` 去掉了 `/api`，恢复为协议约定的完整路径 `/api/plugins/<名>/…`
-    let pq = req.uri().path_and_query().map(|p| p.as_str()).unwrap_or("/");
-    let full = if pq.starts_with("/api/") { pq.to_string() } else { format!("/api{pq}") };
-    if let Ok(uri) = full.parse() {
-        *req.uri_mut() = uri;
+    #[cfg(not(unix))]
+    {
+        let _ = (p, page);
+        LocalError::new("PLUGIN_UNSUPPORTED").into_response()
     }
-    apply_plugin_headers(&mut req, &handle.token, access_label(&access, peer.as_ref()), readonly);
-    let opts = proxy::Opts {
-        auth: None,
-        host: Some("localhost".into()),
-        inject: None,
-        rewrite_location: None,
-        terminal: false,
-        on_input: None,
-        keep: Some(Box::new(handle.guard)),
-    };
-    proxy::forward_unix(req, &handle.socket, opts).await
 }
 
-/// `/p/{name}/` 与 `/p/{name}/{*rest}` → 插件（页面、静态资源、画面 WebSocket）。
-pub async fn page_proxy(State(app): State<App>, mut req: Request) -> Response {
-    let access = req.extensions().get::<Access>().cloned().unwrap_or(Access::Local);
-    let peer = req.extensions().get::<Peer>().copied();
-    let readonly = req.extensions().get::<ReadOnly>().is_some_and(|r| r.0);
-    let ws = proxy::is_websocket(req.headers());
-    if (ws || !matches!(*req.method(), Method::GET | Method::HEAD)) && req.headers().contains_key(header::ORIGIN) && !origin_matches(req.headers(), &access) {
-        return (StatusCode::FORBIDDEN, "origin").into_response();
-    }
-    let Some(name) = proto::plugin_of_path(req.uri().path()).map(str::to_owned) else {
-        return assets::message_page(StatusCode::NOT_FOUND, "not_running");
+/// 插件起不来、没装、没授权时页面上显示的：管理台的提示页（iframe 里看得到原因）
+fn plugin_error_page(e: &LocalError) -> Response {
+    let kind = match e.code.as_ref() {
+        "PLUGIN_NOT_INSTALLED" | "PLUGIN_NOT_FOUND" => "plugin_missing",
+        _ => "plugin_failed",
     };
-    let handle = match app.plugins.ensure_running(&name).await {
-        Ok(h) => h,
-        Err(_) => return assets::message_page(StatusCode::NOT_FOUND, "not_running"),
-    };
-    if !check_readonly(handle.manifest.readonly_policy, readonly, req.method(), ws) {
-        return (StatusCode::FORBIDDEN, "readonly").into_response();
-    }
-    let inject = (req.method() == Method::GET && handle.manifest.wants_web_inject(req.uri().path())).then_some(proxy::WEB_TAGS);
-    apply_plugin_headers(&mut req, &handle.token, access_label(&access, peer.as_ref()), readonly);
-    if req.headers().contains_key(header::ORIGIN) {
-        req.headers_mut().insert(header::ORIGIN, HeaderValue::from_static("http://localhost"));
-    }
-    let opts = proxy::Opts {
-        auth: None,
-        host: Some("localhost".into()),
-        inject,
-        rewrite_location: Some((vec!["http://localhost".into()], String::new())),
-        terminal: false,
-        on_input: None,
-        keep: Some(Box::new(handle.guard)),
-    };
-    proxy::forward_unix(req, &handle.socket, opts).await
+    tracing::debug!(error = ?e, "插件页面打不开");
+    assets::message_page(StatusCode::SERVICE_UNAVAILABLE, kind)
 }
 
-// ---------------------------------------------------------------- 宿主白名单接口（/_host/*）
-
-fn auth_plugin(app: &App, peer: Option<Extension<Peer>>, headers: &HeaderMap) -> R<String> {
-    if peer.is_some_and(|p| p.0 != Peer::Local) {
+/// 宿主接口：口令对、从这台电脑来
+fn host_check(app: &App, req: &Request) -> R<()> {
+    let local = req.extensions().get::<access::Peer>() == Some(&access::Peer::Local) || req.extensions().get::<access::Peer>().is_none();
+    let token = req.headers().get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer ")).unwrap_or("");
+    if !local || !app.plugins.host_token_ok(token) {
         return Err(LocalError::new("FORBIDDEN"));
     }
-    let tok = headers.get(proto::HDR_TOKEN).and_then(|v| v.to_str().ok()).unwrap_or("");
-    app.plugins.verify_host_token(tok).ok_or_else(|| LocalError::new("UNAUTHENTICATED"))
+    Ok(())
 }
 
-async fn host_info(State(app): State<App>, peer: Option<Extension<Peer>>, headers: HeaderMap) -> R<Json<HostInfo>> {
-    let _plugin = auth_plugin(&app, peer, &headers)?;
-    let session = app.account.session();
-    Ok(Json(HostInfo {
-        protocol: proto::PROTOCOL_VERSION,
-        client_version: VERSION.to_string(),
-        target: paths::target().to_string(),
-        logged_in: session.is_some(),
-        device: session.as_ref().map(|s| s.device_id.clone()),
-        server: session.as_ref().map(|_| app.account.server_url()),
-        server_time_ms: app.account.now_ms(),
-    }))
+async fn host_info(State(app): State<App>, req: Request) -> R<Json<Value>> {
+    host_check(&app, &req)?;
+    Ok(Json(app.plugins.info()))
 }
 
-async fn host_notify(State(app): State<App>, peer: Option<Extension<Peer>>, headers: HeaderMap, Json(req): Json<HostNotify>) -> R<StatusCode> {
-    let plugin = auth_plugin(&app, peer, &headers)?;
-    tracing::info!(plugin = %plugin, title = %req.title, body = %req.body, path = ?req.path, "插件通知");
-    Ok(StatusCode::NO_CONTENT)
-}
-
-async fn host_license(State(app): State<App>, peer: Option<Extension<Peer>>, headers: HeaderMap, Json(req): Json<LicenseRequest>) -> R<Json<proto::SignedLicense>> {
-    let plugin = auth_plugin(&app, peer, &headers)?;
-    if req.machine.trim().is_empty() || req.machine.len() > 128 {
-        return Err(LocalError::invalid("machine", "invalid"));
+/// 代插件申请凭证：`{ plugin, machine, version }`
+async fn host_license(State(app): State<App>, req: Request) -> R<Json<proto::LicenseResponse>> {
+    host_check(&app, &req)?;
+    let bytes = axum::body::to_bytes(req.into_body(), 64 * 1024).await.map_err(|_| LocalError::invalid("body", "too_large"))?;
+    let v: Value = serde_json::from_slice(&bytes).map_err(|_| LocalError::invalid("body", "json"))?;
+    let name = v["plugin"].as_str().filter(|n| proto::valid_name(n)).ok_or_else(|| LocalError::invalid("plugin", "invalid"))?;
+    // 只给正在跑的插件签（看看起的进程才拿得到口令）
+    if !app.plugins.running_names().await.iter().any(|n| n == name) {
+        return Err(LocalError::new("FORBIDDEN"));
     }
-    let lic = app.account.plugin_license(&plugin, &req).await?;
-    Ok(Json(lic))
+    let req = proto::LicenseRequest { machine: v["machine"].as_str().unwrap_or("").to_string(), version: v["version"].as_str().unwrap_or("").chars().take(40).collect() };
+    Ok(Json(app.plugins.license(name, &req).await?))
 }
 
-async fn host_data(State(app): State<App>, peer: Option<Extension<Peer>>, headers: HeaderMap) -> R<Json<proto::PluginData>> {
-    let plugin = auth_plugin(&app, peer, &headers)?;
-    let data = app.account.plugin_data(&plugin).await?;
-    Ok(Json(data))
+#[cfg(unix)]
+mod unix {
+    use super::*;
+    use axum::http::{HeaderMap, HeaderName, Version};
+    use http_body_util::BodyExt;
+    use hyper_util::rt::TokioIo;
+    use std::time::Duration;
+
+    const HOP: &[&str] = &["connection", "keep-alive", "te", "trailer", "transfer-encoding", "upgrade", "proxy-connection", "proxy-authenticate", "proxy-authorization"];
+
+    fn strip(h: &mut HeaderMap) {
+        let listed: Vec<HeaderName> = h
+            .get_all(header::CONNECTION)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .flat_map(|v| v.split(','))
+            .filter_map(|n| HeaderName::from_bytes(n.trim().as_bytes()).ok())
+            .collect();
+        for n in listed {
+            h.remove(n);
+        }
+        for n in HOP {
+            h.remove(*n);
+        }
+    }
+
+    pub async fn forward(mut req: Request, socket: &std::path::Path, token: &str, local: bool, page: bool) -> Response {
+        let ws = proxy::is_websocket(req.headers());
+        let client_upgrade = ws.then(|| hyper::upgrade::on(&mut req));
+        let (mut parts, body) = req.into_parts();
+        parts.version = Version::HTTP_11;
+        let h = &mut parts.headers;
+        strip(h);
+        // 看看自己的登录 Cookie、认证头不给插件
+        h.remove(header::COOKIE);
+        h.remove(header::AUTHORIZATION);
+        h.remove(proto::HDR_TOKEN);
+        h.remove(proto::HDR_LOCAL);
+        if let Ok(v) = HeaderValue::from_str(token) {
+            h.insert(proto::HDR_TOKEN, v);
+        }
+        h.insert(proto::HDR_LOCAL, HeaderValue::from_static(if local { "1" } else { "0" }));
+        h.insert(header::HOST, HeaderValue::from_static("plugin"));
+        if ws {
+            h.insert(header::CONNECTION, HeaderValue::from_static("upgrade"));
+            h.insert(header::UPGRADE, HeaderValue::from_static("websocket"));
+        }
+        if page {
+            // 要往页面里注入脚本：请插件返回不压缩的
+            h.remove(header::ACCEPT_ENCODING);
+        }
+        let stream = match tokio::net::UnixStream::connect(socket).await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::debug!(error = %e, "连不上插件");
+                return assets::message_page(StatusCode::BAD_GATEWAY, "upstream_down");
+            }
+        };
+        let (mut sender, conn) = match hyper::client::conn::http1::handshake::<_, Body>(TokioIo::new(stream)).await {
+            Ok(x) => x,
+            Err(_) => return assets::message_page(StatusCode::BAD_GATEWAY, "upstream_down"),
+        };
+        tokio::spawn(async move {
+            let _ = conn.with_upgrades().await;
+        });
+        let body = if ws { Body::empty() } else { body };
+        let fut = sender.send_request(Request::from_parts(parts, body));
+        // 接口可以慢（装浏览器内核这类），只限制等响应头的时间
+        let mut resp = match tokio::time::timeout(Duration::from_secs(120), fut).await {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => {
+                tracing::debug!(error = %e, "插件没有响应");
+                return assets::message_page(StatusCode::BAD_GATEWAY, "upstream_down");
+            }
+            Err(_) => return assets::message_page(StatusCode::GATEWAY_TIMEOUT, "upstream_down"),
+        };
+        if ws && resp.status() == StatusCode::SWITCHING_PROTOCOLS {
+            let server_upgrade = hyper::upgrade::on(&mut resp);
+            let client_upgrade = client_upgrade.expect("websocket");
+            tokio::spawn(async move {
+                if let Ok((c, s)) = tokio::try_join!(client_upgrade, server_upgrade) {
+                    let _ = tokio::io::copy_bidirectional(&mut TokioIo::new(c), &mut TokioIo::new(s)).await;
+                }
+            });
+            let (parts, _) = resp.into_parts();
+            return Response::from_parts(parts, Body::empty());
+        }
+        let (mut parts, body) = resp.into_parts();
+        strip(&mut parts.headers);
+        // 插件不能给看看的域名设 Cookie
+        parts.headers.remove(header::SET_COOKIE);
+        let html = parts.headers.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).is_some_and(|v| v.starts_with("text/html"));
+        if page && html && parts.status == StatusCode::OK && parts.headers.get(header::CONTENT_ENCODING).is_none() {
+            let bytes = match tokio::time::timeout(Duration::from_secs(30), body.collect()).await {
+                Ok(Ok(b)) => b.to_bytes(),
+                _ => return assets::message_page(StatusCode::BAD_GATEWAY, "upstream_down"),
+            };
+            let html = proxy::inject(&String::from_utf8_lossy(&bytes), proxy::WEB_TAGS);
+            parts.headers.remove(header::CONTENT_LENGTH);
+            parts.headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+            return Response::from_parts(parts, Body::from(html));
+        }
+        Response::from_parts(parts, Body::new(body.map_err(axum::Error::new)))
+    }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    #[test]
-    fn readonly_policy_enforced() {
-        let q1: ListQuery = serde_urlencoded::from_str("catalog=1").unwrap();
-        let q2: ListQuery = serde_urlencoded::from_str("catalog=true").unwrap();
-        let q0: ListQuery = serde_urlencoded::from_str("catalog=0").unwrap();
-        assert!(q1.catalog && q2.catalog && !q0.catalog);
-        assert!(check_readonly(ReadonlyPolicy::Deny, false, &Method::POST, false));
-        assert!(!check_readonly(ReadonlyPolicy::Deny, true, &Method::GET, false));
-        assert!(check_readonly(ReadonlyPolicy::ReadMethods, true, &Method::GET, false));
-        assert!(check_readonly(ReadonlyPolicy::ReadMethods, true, &Method::HEAD, false));
-        assert!(!check_readonly(ReadonlyPolicy::ReadMethods, true, &Method::POST, false));
-        assert!(!check_readonly(ReadonlyPolicy::ReadMethods, true, &Method::GET, true));
-        assert!(check_readonly(ReadonlyPolicy::Plugin, true, &Method::POST, true));
-    }
-
-    #[test]
-    fn strips_sensitive_headers_and_sets_plugin_headers() {
-        let mut req = Request::builder()
-            .uri("/api/plugins/demo/ping")
-            .header(header::COOKIE, "ll_access=secret")
-            .header(header::AUTHORIZATION, "Bearer secret")
-            .header(proto::HDR_TOKEN, "forged")
-            .header(proto::HDR_READONLY, "0")
-            .header(header::ACCEPT_LANGUAGE, "zh-CN,zh;q=0.9")
-            .body(axum::body::Body::empty())
-            .unwrap();
-        apply_plugin_headers(&mut req, "real-token", proto::Access::Rtc, true);
-        let h = req.headers();
-        assert!(h.get(header::COOKIE).is_none());
-        assert!(h.get(header::AUTHORIZATION).is_none());
-        assert_eq!(h.get(proto::HDR_TOKEN).unwrap(), "real-token");
-        assert_eq!(h.get(proto::HDR_ACCESS).unwrap(), "rtc");
-        assert_eq!(h.get(proto::HDR_READONLY).unwrap(), "1");
-        assert_eq!(h.get(proto::HDR_LOCALE).unwrap(), "zh-CN");
-    }
-
-    #[cfg(unix)]
+    /// 假插件：读一个请求，把收到的头原样写回去（HTML），确认口令、Cookie、注入都对
     #[tokio::test]
-    async fn unix_proxy_forwards_and_injects_web_tags() {
-        use axum::routing::get;
-        use http_body_util::BodyExt;
-        use hyper::service::service_fn;
-        use hyper_util::rt::TokioIo;
-        use tower::ServiceExt;
-
-        let tmp = tempfile::tempdir().unwrap();
-        let sock = tmp.path().join("p.sock");
-        let listener = tokio::net::UnixListener::bind(&sock).unwrap();
-        let upstream = axum::Router::new().route(
-            "/p/demo/view/",
-            get(|headers: HeaderMap| async move {
-                let tok = headers.get(proto::HDR_TOKEN).and_then(|v| v.to_str().ok()).unwrap_or("");
-                (
-                    [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
-                    format!("<html><head></head><body>tok={tok}</body></html>"),
-                )
-            }),
-        );
-        let srv = tokio::spawn(async move {
-            if let Ok((stream, _)) = listener.accept().await {
-                let svc = service_fn(move |req| upstream.clone().oneshot(req));
-                let _ = hyper::server::conn::http1::Builder::new().serve_connection(TokioIo::new(stream), svc).await;
-            }
+    async fn forwards_over_unix_socket() {
+        let d = tempfile::tempdir().unwrap();
+        let sock = d.path().join("p.sock");
+        let l = tokio::net::UnixListener::bind(&sock).unwrap();
+        tokio::spawn(async move {
+            let (mut s, _) = l.accept().await.unwrap();
+            let mut buf = vec![0u8; 8192];
+            let n = s.read(&mut buf).await.unwrap();
+            let head = String::from_utf8_lossy(&buf[..n]).to_lowercase().replace("\r\n", "|");
+            let body = format!("<html><head></head><body>{head}</body></html>");
+            let resp = format!("HTTP/1.1 200 OK\r\ncontent-type: text/html\r\nset-cookie: x=1\r\ncontent-length: {}\r\n\r\n{body}", body.len());
+            s.write_all(resp.as_bytes()).await.unwrap();
         });
-
-        let mut req = Request::builder().uri("/p/demo/view/").body(axum::body::Body::empty()).unwrap();
-        apply_plugin_headers(&mut req, "tok123", proto::Access::Local, false);
-        let opts = proxy::Opts {
-            auth: None,
-            host: Some("localhost".into()),
-            inject: Some(proxy::WEB_TAGS),
-            rewrite_location: None,
-            terminal: false,
-            on_input: None,
-            keep: None,
-        };
-        let resp = proxy::forward_unix(req, &sock, opts).await;
+        let req = Request::builder().uri("/p/demo/?a=1").header("cookie", "ll_access=secret").header("authorization", "Basic x").header(proto::HDR_TOKEN, "forged").body(Body::empty()).unwrap();
+        let resp = unix::forward(req, &sock, "tok123", false, true).await;
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = resp.into_body().collect().await.unwrap().to_bytes();
-        let html = String::from_utf8_lossy(&body);
-        assert!(html.contains("tok=tok123"), "{html}");
-        assert!(html.contains(proxy::WEB_TAGS), "{html}");
-        srv.abort();
+        assert!(resp.headers().get(header::SET_COOKIE).is_none(), "插件不能设 Cookie");
+        let text = String::from_utf8(axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap().to_vec()).unwrap();
+        assert!(text.contains("x-ll-plugin-token: tok123"), "{text}");
+        assert!(!text.contains("forged") && !text.contains("secret") && !text.contains("basic x"), "{text}");
+        assert!(text.contains("x-ll-local: 0"));
+        assert!(text.contains("get /p/demo/?a=1 http/1.1"), "路径原样转过去：{text}");
+        assert!(text.contains(proxy::WEB_TAGS), "页面里注入了 web.js");
+    }
+
+    #[tokio::test]
+    async fn plugin_not_listening() {
+        let d = tempfile::tempdir().unwrap();
+        let req = Request::builder().uri("/api/plugins/demo/x").body(Body::empty()).unwrap();
+        let resp = unix::forward(req, &d.path().join("none.sock"), "t", true, false).await;
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
     }
 }

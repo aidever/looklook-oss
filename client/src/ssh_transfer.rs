@@ -1103,6 +1103,7 @@ pub(crate) mod e2e {
         // 要真的打开终端的测试用 LOOKLOOK_TEST_TTYD 给出 ttyd
         let ttyd = std::env::var_os("LOOKLOOK_TEST_TTYD").map(std::path::PathBuf::from);
         let paths = Paths { home: home.into(), ttyd, mux: None, fonts: None, trzsz: None };
+        let plugin_paths = paths.clone();
         let account = test_support::logged_in(store.clone(), paths.clone(), server, dev, key);
         let instances = crate::instances::Instances::new(store.clone(), paths.clone());
         Arc::new(Inner {
@@ -1128,7 +1129,7 @@ pub(crate) mod e2e {
             ssh_transfer: Default::default(),
             sync: Default::default(),
             notify: Default::default(),
-            plugins: crate::plugins::Plugins::new(home.to_path_buf(), Default::default()),
+            plugins: crate::plugins::Plugins::new(plugin_paths, account.clone(), ""),
         })
     }
 

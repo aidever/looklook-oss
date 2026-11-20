@@ -107,7 +107,7 @@ pub async fn forward(client: &HttpClient, mut req: Request, port: u16, opts: Opt
     }
     let body = if ws { Body::empty() } else { body };
     let fut = client.request(Request::from_parts(parts, body));
-    let resp = match tokio::time::timeout(Duration::from_secs(60), fut).await {
+    let mut resp = match tokio::time::timeout(Duration::from_secs(60), fut).await {
         Ok(Ok(r)) => r,
         Ok(Err(e)) => {
             tracing::debug!(error = %e, port, "上游连接失败");
@@ -115,82 +115,7 @@ pub async fn forward(client: &HttpClient, mut req: Request, port: u16, opts: Opt
         }
         Err(_) => return assets::message_page(StatusCode::GATEWAY_TIMEOUT, "upstream_down"),
     };
-    finish_response(resp, ws, client_upgrade, opts).await
-}
 
-/// 经 Unix socket 转发到插件进程（HTTP 流式 + WebSocket 升级 + 可选 HTML 注入）。
-#[cfg(unix)]
-pub async fn forward_unix(mut req: Request, socket: &std::path::Path, opts: Opts) -> Response {
-    let ws = is_websocket(req.headers());
-    let client_upgrade = ws.then(|| hyper::upgrade::on(&mut req));
-    let (mut parts, body) = req.into_parts();
-    let pq = parts.uri.path_and_query().map(|p| p.as_str().to_string()).unwrap_or_else(|| "/".into());
-    parts.uri = match pq.parse() {
-        Ok(u) => u,
-        Err(_) => return StatusCode::BAD_REQUEST.into_response(),
-    };
-    parts.version = Version::HTTP_11;
-    let h = &mut parts.headers;
-    strip_hop_by_hop(h);
-    h.remove(header::COOKIE);
-    h.remove(header::AUTHORIZATION);
-    if ws {
-        h.insert(header::CONNECTION, HeaderValue::from_static("upgrade"));
-        h.insert(header::UPGRADE, HeaderValue::from_static("websocket"));
-    }
-    if let Some(host) = &opts.host {
-        if let Ok(v) = HeaderValue::from_str(host) {
-            h.insert(header::HOST, v);
-        }
-    } else {
-        h.insert(header::HOST, HeaderValue::from_static("localhost"));
-    }
-    if opts.inject.is_some() {
-        h.remove(header::ACCEPT_ENCODING);
-    }
-    let body = if ws { Body::empty() } else { body };
-    let stream = match tokio::time::timeout(Duration::from_secs(5), tokio::net::UnixStream::connect(socket)).await {
-        Ok(Ok(s)) => s,
-        Ok(Err(e)) => {
-            tracing::debug!(error = %e, socket = %socket.display(), "插件 socket 连接失败");
-            return assets::message_page(StatusCode::BAD_GATEWAY, "upstream_down");
-        }
-        Err(_) => return assets::message_page(StatusCode::GATEWAY_TIMEOUT, "upstream_down"),
-    };
-    let (mut sender, conn) = match hyper::client::conn::http1::handshake(TokioIo::new(stream)).await {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::debug!(error = %e, "插件 HTTP 握手失败");
-            return assets::message_page(StatusCode::BAD_GATEWAY, "upstream_down");
-        }
-    };
-    tokio::spawn(async move {
-        if let Err(e) = conn.with_upgrades().await {
-            tracing::debug!(error = %e, "插件上游连接结束");
-        }
-    });
-    let resp = match tokio::time::timeout(Duration::from_secs(60), sender.send_request(Request::from_parts(parts, body))).await {
-        Ok(Ok(r)) => r,
-        Ok(Err(e)) => {
-            tracing::debug!(error = %e, "插件请求失败");
-            return assets::message_page(StatusCode::BAD_GATEWAY, "upstream_down");
-        }
-        Err(_) => return assets::message_page(StatusCode::GATEWAY_TIMEOUT, "upstream_down"),
-    };
-    finish_response(resp, ws, client_upgrade, opts).await
-}
-
-#[cfg(not(unix))]
-pub async fn forward_unix(_req: Request, _socket: &std::path::Path, _opts: Opts) -> Response {
-    assets::message_page(StatusCode::NOT_IMPLEMENTED, "upstream_down")
-}
-
-async fn finish_response(
-    mut resp: hyper::Response<hyper::body::Incoming>,
-    ws: bool,
-    client_upgrade: Option<hyper::upgrade::OnUpgrade>,
-    opts: Opts,
-) -> Response {
     if ws && resp.status() == StatusCode::SWITCHING_PROTOCOLS {
         // 谈好了 permessage-deflate：浏览器发来的消息是压缩的，看输入要先解压（见 input_tap.rs）
         let ext = resp.headers().get(header::SEC_WEBSOCKET_EXTENSIONS).and_then(|v| v.to_str().ok()).unwrap_or("").to_ascii_lowercase();

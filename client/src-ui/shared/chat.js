@@ -297,7 +297,7 @@ export const CODEX_PASS = ['/logout'];
 
 /** DSH（走 dsh web）认的：/clear、/new 开新会话，/model 是界面的模型菜单；别的斜杠命令交给 DSH 自己执行 */
 export const DSH_COMMANDS = ['/clear', '/new', '/model', '/share', '/export'];
-/** Antigravity (agy acp) 认的内置命令；其余（/compact、/plan、技能…）从 ACP 的 available_commands_update 来 */
+/** Antigravity（agy acp）：看看自己处理的命令（别的斜杠命令照常送给 agy，菜单里列的是 agy 报的命令和技能） */
 export const AGY_COMMANDS = ['/clear', '/new', '/model', '/share', '/export'];
 
 /** stream-json 的 Claude Code 里用不了的（`claude -p` 回“isn't available in this environment”）：不列。
@@ -570,7 +570,6 @@ export function effortsFor(agent, option) {
   if (option?.section === 'provider') return [];
   if (/haiku/i.test(option?.model || option?.value || '')) return [];
   if (agent === 'codex') return CODEX_EFFORTS;
-  if (agent === 'agy') return CODEX_EFFORTS;
   if (agent === 'claude') return EFFORTS;
   return [];
 }
@@ -589,7 +588,7 @@ export function effortShown(status, option, setting = null) {
 export const MODE_CHOICES = ['default', 'acceptEdits', 'plan', 'auto', 'bypassPermissions'];
 /** Codex 的权限（和 TUI 的 `/permissions` 一样三档），Shift+Tab 在这三个里轮换 */
 export const CODEX_MODE_CHOICES = ['readOnly', 'workspaceWrite', 'fullAccess'];
-// 助理派出去的 Codex 会话用的两档（codex_chat.rs 的 ASK_COMMANDS、FULL_GUARDED）：只显示，不在菜单里
+// 助理派出去的 Codex 会话用的两档（codex_chat.rs 的 ASK_COMMANDS、FULL_GUARDED）：在菜单里列在三档后面，Shift+Tab 不轮换到
 export const CODEX_DISPATCH_MODES = ['askCommands', 'fullGuarded'];
 
 /** 光标前面正在打的 `@…`：{ start, q }，start 是 `@` 的位置；不在打就是 null。`@` 要在开头或空白后面（邮箱里的 @ 不算） */

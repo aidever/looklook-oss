@@ -831,6 +831,23 @@ impl Account {
         r
     }
 
+    // ---------------- 插件（src/plugins.rs） ----------------
+
+    /// 这个平台能装的插件和这个账号的授权
+    pub async fn plugin_catalog(&self, platform: &str) -> PResult<looklook_protocol::plugin::Catalog> {
+        self.signed("GET", &format!("/plugins?platform={platform}"), None::<&()>).await
+    }
+
+    /// 签过名的 `release.json` 和下载地址（服务端查授权）
+    pub async fn plugin_release(&self, name: &str, platform: &str) -> PResult<Value> {
+        self.signed("GET", &format!("/plugins/{name}/release?platform={platform}"), None::<&()>).await
+    }
+
+    /// 代插件申请授权凭证
+    pub async fn plugin_license(&self, name: &str, req: &looklook_protocol::plugin::LicenseRequest) -> PResult<looklook_protocol::plugin::LicenseResponse> {
+        self.signed("POST", &format!("/plugins/{name}/license"), Some(req)).await
+    }
+
     pub async fn account(&self) -> PResult<AccountSummary> {
         let a: AccountSummary = self.signed("GET", "/account", None::<&()>).await?;
         self.update_session(|s| {
@@ -982,40 +999,6 @@ impl Account {
             self.on_error(e);
         }
         r
-    }
-
-    pub fn now_ms(&self) -> i64 {
-        self.clock.now_ms()
-    }
-
-    pub fn server_url(&self) -> String {
-        self.platform().base.clone()
-    }
-
-    /// 插件目录：已登录走设备签名接口（带独立授权情况），未登录走公开目录接口。
-    pub async fn plugin_catalog(&self, target: &str) -> PResult<looklook_protocol::plugin::PluginCatalog> {
-        let q = format!("?target={}", path_seg(target));
-        if self.session().is_some() {
-            self.signed("GET", &format!("{}{q}", looklook_protocol::plugin::CLIENT_CATALOG_PATH), None::<&()>).await
-        } else {
-            self.platform().public(&format!("{}{q}", looklook_protocol::plugin::CLIENT_CATALOG_PUBLIC_PATH)).await
-        }
-    }
-
-    /// 请求插件安装包下载票据（需登录且账号持有该插件授权）。
-    pub async fn plugin_download(&self, name: &str, target: &str) -> PResult<looklook_protocol::plugin::DownloadTicket> {
-        let body = looklook_protocol::plugin::DownloadRequest { target: target.to_string() };
-        self.signed("POST", &looklook_protocol::plugin::client_download_path(&path_seg(name)), Some(&body)).await
-    }
-
-    /// 代插件向平台申请或续期短期签名授权凭证（设备签名，不向插件暴露 device.key）。
-    pub async fn plugin_license(&self, name: &str, req: &looklook_protocol::plugin::LicenseRequest) -> PResult<looklook_protocol::plugin::SignedLicense> {
-        self.signed("POST", &looklook_protocol::plugin::client_license_path(&path_seg(name)), Some(req)).await
-    }
-
-    /// 代插件拉取平台按凭证加密下发的数据（如设备池、内核适配模板）。
-    pub async fn plugin_data(&self, name: &str) -> PResult<looklook_protocol::plugin::PluginData> {
-        self.signed("GET", &looklook_protocol::plugin::client_data_path(&path_seg(name)), None::<&()>).await
     }
 }
 

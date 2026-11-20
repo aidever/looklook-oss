@@ -54,9 +54,18 @@ struct Queued {
     engine: String,
     /// 整理好的第一句话
     first: String,
-    /// 新会话的权限（[`dispatch_level`] 定好的；旧版存的助理档 `auto` 读成全权）
+    /// 新会话的权限（[`dispatch_level`] 定好的；旧版存的助理档 `auto` 读成全权）。`asked` 为 None（大脑没指定）时开的时候
+    /// 按那时的设置重新算，用户在这期间改了默认权限也用新的
     #[serde(default)]
     perm: Option<core::Level>,
+    /// 大脑按用户的话指定的那一档（没指定 None）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    asked: Option<core::Level>,
+    #[serde(default)]
+    attended: bool,
+    /// 用户指定的模型（没指定 None：开的时候用设置里的默认）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
     /// 用户在飞书哪里交代的（见 `Watch::feishu`）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     feishu: Option<core::FeishuLink>,
@@ -308,6 +317,8 @@ fn session_view(app: &App, row: &crate::store::InstanceRow, watched: bool) -> Va
         "errand": core::is_errand(&app.store, &row.id),
         // 助理开这个会话时给的那一档（送话进去的别的会话没有）
         "level": core::watches(&app.store).get(&row.id).and_then(|w| w.level).map(core::Level::id),
+        // 现在实际的权限模式（用户可能在对话页设置栏里换过）：活动面板上的权限菜单显示它、能换成这种引擎的任何一种
+        "mode": app.chat.mode(&row.id),
         // 在等用户的那件事（审批、提问……）：助理页直接显示、就地批（和任务看板同一份）
         "attn": if state == "waiting_for_user" { b["attn"].clone() } else { Value::Null },
         "since": b["since"],
@@ -455,29 +466,51 @@ fn facts_text(commits: &str, status: &str) -> String {
     s
 }
 
-/// 派出去的会话用哪一档（docs/ASSISTANT.md「派出去的会话的权限」）。`asked`：大脑按这件活填的（只看 / 动手前问 / 项目内放手 / 全权），
-/// 没填 = 项目内放手。`attended`：用户这一轮在（不是事件叫醒的）；没人在的时候最多项目内放手。
-/// 返回（用的那一档，大脑要的但没给上的那一档）：
-/// - 不超过用户设的上限：照给；
+/// 派出去的会话用什么权限（docs/ASSISTANT.md「派出去的会话的权限」）
+#[derive(Debug, Clone, PartialEq)]
+struct Pick {
+    /// 这种引擎的权限模式（[`core::engine_modes`] 之一）
+    mode: String,
+    level: core::Level,
+    /// 大脑要的但没给上的那一档
+    capped: Option<core::Level>,
+}
+
+/// 派出去的会话用哪一档。`asked`：大脑按这件活填的（只看 / 动手前问 / 项目内放手 / 全权）；
+/// 没填 = 用户在设置里给这种引擎设的默认权限（原样用，哪种模式都行，是用户自己设的），没设 = 项目内放手。
+/// `attended`：用户这一轮在（不是事件叫醒的）；没人在的时候大脑要的最多项目内放手（用户设的默认照用）。
+/// - 不超过用户设的上限（默认权限比上限高时上限跟着到默认那一档）：照给；
 /// - 超过上限：Claude 大脑在闸门那里已经问过用户、用户点了头，照给；Codex 大脑的助理工具不经过闸门、没人在时没人能点头，按上限开，
 ///   用户可以在活动面板上点那一档自己调高
-fn dispatch_level(settings: &core::Settings, asked: Option<core::Level>, attended: bool) -> (core::Level, Option<core::Level>) {
+fn dispatch_level(settings: &core::Settings, engine: &str, asked: Option<core::Level>, attended: bool) -> Pick {
+    let def = core::default_level(settings, engine);
+    let level = |l: core::Level| Pick { mode: core::native_mode(engine, l).to_string(), level: l, capped: None };
+    let Some(want) = asked else {
+        return match (settings.defaults(engine).mode.clone(), def) {
+            (Some(mode), Some(level)) => Pick { mode, level, capped: None },
+            _ => level(core::Level::Project),
+        };
+    };
     let mut cap = core::ceiling(settings);
     if !attended {
         cap = cap.min(core::Level::Project);
     }
-    let want = asked.unwrap_or(core::Level::Project);
-    if want.rank() <= cap.rank() {
-        return (want, None);
+    if let Some(d) = def {
+        cap = cap.max(d);
     }
-    if attended && settings.engine == core::Engine::Claude && asked.is_some() {
-        return (want, None);
+    if want.rank() <= cap.rank() || (attended && settings.engine == core::Engine::Claude) {
+        return level(want);
     }
-    (cap, Some(want))
+    Pick { capped: Some(want), ..level(cap) }
 }
 
-/// 真的开一个会话，把第一句话交给它，权限按 `level`（[`ChatManager::apply_level`]：两种引擎同一个意思）
-async fn open_session(app: &App, project: &str, title: &str, engine: &str, first: &str, level: core::Level) -> R<String> {
+/// 派出去的会话用哪个模型：用户指定的 > 设置里这种引擎的默认 > 不传（工具自己的配置）
+fn dispatch_model(settings: &core::Settings, engine: &str, asked: Option<&str>) -> Option<String> {
+    asked.map(String::from).or_else(|| settings.defaults(engine).model.clone()).filter(|m| core::model_ok(m))
+}
+
+/// 真的开一个会话，把第一句话交给它，权限按 `pick`（[`ChatManager::apply_mode`]），模型按 `model`
+async fn open_session(app: &App, project: &str, title: &str, engine: &str, first: &str, pick: &Pick, model: Option<&str>) -> R<String> {
     let input = Input {
         name: Some(title.chars().take(40).collect()).filter(|t: &String| !t.trim().is_empty()),
         // 用助理起的标题（第一句话是交代，拿它当标题没法看）
@@ -485,8 +518,8 @@ async fn open_session(app: &App, project: &str, title: &str, engine: &str, first
         workdir: Some(project.to_string()),
         launch: Some(engine.to_string()),
         chat_ui: Some(true),
-        full_access: Some(level == core::Level::Full),
-        // 第一句话等登记好再送：起进程时要带上找助理的工具（assistant_note）；权限也要先换好
+        full_access: Some(pick.mode == "bypassPermissions" || pick.mode == "fullAccess"),
+        // 第一句话等登记好再送：起进程时要带上找助理的工具（assistant_note）；权限、模型也要先换好
         prompt: None,
         ..Default::default()
     };
@@ -494,8 +527,13 @@ async fn open_session(app: &App, project: &str, title: &str, engine: &str, first
     if let Err(e) = core::add_worker(&app.paths, &app.store, &v.row.id, app.ui_addr) {
         tracing::warn!(error = %e, "助理：没能给新会话写好找助理的工具");
     }
-    if let Err(e) = app.chat.apply_level(&v.row.id, level).await {
-        tracing::warn!(error = ?e, id = %v.row.id, level = level.id(), "助理：新会话没能换权限");
+    if let Err(e) = app.chat.apply_mode(&v.row.id, &pick.mode).await {
+        tracing::warn!(error = ?e, id = %v.row.id, mode = %pick.mode, "助理：新会话没能换权限");
+    }
+    if let Some(m) = model {
+        if let Err(e) = app.chat.apply_model(&v.row.id, m).await {
+            tracing::warn!(error = ?e, id = %v.row.id, model = m, "助理：新会话没能换模型");
+        }
     }
     app.chat.input(&v.row.id, first, &[]).await?;
     Ok(v.row.id)
@@ -526,15 +564,32 @@ async fn session_start(app: &App, a: &Value) -> Result<Value, String> {
         "" => None,
         p => Some(core::Level::parse(p).ok_or_else(|| format!("unknown permission {p}; use read_only, ask, project or full"))?),
     };
+    let asked_model = match s("model").as_str() {
+        "" => None,
+        m if core::model_ok(m) => Some(m.to_string()),
+        m => return Err(format!("invalid model {m}; use the model id the user named, e.g. opus, sonnet, gpt-5.1-codex")),
+    };
     let settings = core::settings(&app.store);
-    let (perm, capped) = dispatch_level(&settings, asked, attended);
+    let pick = dispatch_level(&settings, &engine, asked, attended);
     let from = origin(app);
     let mut d = new_dispatch("start", "", &project, &title, &engine, &reason, &said, &brief);
     if let (Some(after), false) = (&busy, now) {
         // 默认排队：同一个项目里并行，没进 git 的文件、依赖、端口都会撞
         let first = core::compose_brief(Some(&said), &brief, false);
         d.queued_after = Some(after.clone());
-        let item = Queued { dispatch: d.id.clone(), after: after.clone(), project: project.clone(), title: title.clone(), engine: engine.clone(), first, perm: Some(perm), feishu: from.clone().flatten() };
+        let item = Queued {
+            dispatch: d.id.clone(),
+            after: after.clone(),
+            project: project.clone(),
+            title: title.clone(),
+            engine: engine.clone(),
+            first,
+            perm: Some(pick.level),
+            asked: asked.map(|_| pick.level),
+            attended,
+            model: asked_model,
+            feishu: from.clone().flatten(),
+        };
         queue_update(app, |q| q.push(item));
         core::dispatch_add(&app.paths, d.clone()).map_err(|e| e.to_string())?;
         let after_title = title_by_id(app, after);
@@ -546,17 +601,18 @@ async fn session_start(app: &App, a: &Value) -> Result<Value, String> {
         }));
     }
     let first = core::compose_brief(Some(&said), &brief, busy.is_some());
-    let id = open_session(app, &project, &title, &engine, &first, perm).await.map_err(|e| format!("could not start the session: {} {}", e.code, serde_json::to_string(&e.params).unwrap_or_default()))?;
+    let model = dispatch_model(&settings, &engine, asked_model.as_deref());
+    let id = open_session(app, &project, &title, &engine, &first, &pick, model.as_deref()).await.map_err(|e| format!("could not start the session: {} {}", e.code, serde_json::to_string(&e.params).unwrap_or_default()))?;
     d.session = id.clone();
     core::dispatch_add(&app.paths, d.clone()).map_err(|e| e.to_string())?;
     watch(app, &id, &d.id, from);
-    set_level(app, &id, perm);
+    set_level(app, &id, pick.level);
     crate::assistant_memory::journal(&app.paths, &format!("派活（新会话）[{id}] {title} · {} · {engine} · {}", base_name(&project), journal_said(&said, &reason)));
     let mut note = "Started. You will get an event when it has a result or a question; do not poll.".to_string();
-    if let Some(p) = capped {
-        note.push_str(&format!(" It was started at {} instead of {}: that is above the limit the user set for sessions you start{}. Tell the user in one sentence; they can raise it with one tap on that session in the assistant's Activity panel.", perm.id(), p.id(), if attended { "" } else { " while they are away" }));
+    if let Some(p) = pick.capped {
+        note.push_str(&format!(" It was started at {} instead of {}: that is above the limit the user set for sessions you start{}. Tell the user in one sentence; they can raise it with one tap on that session in the assistant's Activity panel.", pick.level.id(), p.id(), if attended { "" } else { " while they are away" }));
     }
-    Ok(json!({ "session": id, "dispatch": d.id, "project": project, "engine": engine, "permission": perm.id(), "note": note }))
+    Ok(json!({ "session": id, "dispatch": d.id, "project": project, "engine": engine, "permission": pick.level.id(), "mode": pick.mode, "model": model, "note": note }))
 }
 
 /// 派活时附上的用户原话：这一轮用户说的（被事件叫醒的轮次没有），大脑给了 `quote` 就只附它抄出来的那几句
@@ -832,7 +888,8 @@ fn tool_defs() -> Value {
               "engine": { "type": "string", "enum": ENGINES, "description": "Only when the user named one, or the project is known to use one. Default: claude." },
               "now": { "type": "boolean", "description": "Start right away even though another session is working in the same project. Only when the user asked for that." },
               "quote": { "type": "string", "description": "Only when the user's latest message also talks about other things: the sentences of it that are about THIS job, copied word for word (Looklook checks). Empty string = attach none of it. Omit when the whole message is about this job." },
-              "permission": { "type": "string", "enum": ["read_only", "ask", "project", "full"], "description": "How much this session may do without asking, chosen by the job. read_only = only read and investigate (reviews, finding causes, answering questions about the code). ask = edits inside the project go ahead, every command asks the user (the user said \"ask me first\"). project (default when omitted) = edits and commands inside the project go ahead; leaving the project, network, pushing and deploying ask. full = nothing asks; only when the user said so (\"let it do whatever it needs\"). Dangerous commands still ask at full. Above the user's limit needs the user's approval; while the user is away it never goes above project." },
+              "permission": { "type": "string", "enum": ["read_only", "ask", "project", "full"], "description": "How much this session may do without asking. Omit unless the user said something about it for this job or the job is clearly read-only: omitted = the default permission the user set in settings (project when unset). read_only = only read and investigate (reviews, finding causes, answering questions about the code). ask = edits inside the project go ahead, every command asks the user (the user said \"ask me first\"). project = edits and commands inside the project go ahead; leaving the project, network, pushing and deploying ask. full = nothing asks; only when the user said so (\"let it do whatever it needs\"). Dangerous commands still ask at full. Above the user's limit needs the user's approval; while the user is away it never goes above project." },
+              "model": { "type": "string", "description": "Only when the user named a model for this job (\"用 opus\", \"use gpt-5.1-codex\"): the model id or alias as the tool accepts it. Omitted = the default model the user set in settings for this engine, else the tool's own configured default." },
           }), &["project", "title", "reason"]) },
         { "name": "session_send", "description": "Send a follow-up into an EXISTING session: more requirements, a correction, an answer to its question. Use for the same piece of work, or the same area of code while its context is not full.",
           "inputSchema": obj(json!({
@@ -1745,13 +1802,18 @@ async fn start_queued(app: &App) {
             continue;
         }
         opened.push(item.project.clone());
-        // 派活时已经定好（超过上限的那时已经问过用户）
-        let level = item.perm.unwrap_or_default();
-        match open_session(app, &item.project, &item.title, &item.engine, &item.first, level).await {
+        // 大脑指定了的派活时已经定好（超过上限的那时已经问过用户）；没指定的按现在的设置（用户这期间可能改了默认）
+        let settings = core::settings(&app.store);
+        let pick = match item.asked {
+            Some(l) => Pick { mode: core::native_mode(&item.engine, l).to_string(), level: l, capped: None },
+            None => dispatch_level(&settings, &item.engine, None, item.attended),
+        };
+        let model = dispatch_model(&settings, &item.engine, item.model.as_deref());
+        match open_session(app, &item.project, &item.title, &item.engine, &item.first, &pick, model.as_deref()).await {
             Ok(id) => {
                 core::dispatch_update(&app.paths, &item.dispatch, |d| d.session = id.clone());
                 watch(app, &id, &item.dispatch, Some(item.feishu.clone()));
-                set_level(app, &id, level);
+                set_level(app, &id, pick.level);
                 tell_brain(app, event("started", &id, &item.title, &item.project, "", "排着队的这件活现在开了。不用告诉用户，除非他问。")).await;
             }
             Err(e) => {
@@ -1829,6 +1891,17 @@ pub struct SettingsReq {
     /// 派出去的会话最多到哪一档：read_only / ask / project / full
     #[serde(default)]
     ceiling: Option<String>,
+    /// 派出去的会话的默认权限、模型，按引擎：`{"claude": {"mode": "auto", "model": "opus"}}`；空字符串 = 不设（用工具自己的）
+    #[serde(default)]
+    defaults: Option<std::collections::BTreeMap<String, DefaultsReq>>,
+}
+
+#[derive(Deserialize, Default)]
+pub struct DefaultsReq {
+    #[serde(default)]
+    mode: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
 }
 
 fn parse_settings(app: &App, req: &SettingsReq) -> R<core::Settings> {
@@ -1848,6 +1921,24 @@ fn parse_settings(app: &App, req: &SettingsReq) -> R<core::Settings> {
     if let Some(c) = req.ceiling.as_deref() {
         s.ceiling = Some(core::Level::parse(c).ok_or_else(|| LocalError::invalid("ceiling", "invalid"))?);
     }
+    for (engine, d) in req.defaults.iter().flatten() {
+        if !ENGINES.contains(&engine.as_str()) {
+            return Err(LocalError::invalid("engine", "invalid"));
+        }
+        let to = s.defaults_mut(engine);
+        if let Some(m) = d.mode.as_deref().map(str::trim) {
+            if !m.is_empty() && core::level_of(engine, m).is_none() {
+                return Err(LocalError::invalid("mode", "invalid"));
+            }
+            to.mode = Some(m.to_string()).filter(|m| !m.is_empty());
+        }
+        if let Some(m) = d.model.as_deref().map(str::trim) {
+            if !m.is_empty() && !core::model_ok(m) {
+                return Err(LocalError::invalid("model", "invalid"));
+            }
+            to.model = Some(m.to_string()).filter(|m| !m.is_empty());
+        }
+    }
     Ok(s)
 }
 
@@ -1856,7 +1947,7 @@ pub async fn enable(State(app): State<App>, body: Option<Json<SettingsReq>>) -> 
     let req = body.map(|b| b.0).unwrap_or_default();
     let s = parse_settings(&app, &req)?;
     let id = ensure_brain(&app, s.engine).await?;
-    core::save_settings(&app.store, s)?;
+    core::save_settings(&app.store, s.clone())?;
     Ok(Json(json!({ "brain": id, "settings": s })))
 }
 
@@ -1866,7 +1957,7 @@ pub async fn put_settings(State(app): State<App>, Json(req): Json<SettingsReq>) 
     let old = core::settings(&app.store).engine;
     let from = core::brain_id(&app.store);
     let brain = ensure_brain(&app, s.engine).await?;
-    core::save_settings(&app.store, s)?;
+    core::save_settings(&app.store, s.clone())?;
     // 换引擎：两边是两段对话，把旧的那边上次带走之后说的带过来（后台做，不让页面等）
     if let Some(from) = from.filter(|f| s.engine != old && *f != brain) {
         let app = app.clone();
@@ -1929,8 +2020,10 @@ pub async fn fix(State(app): State<App>, Path(id): Path<String>, Json(req): Json
             let first = core::compose_brief(Some(&d.said), &d.brief, false);
             let title = d.said.lines().next().unwrap_or(&d.title).chars().take(30).collect::<String>();
             let engine = if ENGINES.contains(&d.engine.as_str()) { d.engine.clone() } else { default_engine(&app).await.to_string() };
-            let level = dispatch_level(&core::settings(&app.store), None, true).0;
-            open_session(&app, &d.project, &title, &engine, &first, level).await?
+            let settings = core::settings(&app.store);
+            let pick = dispatch_level(&settings, &engine, None, true);
+            let model = dispatch_model(&settings, &engine, None);
+            open_session(&app, &d.project, &title, &engine, &first, &pick, model.as_deref()).await?
         }
         "into" => {
             let target = req.session.as_deref().map(str::trim).filter(|s| !s.is_empty() && Some(*s) != wrong.as_deref()).ok_or_else(|| LocalError::invalid("session", "required"))?;
@@ -2301,20 +2394,32 @@ pub async fn unwatch(State(app): State<App>, Path(session): Path<String>) -> Sta
 
 #[derive(Deserialize)]
 pub struct LevelReq {
-    level: String,
+    /// 四档之一（read_only / ask / project / full）
+    #[serde(default)]
+    level: Option<String>,
+    /// 或者直接给这种引擎的权限模式（[`core::engine_modes`]）
+    #[serde(default)]
+    mode: Option<String>,
 }
 
-/// `POST /api/assistant/sessions/{session}/level`：用户在活动面板上给助理开的会话换一档（调高也行：是用户自己点的）。
-/// Claude Code 马上生效；Codex 下一轮生效
+/// `POST /api/assistant/sessions/{session}/level`：用户在活动面板上给助理开的、送过话的会话换权限（调高也行：是用户自己点的），
+/// 可以是四档之一，也可以是这种引擎的任何一种权限模式。Claude Code 马上生效；Codex 下一轮生效
 pub async fn set_session_level(State(app): State<App>, Path(session): Path<String>, Json(req): Json<LevelReq>) -> R<Json<Value>> {
-    let level = core::Level::parse(&req.level).ok_or_else(|| LocalError::invalid("level", "invalid"))?;
     if !core::watches(&app.store).contains_key(&session) || core::is_gated(&app.store, &session) {
         return Err(LocalError::not_found());
     }
-    let mode = app.chat.apply_level(&session, level).await?;
+    let engine = app.store.instance(&session)?.ok_or_else(LocalError::not_found)?.launch;
+    let mode = match (req.mode.as_deref(), req.level.as_deref()) {
+        (Some(m), _) if core::level_of(&engine, m).is_some() => m.to_string(),
+        (None, Some(l)) => core::native_mode(&engine, core::Level::parse(l).ok_or_else(|| LocalError::invalid("level", "invalid"))?).to_string(),
+        (Some(_), _) => return Err(LocalError::invalid("mode", "invalid")),
+        (None, None) => return Err(LocalError::invalid("mode", "required")),
+    };
+    let used = app.chat.apply_mode(&session, &mode).await?;
+    let level = core::level_of(&engine, used).unwrap_or_default();
     set_level(&app, &session, level);
-    crate::assistant_memory::journal(&app.paths, &format!("用户把 [{session}] 的权限换成了 {}", level.id()));
-    Ok(Json(json!({ "level": level.id(), "mode": mode })))
+    crate::assistant_memory::journal(&app.paths, &format!("用户把 [{session}] 的权限换成了 {used}"));
+    Ok(Json(json!({ "level": level.id(), "mode": used })))
 }
 
 /// 飞书 CLI 的语言跟通知语言走（飞书卡片也用它）：中文环境用中文安装、国内源
@@ -2408,5 +2513,55 @@ mod tests {
         let paths: Vec<String> = p["repos_inside"].as_array().unwrap().iter().map(|r| r["path"].as_str().unwrap().strip_prefix(&ws.display().to_string()).unwrap().to_string()).collect();
         assert_eq!(paths, ["/ViralForge", "/svc/api"]);
         assert_eq!(p["repos_inside"][0]["remote"], "https://g.example/vf.git");
+    }
+
+    #[test]
+    fn dispatch_defaults_per_engine() {
+        use crate::assistant::Level::*;
+        let mut s = crate::assistant::Settings::default();
+        let pick = |s: &crate::assistant::Settings, e: &str, a, att| {
+            let p = dispatch_level(s, e, a, att);
+            (p.mode, p.level, p.capped)
+        };
+        // 没设默认：项目内放手，按引擎换成各自的模式
+        assert_eq!(pick(&s, "claude", None, true), ("auto".into(), Project, None));
+        assert_eq!(pick(&s, "codex", None, false), ("workspaceWrite".into(), Project, None));
+        // 设了默认：大脑没指定就原样用（哪种模式都行，用户没在也照用）
+        s.claude.mode = Some("bypassPermissions".into());
+        s.codex.mode = Some("fullAccess".into());
+        assert_eq!(pick(&s, "claude", None, false), ("bypassPermissions".into(), Full, None));
+        assert_eq!(pick(&s, "codex", None, true), ("fullAccess".into(), Full, None));
+        s.claude.mode = Some("default".into());
+        assert_eq!(pick(&s, "claude", None, true), ("default".into(), Ask, None));
+        // 大脑指定了的按档；上限至少到用户设的默认那一档
+        s.engine = crate::assistant::Engine::Codex;
+        s.ceiling = Some(Project);
+        assert_eq!(pick(&s, "codex", Some(Full), true), ("fullGuarded".into(), Full, None), "默认全权 → 上限也到全权");
+        assert_eq!(pick(&s, "claude", Some(Full), true), ("auto".into(), Project, Some(Full)), "Claude 默认只到动手前问，上限还是项目内放手");
+        assert_eq!(pick(&s, "claude", Some(ReadOnly), false), ("plan".into(), ReadOnly, None));
+        // 设的模式不认得（比如换了引擎写法）：当没设
+        s.codex.mode = Some("plan".into());
+        assert_eq!(pick(&s, "codex", None, true), ("workspaceWrite".into(), Project, None));
+    }
+
+    #[test]
+    fn dispatch_model_priority() {
+        let mut s = crate::assistant::Settings::default();
+        assert_eq!(dispatch_model(&s, "claude", None), None, "都没设：用工具自己的配置");
+        s.claude.model = Some("opus".into());
+        assert_eq!(dispatch_model(&s, "claude", None).as_deref(), Some("opus"));
+        assert_eq!(dispatch_model(&s, "codex", None), None, "按引擎分开");
+        assert_eq!(dispatch_model(&s, "claude", Some("sonnet")).as_deref(), Some("sonnet"), "用户指定的优先");
+    }
+
+    #[test]
+    fn engine_modes_map_to_levels() {
+        for e in ["claude", "codex"] {
+            for l in crate::assistant::Level::ALL {
+                assert_eq!(crate::assistant::level_of(e, crate::assistant::native_mode(e, l)), Some(l), "{e} {l:?}");
+            }
+            assert_eq!(crate::assistant::engine_modes(e).len(), 5);
+        }
+        assert_eq!(crate::assistant::level_of("codex", "auto"), None);
     }
 }

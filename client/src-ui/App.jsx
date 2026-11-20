@@ -19,6 +19,7 @@ import Membership from './pages/Membership.jsx';
 import Pages from './pages/Pages.jsx';
 import Plugins from './pages/Plugins.jsx';
 import PluginView from './pages/PluginView.jsx';
+import { PLUGIN_ROUTE, parsePluginRoute, pickLocalized, pluginIcon, pluginRoute } from './shared/plugins.jsx';
 import Settings from './pages/Settings.jsx';
 import SshHosts from './pages/SshHosts.jsx';
 import System from './pages/System.jsx';
@@ -43,7 +44,6 @@ import { daysLeft, formatTime } from './shared/time.js';
 import { BrandMark, Button, Drawer, FoldNote, LangSwitch, Note, Skeleton, useConfirm, useToast } from './shared/ui.jsx';
 import { isMod, keyLabel } from './shared/hotkeys.js';
 import i18next, { setLocale } from './shared/i18n.js';
-import { PLUGIN_ROUTE, parsePluginRoute, pickLocalized, pluginIcon, pluginRoute } from './shared/plugins.jsx';
 import QuickSwitch from './shared/QuickSwitch.jsx';
 import ShortcutsHelp from './shared/Shortcuts.jsx';
 import { errorText } from './shared/i18n.js';
@@ -120,7 +120,7 @@ const SESS = /^\/s\/([a-z2-7]{8})$/;
 // 用户菜单里的账户页面
 const ACCOUNT_PAGES = ['/devices', '/membership', '/account'];
 // 从右边滑出来的抽屉（地址照旧，链接、刷新都能直接打开）：盖在会话上面，不换掉它，关掉回到会话。
-// 会话为主（docs/SESSION_FIRST_DESIGN_2026-11-16.md P0）：文件、SSH、网页、系统、插件、AI 这些工具也是抽屉（更宽一档）
+// 会话为主（docs/SESSION_FIRST_DESIGN_2026-11-16.md P0）：文件、SSH、网页、系统、AI 这些工具也是抽屉（更宽一档）
 const TOOL_DRAWERS = ['/files', '/ssh', '/pages', '/system', '/plugins', '/ai'];
 const DRAWER_PAGES = {
   '/settings': 'nav.settings',
@@ -462,23 +462,23 @@ function NavRail({ path, onPane }) {
   );
 }
 
-/** 工具菜单：已安装插件声明的入口（不硬编码任何具体插件）+ 文件、SSH、网页、系统、插件管理。 */
-function useToolMenu() {
+/** 装着的插件的入口（看看不认识具体插件，名字、图标来自插件清单）；跑着的带“运行中” */
+function usePluginItems() {
   const { t, i18n } = useTranslation();
   const { navigate } = useRouter();
   const { status } = useStatus();
-  const pluginItems = (status.plugins ?? [])
+  return (status.plugins ?? [])
     .filter((p) => !p.incompatible)
-    .flatMap((p) =>
-      (p.entries ?? []).map((e) => ({
-        icon: pluginIcon(e.icon || p.icon),
-        label: pickLocalized(e.title, i18n.language) || pickLocalized(p.title, i18n.language) || p.name,
-        hint: p.running ? p.badge || t('plugins.running') : undefined,
-        onClick: () => navigate(pluginRoute(p.name, e.path)),
-      })),
-    );
+    .map((p) => ({ icon: pluginIcon(p.icon), label: pickLocalized(p.title, i18n.language) || p.name, hint: p.running ? t('plugins.running') : undefined, onClick: () => navigate(pluginRoute(p.name)) }));
+}
+
+/** 工具菜单：装着的插件、文件、SSH、网页、系统、插件管理 */
+function useToolMenu() {
+  const { t } = useTranslation();
+  const { navigate } = useRouter();
+  const plugins = usePluginItems();
   return [
-    ...pluginItems,
+    ...plugins,
     ...TOOLS.filter((x) => !x.config).map((x) => ({ icon: x.icon, label: t(x.key), onClick: () => navigate(x.to) })),
   ].filter(Boolean);
 }
@@ -564,22 +564,14 @@ function PaneNav({ path }) {
 /** “我的”菜单：头像卡片下面一块图标格子（任务、历史、文件、SSH、网页、系统、AI、电脑），再是账户那些
  *  （手机底栏的“我的”、电脑会话栏底部的头像共用） */
 function useMeMenu({ tasks = true } = {}) {
-  const { t, i18n } = useTranslation();
+  const { t } = useTranslation();
   const { status } = useStatus();
   const { navigate } = useRouter();
   const n = useAttnCount();
+  const plugins = usePluginItems();
   const item = (x) => ({ icon: x.icon, label: t(x.short), onClick: () => navigate(x.to) });
-  const pluginItems = (status.plugins ?? [])
-    .filter((p) => !p.incompatible)
-    .flatMap((p) =>
-      (p.entries ?? []).map((e) => ({
-        icon: pluginIcon(e.icon || p.icon),
-        label: pickLocalized(e.title, i18n.language) || pickLocalized(p.title, i18n.language) || p.name,
-        onClick: () => navigate(pluginRoute(p.name, e.path)),
-      })),
-    );
   return useUserMenu([
-    ...pluginItems,
+    ...plugins,
     tasks && { icon: ListTodo, label: t('nav.short.tasks'), count: n, onClick: () => navigate('/tasks') },
     { icon: History, label: t('nav.short.history'), onClick: () => navigate('/history') },
     ...TOOLS.filter((x) => !x.config).map(item),
@@ -1050,12 +1042,8 @@ function Shell() {
     const ownId = devices.def ?? ownDevRef.current ?? status.account.session?.device_id;
     const login = rtcMode ? 'remote' : status.account.logged_in && ownId ? `local:${ownId}` : 'guest';
     const home = opensInPage() ? <DraftPane key={`start:${login}`} /> : <SessionHome />;
-    const pluginMatch = parsePluginRoute(path);
-    const page = SESS.test(path)
-      ? null
-      : pluginMatch
-        ? <PluginView name={pluginMatch.name} entryPath={pluginMatch.entryPath} />
-        : { '/': home, '/new': <DraftPane key={`start:${login}`} />, '/assistant': <Assistant />, '/tasks': <Board />, '/history': <HistoryPage />, '/project': <ProjectPage /> }[path];
+    const pluginName = parsePluginRoute(path);
+    const page = SESS.test(path) ? null : pluginName ? <PluginView name={pluginName} /> : { '/': home, '/new': <DraftPane key={`start:${login}`} />, '/assistant': <Assistant />, '/tasks': <Board />, '/history': <HistoryPage />, '/project': <ProjectPage /> }[path];
     const guest = !status.account.logged_in;
     const drawerPage = route.drawer && { '/settings': <Settings />, '/account': guest ? <Login drawer /> : <Account />, '/devices': guest ? <Login drawer /> : <Computers />, '/membership': guest ? <Login drawer /> : <Membership />, '/files': <Files />, '/ssh': <SshHosts />, '/pages': <Pages />, '/plugins': <Plugins />, '/ai': <AiPage />, '/system': <System /> }[route.drawer];
     body = (

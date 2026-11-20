@@ -18,12 +18,12 @@ pub struct LocalError {
 impl LocalError {
     pub fn new(code: &str) -> Self {
         let status = match code {
-            "NOT_FOUND" | "PLUGIN_NOT_FOUND" => StatusCode::NOT_FOUND,
+            "NOT_FOUND" => StatusCode::NOT_FOUND,
             "NOT_LOGGED_IN" | "UNAUTHENTICATED" | "ACCESS_CODE_REQUIRED" => StatusCode::UNAUTHORIZED,
-            "LOCKED" | "FORBIDDEN" | "CSRF_FAILED" | "REMOTE_FORBIDDEN" | "PORT_RESERVED" | "PLUGIN_NOT_LICENSED" => StatusCode::FORBIDDEN,
+            "LOCKED" | "FORBIDDEN" | "CSRF_FAILED" | "REMOTE_FORBIDDEN" | "PORT_RESERVED" => StatusCode::FORBIDDEN,
             "INTERNAL" | "START_FAILED" | "TTYD_MISSING" | "NO_FREE_PORT" | "AGENT_INSTALL_FAILED" => StatusCode::INTERNAL_SERVER_ERROR,
-            "NETWORK" | "PLUGIN_START_FAILED" => StatusCode::BAD_GATEWAY,
-            "INSTANCE_RUNNING" | "MCP_DISABLED" | "UPLOAD_OFFSET" | "UPLOAD_INCOMPLETE" | "TRANSFER_GONE" | "PLUGIN_BUSY" | "PLUGIN_INCOMPATIBLE" | "PLUGIN_INSTALLING" => StatusCode::CONFLICT,
+            "NETWORK" => StatusCode::BAD_GATEWAY,
+            "INSTANCE_RUNNING" | "MCP_DISABLED" | "UPLOAD_OFFSET" | "UPLOAD_INCOMPLETE" | "TRANSFER_GONE" => StatusCode::CONFLICT,
             "UPLOAD_BUSY" => StatusCode::TOO_MANY_REQUESTS,
             "AGENT_NOT_FOUND" => StatusCode::NOT_FOUND,
             _ => StatusCode::BAD_REQUEST,

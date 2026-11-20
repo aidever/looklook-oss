@@ -1,649 +1,354 @@
-//! 插件协议（客户端 docs/BROWSER_PLUGIN_DESIGN_2026-11-19.md、docs/PLUGIN_PROTOCOL.md）。
+//! 插件协议（looklook-client/docs/BROWSER_PLUGIN_DESIGN_2026-11-19.md）：看看客户端、服务端、闭源插件三方共用。
 //!
-//! 看看客户端只做通用的插件管理（安装、验签、启动、转发、菜单入口），不认识任何具体插件；
-//! 插件是单独的程序，只经这里定义的 HTTP + JSON 协议和看看交互。三方：
-//!
-//! - **看看 → 插件**：插件监听看看给的 Unix socket（[`ENV_SOCKET`]），看看把 `/api/plugins/<名>/…`、`/p/<名>/…`
-//!   原样（不去前缀）转给它，带上 [`HDR_TOKEN`] 和访问来源头；另有固定的 [`PLUGIN_STATUS_PATH`] 等。
-//! - **插件 → 看看**：只给白名单接口（[`HOST_INFO_PATH`] 等），走 [`ENV_HOST_URL`]，同样带 [`HDR_TOKEN`]。
-//! - **看看 ↔ 平台**：插件目录、下载、授权凭证、按凭证下发的数据（[`CLIENT_CATALOG_PATH`] 等，设备签名）。
-//!
-//! 插件包：tar.gz，顶层是 [`MANIFEST_FILE`]、[`PACKAGE_FILE`]（全部文件的 SHA-256）、[`SIGNATURE_FILE`]
-//! （离线私钥对 [`PACKAGE_FILE`] 的签名）和其他文件。授权凭证由平台签名（与平台响应同一把钥匙），插件内置平台公钥自己验。
+//! - **清单**（[`Manifest`]）：插件包里的 `manifest.json`，说明名字、版本、要的协议版本、怎么启动、界面入口。
+//! - **发布**（[`Release`] + [`ReleaseSig`]）：服务端插件目录里每个平台一份 `release.json`（包的大小、SHA-256、清单），
+//!   用离线私钥签名（`release.sig`）。客户端编译时内置公钥（`LOOKLOOK_PLUGIN_KEYS`），签名不对、哈希不对都不装。
+//! - **授权凭证**（[`LicenseClaims`]）：服务端按“账号 × 插件”的授权（管理后台手动开通，带到期时间）签发的短期凭证，
+//!   用平台私钥签名；插件内置平台公钥自己验，过期就不干活。看看只负责代插件向服务端申请（客户端是开源的，不靠它判权）。
+//! - **本机交互**：插件监听看看给的 Unix Socket，看看把 `/p/<名>/…`（页面）和 `/api/plugins/<名>/…`（接口）转过去，
+//!   每个请求带 [`HDR_TOKEN`]；插件调看看的宿主接口（[`HOST_PREFIX`]）带 [`ENV_HOST_TOKEN`] 给的口令。
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 
-use chacha20poly1305::aead::{Aead, KeyInit};
-use chacha20poly1305::{XChaCha20Poly1305, XNonce};
-use ed25519_dalek::{SigningKey, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
-use crate::signing::{b64, b64_decode, sha256_hex, sign, verify};
+use crate::signing::{b64, b64_decode, sha256_hex};
 
-/// 协议版本。清单写自己支持的范围（[`ProtocolRange`]），看看不在范围内就不启动并提示更新。
-pub const PROTOCOL_VERSION: u32 = 1;
+/// 协议版本：清单里的 `protocol` 不等于它，看看就不启动（提示更新看看或插件）
+pub const PROTOCOL: u32 = 1;
 
-// ---------------------------------------------------------------- 包
-
-pub const MANIFEST_FILE: &str = "manifest.json";
-pub const PACKAGE_FILE: &str = "package.json";
-pub const SIGNATURE_FILE: &str = "package.sig";
-/// 安装包（tar.gz）的大小上限。
-pub const MAX_PACKAGE_BYTES: u64 = 512 << 20;
-
-// ---------------------------------------------------------------- 进程环境变量（看看 → 插件）
-
-/// 插件要监听的 Unix socket 路径（目录已建好、0700）。
-pub const ENV_SOCKET: &str = "LOOKLOOK_PLUGIN_SOCKET";
-/// 本次启动的随机令牌：看看发来的每个请求都带 [`HDR_TOKEN`]，插件调宿主接口也带它。
-pub const ENV_TOKEN: &str = "LOOKLOOK_PLUGIN_TOKEN";
-/// 插件自己的持久数据目录 `<数据目录>/plugin-data/<名>/`（0700，更新插件不动它）。
-pub const ENV_DATA_DIR: &str = "LOOKLOOK_PLUGIN_DATA_DIR";
-/// 宿主接口的地址（`http://127.0.0.1:端口`，不带结尾 `/`）。
-pub const ENV_HOST_URL: &str = "LOOKLOOK_PLUGIN_HOST_URL";
-/// 插件名。
-pub const ENV_NAME: &str = "LOOKLOOK_PLUGIN_NAME";
-/// 看看实现的协议版本。
-pub const ENV_PROTOCOL: &str = "LOOKLOOK_PLUGIN_PROTOCOL";
-/// 看看的版本号。
-pub const ENV_CLIENT_VERSION: &str = "LOOKLOOK_CLIENT_VERSION";
-/// 看看的数据目录（只读用途：迁移旧版内置功能留下的数据，如 `<数据目录>/browser/`）。
-pub const ENV_HOME: &str = "LOOKLOOK_HOME_DIR";
-
-// ---------------------------------------------------------------- 请求头
-
-/// 看看 ↔ 插件双向请求都带的令牌（[`ENV_TOKEN`]）。
-pub const HDR_TOKEN: &str = "x-ll-plugin-token";
-/// 用户从哪里打开：[`Access`] 的取值。
-pub const HDR_ACCESS: &str = "x-ll-plugin-access";
-/// `1`：只读访问（只读分享），插件不能执行会改变状态的操作。
-pub const HDR_READONLY: &str = "x-ll-plugin-readonly";
-/// 界面语言（`zh-CN` / `en-US`），插件按它返回文案（如 open_url 的目标名称）。
-pub const HDR_LOCALE: &str = "x-ll-plugin-locale";
-
-/// 请求从哪里来（转发时由看看填 [`HDR_ACCESS`]）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Access {
-    /// 这台电脑自己
-    Local,
-    /// 局域网 / 白名单
-    Lan,
-    /// 远程（专属地址经中转）
-    Remote,
-    /// 远程（WebRTC）
-    Rtc,
-}
-
-impl Access {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Access::Local => "local",
-            Access::Lan => "lan",
-            Access::Remote => "remote",
-            Access::Rtc => "rtc",
-        }
-    }
-}
-
-// ---------------------------------------------------------------- 路径
-
-/// 看看上的插件接口前缀：`/api/plugins/<名>/…` 原样转给插件。
-pub const API_PREFIX: &str = "/api/plugins/";
-/// 看看上的插件页面前缀：`/p/<名>/…` 原样转给插件。
+/// 插件页面：`/p/<名>/…`
 pub const PAGE_PREFIX: &str = "/p/";
-
-/// 插件固定提供：状态（[`PluginStatus`]）。看看只在插件进程已在跑时才问，不会为它拉起插件。
-pub const PLUGIN_STATUS_PATH: &str = "/_plugin/status";
-/// 插件固定提供：看看要停掉它之前先发这个（POST），插件收尾后自己退出；5 秒内没退出看看再结束进程。
-pub const PLUGIN_SHUTDOWN_PATH: &str = "/_plugin/shutdown";
-
-/// 宿主接口前缀（插件 → 看看，只接受这台机器自己的连接且带 [`HDR_TOKEN`]）。
+/// 插件接口：`/api/plugins/<名>/…`
+pub const API_PREFIX: &str = "/api/plugins/";
+/// 看看给插件用的宿主接口（只在本机、只认插件口令）：`/_host/license`、`/_host/info`
 pub const HOST_PREFIX: &str = "/_host/";
-/// GET → [`HostInfo`]
-pub const HOST_INFO_PATH: &str = "/_host/info";
-/// POST [`HostNotify`] → 204：在看看里弹一条提醒（也会照用户设置推送）。
-pub const HOST_NOTIFY_PATH: &str = "/_host/notify";
-/// POST [`LicenseRequest`] → [`SignedLicense`]：看看用设备私钥签名，代插件向平台申请 / 续期授权凭证。
 pub const HOST_LICENSE_PATH: &str = "/_host/license";
-/// GET → [`PluginData`]：看看代插件取平台按凭证下发的数据（如设备池），插件用凭证里的 `data_key` 解密。
-pub const HOST_DATA_PATH: &str = "/_host/data";
+pub const HOST_INFO_PATH: &str = "/_host/info";
 
-// 平台接口（客户端接口前缀 `/api/client/v1` 之后的部分）
+/// 看看启动插件时给的环境变量
+pub const ENV_SOCKET: &str = "LOOKLOOK_PLUGIN_SOCKET";
+pub const ENV_TOKEN: &str = "LOOKLOOK_PLUGIN_TOKEN";
+pub const ENV_DATA_DIR: &str = "LOOKLOOK_PLUGIN_DATA_DIR";
+pub const ENV_BASE: &str = "LOOKLOOK_PLUGIN_BASE";
+pub const ENV_HOST_URL: &str = "LOOKLOOK_HOST_URL";
+pub const ENV_HOST_TOKEN: &str = "LOOKLOOK_HOST_TOKEN";
+pub const ENV_CLIENT_VERSION: &str = "LOOKLOOK_CLIENT_VERSION";
 
-/// 不需要登录：插件目录（`?target=linux-x86_64`）→ [`PluginCatalog`]，`licensed` 全为 false。
-pub const CLIENT_CATALOG_PUBLIC_PATH: &str = "/plugins/catalog";
-/// 设备签名：插件目录（`?target=`）→ [`PluginCatalog`]，带本账户的授权情况。
-pub const CLIENT_CATALOG_PATH: &str = "/plugins";
+/// 看看转给插件的请求带的头：口令（插件只认带对口令的请求）、是不是这台电脑自己打开的（`1` / `0`）
+pub const HDR_TOKEN: &str = "x-ll-plugin-token";
+pub const HDR_LOCAL: &str = "x-ll-local";
 
-/// 设备签名：`POST /plugins/{name}/download`（[`DownloadRequest`]）→ [`DownloadTicket`]。
-pub fn client_download_path(name: &str) -> String {
-    format!("/plugins/{name}/download")
-}
-/// 设备签名：`POST /plugins/{name}/license`（[`LicenseRequest`]）→ [`SignedLicense`]。
-pub fn client_license_path(name: &str) -> String {
-    format!("/plugins/{name}/license")
-}
-/// 设备签名：`GET /plugins/{name}/data` → [`PluginData`]。
-pub fn client_data_path(name: &str) -> String {
-    format!("/plugins/{name}/data")
-}
-
-/// 插件名：小写字母开头，小写字母、数字、`-`，2–32 个字符。
+/// 插件名：小写字母、数字、`-`，2～32 个字符，字母开头
 pub fn valid_name(name: &str) -> bool {
-    let b = name.as_bytes();
-    (2..=32).contains(&b.len()) && b[0].is_ascii_lowercase() && b.iter().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'-') && !name.ends_with('-')
+    (2..=32).contains(&name.len()) && name.starts_with(|c: char| c.is_ascii_lowercase()) && name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
 
-/// 请求路径属于哪个插件：`/api/plugins/<名>/…` 或 `/p/<名>/…`（也认不带结尾 `/` 的 `/p/<名>`）。
+/// 版本号：`1.2.3`（可带 `-beta.1` 这样的后缀）
+pub fn valid_version(v: &str) -> bool {
+    let core = v.split('-').next().unwrap_or("");
+    let parts: Vec<&str> = core.split('.').collect();
+    v.len() <= 40 && parts.len() == 3 && parts.iter().all(|p| !p.is_empty() && p.len() <= 6 && p.chars().all(|c| c.is_ascii_digit())) && v.chars().all(|c| c.is_ascii_alphanumeric() || ".-".contains(c))
+}
+
+/// 比较版本号（只比 `主.次.修订`，后缀不管）
+pub fn version_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    let nums = |v: &str| -> Vec<u64> { v.split('-').next().unwrap_or("").split('.').map(|p| p.parse().unwrap_or(0)).collect() };
+    nums(a).cmp(&nums(b))
+}
+
+/// 路径属于哪个插件：`/p/<名>/…` 或 `/api/plugins/<名>/…`
 pub fn plugin_of_path(path: &str) -> Option<&str> {
-    let rest = path.strip_prefix(API_PREFIX).or_else(|| path.strip_prefix(PAGE_PREFIX))?;
-    let name = rest.split(['/', '?']).next()?;
+    let rest = path.strip_prefix(PAGE_PREFIX).or_else(|| path.strip_prefix(API_PREFIX))?;
+    let name = rest.split('/').next()?;
     valid_name(name).then_some(name)
 }
 
-/// 插件页面地址 `/p/<名>/<path>`（`path` 是清单里相对页面前缀的路径）。
-pub fn page_url(name: &str, path: &str) -> String {
-    format!("{PAGE_PREFIX}{name}/{}", path.trim_start_matches('/'))
+/// 这台电脑的平台：`linux-x86_64`、`linux-aarch64`、`macos-aarch64`、`windows-x86_64`……
+pub fn current_platform() -> String {
+    let os = match std::env::consts::OS {
+        "macos" => "macos",
+        "windows" => "windows",
+        other => other,
+    };
+    format!("{os}-{}", std::env::consts::ARCH)
 }
 
-/// 插件接口地址 `/api/plugins/<名>/<path>`。
-pub fn api_url(name: &str, path: &str) -> String {
-    format!("{API_PREFIX}{name}/{}", path.trim_start_matches('/'))
+pub fn valid_platform(p: &str) -> bool {
+    (3..=40).contains(&p.len()) && p.contains('-') && p.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
 }
 
-// ---------------------------------------------------------------- 清单
-
-/// 中英文文案（英文缺省时回退中文）。
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Localized {
-    #[serde(rename = "zh-CN")]
-    pub zh: String,
-    #[serde(rename = "en-US", default, skip_serializing_if = "String::is_empty")]
-    pub en: String,
-}
-
-impl Localized {
-    pub fn get(&self, locale: &str) -> &str {
-        if locale.starts_with("en") && !self.en.is_empty() {
-            &self.en
-        } else {
-            &self.zh
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ProtocolRange {
-    pub min: u32,
-    pub max: u32,
-}
-
-impl ProtocolRange {
-    pub fn contains(&self, v: u32) -> bool {
-        self.min <= v && v <= self.max
-    }
-}
-
-/// “工具”菜单里的一项。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Entry {
-    pub id: String,
-    pub title: Localized,
-    /// lucide 图标名（`globe`、`monitor` …），看看不认识就用默认图标
-    #[serde(default)]
-    pub icon: String,
-    /// 相对页面前缀 `/p/<名>/` 的路径，空串就是插件首页
-    #[serde(default)]
-    pub path: String,
-}
-
-/// 对话里点链接时“用插件打开”（docs/PLUGIN_PROTOCOL.md §open_url）。路径相对接口前缀 `/api/plugins/<名>/`。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct OpenUrlCapability {
-    /// GET → [`OpenUrlTargets`]
-    pub targets: String,
-    /// POST [`OpenUrlRequest`] → [`OpenUrlResponse`]
-    pub open: String,
-    /// 菜单里这一组的名字（如“远程浏览器”）
-    pub title: Localized,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Capabilities {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub open_url: Option<OpenUrlCapability>,
-}
-
-/// 只读访问（[`HDR_READONLY`]）时看看在网关层怎么处理，不依赖插件自觉检查。
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ReadonlyPolicy {
-    /// 一律拒绝（默认）
-    #[default]
-    Deny,
-    /// 只放行 GET / HEAD 和 WebSocket 以外的读请求
-    ReadMethods,
-    /// 全部转给插件，由插件按 [`HDR_READONLY`] 自己限制
-    Plugin,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// 插件包里的 `manifest.json`
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Manifest {
     pub name: String,
     pub version: String,
-    pub protocol: ProtocolRange,
-    /// 需要的最低看看版本（semver）
+    /// 要的协议版本（[`PROTOCOL`]）
+    pub protocol: u32,
+    /// 要求的最低看看版本
     #[serde(default)]
     pub min_client: String,
-    /// 支持的平台（`linux-x86_64` 等，与客户端更新接口的平台标识一致）
-    pub platforms: Vec<String>,
-    /// 可执行文件，相对包根目录
-    pub exec: String,
-    pub title: Localized,
+    /// 显示名、说明：语言 → 文字（`zh-CN`、`en-US`）
+    pub title: BTreeMap<String, String>,
     #[serde(default)]
-    pub description: Localized,
+    pub description: BTreeMap<String, String>,
+    /// 图标：lucide 图标名（`globe`、`puzzle`……），界面认不出时用拼图
     #[serde(default)]
     pub icon: String,
-    #[serde(default)]
-    pub entries: Vec<Entry>,
-    #[serde(default)]
-    pub capabilities: Capabilities,
-    /// 相对插件数据目录的文件：看看启动时它存在就立即拉起插件（插件借此接回看看重启前还在跑的后台任务）
+    /// 包里的可执行文件（相对包根目录），例如 `bin/looklook-browser`
+    pub exec: String,
+    /// 看看启动时如果插件数据目录下有这个文件（相对路径），就先把插件起来（例如浏览器还在后台跑，要接回来）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub autostart_if_exists: Option<String>,
+    /// 插件能打开网址（对话里点链接时菜单里多一项“用 <插件> 打开”）：`POST /api/plugins/<名>/open-url {url}`
     #[serde(default)]
-    pub readonly_policy: ReadonlyPolicy,
-    /// 相对页面前缀的路径前缀：这些 HTML 页面由看看注入 `/static/web.js`（远程 WebRTC 时页面里的 WebSocket 经启动页走）
-    #[serde(default)]
-    pub inject_web_prefixes: Vec<String>,
-    /// 没有请求、也不忙（[`PluginStatus::busy`]）多久后停掉插件进程；0 = 不停
-    #[serde(default = "default_idle")]
-    pub idle_stop_minutes: u32,
-    /// 需要平台授权才能下载（目录里显示授权情况）
-    #[serde(default)]
-    pub requires_license: bool,
-}
-
-fn default_idle() -> u32 {
-    10
-}
-
-fn safe_rel(p: &str) -> bool {
-    !p.is_empty() && !p.starts_with('/') && !p.contains('\\') && p.split('/').all(|s| !s.is_empty() && s != "." && s != "..")
+    pub open_url: bool,
 }
 
 impl Manifest {
-    pub fn parse(bytes: &[u8]) -> Result<Self, String> {
-        let m: Manifest = serde_json::from_slice(bytes).map_err(|e| format!("manifest: {e}"))?;
-        m.validate().map_err(|f| format!("manifest: invalid {f}"))?;
-        Ok(m)
-    }
-
-    /// 字段检查，返回不合格的字段名。
-    pub fn validate(&self) -> Result<(), &'static str> {
+    /// 检查字段（看看装之前、服务端打包时都查）
+    pub fn validate(&self) -> Result<(), String> {
         if !valid_name(&self.name) {
-            return Err("name");
+            return Err(format!("bad name {:?}", self.name));
         }
-        if self.version.is_empty() || self.version.len() > 64 {
-            return Err("version");
+        if !valid_version(&self.version) {
+            return Err(format!("bad version {:?}", self.version));
         }
-        if self.protocol.min > self.protocol.max {
-            return Err("protocol");
+        if !self.min_client.is_empty() && !valid_version(&self.min_client) {
+            return Err(format!("bad min_client {:?}", self.min_client));
         }
-        if !safe_rel(&self.exec) {
-            return Err("exec");
+        if self.title.values().all(|t| t.trim().is_empty()) {
+            return Err("missing title".into());
         }
-        if self.title.zh.is_empty() {
-            return Err("title");
+        let exec = self.exec.as_str();
+        let safe = !exec.is_empty() && !exec.starts_with('/') && !exec.contains('\\') && exec.split('/').all(|p| !p.is_empty() && p != "." && p != "..");
+        if !safe {
+            return Err(format!("bad exec {:?}", self.exec));
         }
-        if self.platforms.is_empty() {
-            return Err("platforms");
-        }
-        if self.entries.iter().any(|e| e.id.is_empty() || e.title.zh.is_empty() || e.path.contains("..")) {
-            return Err("entries");
-        }
-        if self.autostart_if_exists.as_deref().is_some_and(|p| !safe_rel(p)) {
-            return Err("autostart_if_exists");
-        }
-        if self.inject_web_prefixes.iter().any(|p| p.contains("..")) {
-            return Err("inject_web_prefixes");
-        }
-        if let Some(c) = &self.capabilities.open_url {
-            if c.targets.contains("..") || c.open.contains("..") {
-                return Err("capabilities");
+        if let Some(f) = &self.autostart_if_exists {
+            if f.is_empty() || f.starts_with('/') || f.split('/').any(|p| p.is_empty() || p == "..") {
+                return Err(format!("bad autostart_if_exists {f:?}"));
             }
         }
         Ok(())
     }
 
-    /// 看看（协议 `v`）能不能运行它。
-    pub fn supports_protocol(&self, v: u32) -> bool {
-        self.protocol.contains(v)
-    }
-
-    pub fn supports_platform(&self, target: &str) -> bool {
-        self.platforms.iter().any(|p| p == target)
-    }
-
-    /// 这个页面路径（完整路径，如 `/p/browser/view/`）要不要注入 web.js。
-    pub fn wants_web_inject(&self, path: &str) -> bool {
-        let base = page_url(&self.name, "");
-        let Some(rel) = path.strip_prefix(&base) else { return false };
-        self.inject_web_prefixes.iter().any(|p| rel.starts_with(p.trim_start_matches('/')))
+    /// 按界面语言挑显示名（没有就用英文，再没有用随便哪个）
+    pub fn title_for(&self, lang: &str) -> String {
+        pick_lang(&self.title, lang).unwrap_or_else(|| self.name.clone())
     }
 }
 
-// ---------------------------------------------------------------- 状态
-
-/// [`PLUGIN_STATUS_PATH`] 的响应。
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-pub struct PluginStatus {
-    /// 插件管的东西在跑（如浏览器开着）：界面上的绿点
-    #[serde(default)]
-    pub running: bool,
-    /// 忙：看看不能因为闲置停掉插件，也不在这时更新它
-    #[serde(default)]
-    pub busy: bool,
-    /// 菜单上显示的一小段文字（如“运行中”），插件按 [`HDR_LOCALE`] 给
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub badge: Option<String>,
-    /// 插件自定义的其他内容，看看原样交给界面
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub detail: Option<Value>,
+pub fn pick_lang(m: &BTreeMap<String, String>, lang: &str) -> Option<String> {
+    m.get(lang).or_else(|| m.get("en-US")).or_else(|| m.values().next()).filter(|s| !s.trim().is_empty()).cloned()
 }
 
-// ---------------------------------------------------------------- open_url
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct OpenUrlTarget {
-    pub id: String,
-    pub label: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub hint: Option<String>,
-    /// 正在用（排第一、菜单上标出来）
-    #[serde(default)]
-    pub active: bool,
-    /// 不指定目标时用它
-    #[serde(default)]
-    pub default: bool,
-}
-
-/// GET targets 的响应。
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct OpenUrlTargets {
-    /// 现在能打开（例如浏览器内核已装好）；false 时菜单只给“去设置”（跳到 `setup_path`）
-    pub ready: bool,
-    #[serde(default)]
-    pub targets: Vec<OpenUrlTarget>,
-    /// 没准备好时跳去的页面（相对页面前缀）
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub setup_path: Option<String>,
-    /// 没准备好时菜单上的提示（如“去安装”）
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub setup_hint: Option<String>,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct OpenUrlRequest {
-    pub url: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub target: Option<String>,
-    /// 用户已经同意的确认（[`OpenUrlResponse::Confirm`] 的 `id`）
-    #[serde(default)]
-    pub confirmed: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "result", rename_all = "snake_case")]
-pub enum OpenUrlResponse {
-    /// 已经打开；`navigate`：随后让管理台跳到这个插件页面（相对页面前缀），不给就不跳
-    Opened {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        navigate: Option<String>,
-    },
-    /// 要用户先确认（如“会关掉正在用的那套配置”）：看看弹确认框，同意后把 `id` 放进 `confirmed` 重发
-    Confirm {
-        id: String,
-        title: String,
-        body: String,
-        confirm: String,
-        #[serde(default)]
-        danger: bool,
-    },
-    /// 打开前先跳到插件页面（例如还在启动、要显示进度），插件自己接着打开
-    Navigate { navigate: String },
-}
-
-// ---------------------------------------------------------------- 宿主接口
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct HostInfo {
-    pub protocol: u32,
-    pub client_version: String,
-    /// 平台标识（`linux-x86_64` 等）
-    pub target: String,
-    pub logged_in: bool,
-    /// 这台电脑的设备 public id（登录时）
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub device: Option<String>,
-    /// 平台地址（登录时）
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub server: Option<String>,
-    /// 平台当前时间（可信时间，毫秒）：插件校时用，配合自己的单调时钟防回拨
-    pub server_time_ms: i64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct HostNotify {
-    pub title: String,
-    #[serde(default)]
-    pub body: String,
-    /// 点提醒打开的页面（相对页面前缀）
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub path: Option<String>,
-}
-
-// ---------------------------------------------------------------- 目录与下载
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CatalogEntry {
+/// 服务端插件目录里一个平台的发布：`<plugins_dir>/<名>/<平台>/release.json`（旁边是 `release.sig` 和 `package.tar.gz`）
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Release {
     pub name: String,
     pub version: String,
-    pub title: Localized,
-    #[serde(default)]
-    pub description: Localized,
-    #[serde(default)]
-    pub icon: String,
-    pub platforms: Vec<String>,
-    /// 这个平台的安装包大小与 SHA-256（不支持这个平台时为 0 / 空）
-    #[serde(default)]
-    pub size: u64,
-    #[serde(default)]
+    pub platform: String,
+    /// `package.tar.gz` 的 SHA-256（hex）和字节数
     pub sha256: String,
-    pub requires_license: bool,
-    /// 本账户有没有授权（不需要授权的插件恒为 true；没登录时为 false）
-    pub licensed: bool,
-    pub protocol: ProtocolRange,
-    #[serde(default)]
-    pub min_client: String,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PluginCatalog {
-    pub plugins: Vec<CatalogEntry>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DownloadRequest {
-    pub target: String,
-}
-
-/// 下载票据：`url` 是短时有效的地址（平台签发，不需要再签名），下载完核对 `sha256`。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DownloadTicket {
-    pub version: String,
-    pub url: String,
     pub size: u64,
-    pub sha256: String,
-}
-
-// ---------------------------------------------------------------- 包签名（离线私钥）
-
-/// [`PACKAGE_FILE`]：包里每个文件的 SHA-256（不含 [`PACKAGE_FILE`] 和 [`SIGNATURE_FILE`] 自己）。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PackageIndex {
-    pub name: String,
-    pub version: String,
-    pub target: String,
-    /// 相对路径 → SHA-256 hex
-    pub files: BTreeMap<String, String>,
-    /// 可执行的文件（解包后设 0755）
+    pub manifest: Manifest,
+    /// 打包时间（RFC 3339）
     #[serde(default)]
-    pub executables: Vec<String>,
+    pub published_at: String,
 }
 
-impl PackageIndex {
-    pub fn parse(bytes: &[u8]) -> Result<Self, String> {
-        let p: PackageIndex = serde_json::from_slice(bytes).map_err(|e| format!("package: {e}"))?;
-        if !valid_name(&p.name) || p.files.is_empty() {
-            return Err("package: invalid".into());
+impl Release {
+    pub fn validate(&self) -> Result<(), String> {
+        self.manifest.validate()?;
+        if self.manifest.name != self.name || self.manifest.version != self.version {
+            return Err("manifest does not match release".into());
         }
-        if !p.files.contains_key(MANIFEST_FILE) {
-            return Err("package: no manifest".into());
+        if !valid_platform(&self.platform) {
+            return Err(format!("bad platform {:?}", self.platform));
         }
-        for (path, hash) in &p.files {
-            if !safe_rel(path) || path == PACKAGE_FILE || path == SIGNATURE_FILE || hash.len() != 64 || !hash.bytes().all(|c| c.is_ascii_hexdigit()) {
-                return Err(format!("package: bad entry {path}"));
-            }
+        if self.sha256.len() != 64 || !self.sha256.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err("bad sha256".into());
         }
-        if p.executables.iter().any(|e| !p.files.contains_key(e)) {
-            return Err("package: bad executables".into());
-        }
-        Ok(p)
+        Ok(())
     }
 }
 
-/// [`SIGNATURE_FILE`] 的内容。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PackageSignature {
+/// `release.sig`：离线私钥对 `release.json` 原文的签名
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReleaseSig {
+    /// 用的哪把公钥（`LOOKLOOK_PLUGIN_KEYS` 里的名字，例如 `pk1`）
     pub kid: String,
     pub sig: String,
 }
 
-/// 包签名规范串 `LL1-PLUGIN-PKG`：签的是 [`PACKAGE_FILE`] 的原始字节。
-pub fn package_canonical(index_bytes: &[u8]) -> String {
-    format!("LL1-PLUGIN-PKG\n{}", sha256_hex(index_bytes))
+fn release_message(release_json: &[u8]) -> String {
+    format!("LL1-PLUGIN-RELEASE\n{}", sha256_hex(release_json))
 }
 
-pub fn sign_package(key: &SigningKey, kid: &str, index_bytes: &[u8]) -> PackageSignature {
-    PackageSignature { kid: kid.to_string(), sig: sign(key, &package_canonical(index_bytes)) }
+pub fn sign_release(key: &SigningKey, kid: &str, release_json: &[u8]) -> ReleaseSig {
+    ReleaseSig { kid: kid.to_string(), sig: b64(&key.sign(release_message(release_json).as_bytes()).to_bytes()) }
 }
 
-pub fn verify_package(keys: &HashMap<String, VerifyingKey>, index_bytes: &[u8], sig: &PackageSignature) -> bool {
-    keys.get(&sig.kid).is_some_and(|k| verify(k, &package_canonical(index_bytes), &sig.sig))
+/// 验 `release.json` 原文的签名，通过了才解析
+pub fn verify_release(keys: &[(String, VerifyingKey)], release_json: &[u8], sig: &ReleaseSig) -> Result<Release, String> {
+    let key = keys.iter().find(|(k, _)| *k == sig.kid).map(|(_, k)| k).ok_or_else(|| format!("unknown key {:?}", sig.kid))?;
+    if !verify_raw(key, release_message(release_json).as_bytes(), &sig.sig) {
+        return Err("bad signature".into());
+    }
+    let r: Release = serde_json::from_slice(release_json).map_err(|e| format!("release.json: {e}"))?;
+    r.validate()?;
+    Ok(r)
 }
 
-// ---------------------------------------------------------------- 授权凭证（平台签名）
-
-/// 插件申请凭证时交给看看的内容。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LicenseRequest {
-    /// 机器指纹摘要（SHA-256 hex）：插件按 machine-id 等算，容器里没有固定 machine-id 时用自己数据卷里的安装 ID
-    pub machine: String,
-    /// 插件版本（平台记录）
-    #[serde(default)]
-    pub version: String,
+fn verify_raw(key: &VerifyingKey, msg: &[u8], sig_b64: &str) -> bool {
+    let Some(bytes) = b64_decode(sig_b64) else { return false };
+    let Ok(bytes): Result<[u8; 64], _> = bytes.try_into() else { return false };
+    key.verify(msg, &Signature::from_bytes(&bytes)).is_ok()
 }
 
-pub const LICENSE_VERSION: u32 = 1;
+/// 公钥列表：`pk1=<base64url>,pk2=<base64url>`（和 `LOOKLOOK_PLATFORM_KEYS` 一个写法）。写错的跳过
+pub fn parse_keys(s: &str) -> Vec<(String, VerifyingKey)> {
+    s.split([',', ';', '\n'])
+        .filter_map(|part| {
+            let (kid, key) = part.trim().split_once('=')?;
+            let bytes: [u8; 32] = b64_decode(key.trim())?.try_into().ok()?;
+            Some((kid.trim().to_string(), VerifyingKey::from_bytes(&bytes).ok()?))
+        })
+        .filter(|(k, _)| !k.is_empty())
+        .collect()
+}
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+// ---------------- 授权凭证 ----------------
+
+/// 授权凭证里的内容
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LicenseClaims {
     pub v: u32,
     pub plugin: String,
-    /// 账户 id（平台内部的公开 id）
-    pub account: String,
+    /// 账号 id
+    pub uid: i64,
     /// 设备 public id
-    pub device: String,
-    pub machine: String,
-    pub issued_ms: i64,
-    pub expires_ms: i64,
-    /// 过了这个时间就该续期（一般是有效期过半）
-    pub renew_after_ms: i64,
-    /// 追查用的水印（每次签发不同，平台记着是谁）
-    pub watermark: String,
-    /// 解开 [`PluginData`] 的密钥（base64url，32 字节）：同一账户 × 设备 × 插件不变，续期后缓存的数据照样能解
-    pub data_key: String,
+    pub did: String,
+    /// 插件报的机器指纹（哈希过的），凭证只在这台机器上有效
+    pub mach: String,
+    /// 签发、到期时间（Unix 秒）
+    pub iat: i64,
+    pub exp: i64,
+    /// 管理后台给的授权什么时候到期（界面上显示）
+    pub ent_exp: i64,
+    /// 水印：每次签发不同，泄露了能查到是谁
+    pub wm: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SignedLicense {
-    pub kid: String,
-    /// base64url(JSON [`LicenseClaims`])
-    pub payload: String,
-    pub sig: String,
+const LICENSE_TAG: &str = "LL1L";
+
+fn license_message(kid: &str, payload: &str) -> String {
+    format!("LL1-PLUGIN-LICENSE\n{kid}\n{payload}")
 }
 
-pub fn license_canonical(payload_b64: &str) -> String {
-    format!("LL1-PLUGIN-LIC\n{payload_b64}")
+/// 签发：`LL1L.<kid>.<内容 base64url>.<签名 base64url>`
+pub fn issue_license(key: &SigningKey, kid: &str, claims: &LicenseClaims) -> String {
+    let payload = b64(&serde_json::to_vec(claims).expect("claims"));
+    let sig = b64(&key.sign(license_message(kid, &payload).as_bytes()).to_bytes());
+    format!("{LICENSE_TAG}.{kid}.{payload}.{sig}")
 }
 
-pub fn sign_license(key: &SigningKey, kid: &str, claims: &LicenseClaims) -> SignedLicense {
-    let payload = b64(&serde_json::to_vec(claims).expect("license json"));
-    let sig = sign(key, &license_canonical(&payload));
-    SignedLicense { kid: kid.to_string(), payload, sig }
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LicenseError {
+    Malformed,
+    UnknownKey,
+    BadSignature,
+    WrongPlugin,
+    WrongMachine,
+    Expired,
 }
 
-/// 验签并取出内容（不检查时间：调用方按自己的可信时间判断 `expires_ms`）。
-pub fn verify_license(keys: &HashMap<String, VerifyingKey>, lic: &SignedLicense, plugin: &str) -> Option<LicenseClaims> {
-    let key = keys.get(&lic.kid)?;
-    if !verify(key, &license_canonical(&lic.payload), &lic.sig) {
-        return None;
+/// 插件验凭证：签名、插件名、机器、有没有过期（`now` 是 Unix 秒）
+pub fn verify_license(keys: &[(String, VerifyingKey)], token: &str, plugin: &str, machine: &str, now: i64) -> Result<LicenseClaims, LicenseError> {
+    let parts: Vec<&str> = token.trim().split('.').collect();
+    let [tag, kid, payload, sig] = parts.as_slice() else { return Err(LicenseError::Malformed) };
+    if *tag != LICENSE_TAG {
+        return Err(LicenseError::Malformed);
     }
-    let claims: LicenseClaims = serde_json::from_slice(&b64_decode(&lic.payload)?).ok()?;
-    (claims.v == LICENSE_VERSION && claims.plugin == plugin).then_some(claims)
+    let key = keys.iter().find(|(k, _)| k == kid).map(|(_, k)| k).ok_or(LicenseError::UnknownKey)?;
+    if !verify_raw(key, license_message(kid, payload).as_bytes(), sig) {
+        return Err(LicenseError::BadSignature);
+    }
+    let claims: LicenseClaims = b64_decode(payload).and_then(|b| serde_json::from_slice(&b).ok()).ok_or(LicenseError::Malformed)?;
+    if claims.plugin != plugin {
+        return Err(LicenseError::WrongPlugin);
+    }
+    if claims.mach != machine {
+        return Err(LicenseError::WrongMachine);
+    }
+    if now >= claims.exp {
+        return Err(LicenseError::Expired);
+    }
+    Ok(claims)
 }
 
-// ---------------------------------------------------------------- 按凭证下发的数据
+/// 凭证最长多久（之后联网续期）
+pub const LICENSE_TTL_SECS: i64 = 7 * 24 * 3600;
+/// 机器指纹：插件把自己算的原始指纹哈希一下再交出去（不把 machine-id 原样传给服务端）
+pub fn machine_digest(raw: &str) -> String {
+    sha256_hex(format!("looklook-plugin-machine\n{raw}").as_bytes())[..32].to_string()
+}
 
-/// [`HOST_DATA_PATH`] / [`client_data_path`] 的响应。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PluginData {
-    /// 数据版本（插件据此判断缓存是否过时）
+// ---------------- 客户端 ↔ 服务端 ----------------
+
+/// `GET /api/client/v1/plugins?platform=…`：这个平台能装的插件，和这个账号的授权
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CatalogItem {
+    pub name: String,
     pub version: String,
-    /// 水印（与凭证里的对应）
-    pub watermark: String,
-    /// [`seal`] 的结果
-    pub blob: String,
+    pub platform: String,
+    pub size: u64,
+    pub title: BTreeMap<String, String>,
+    #[serde(default)]
+    pub description: BTreeMap<String, String>,
+    #[serde(default)]
+    pub icon: String,
+    #[serde(default)]
+    pub min_client: String,
+    /// 这个账号有没有有效授权、授权到什么时候（RFC 3339）
+    pub licensed: bool,
+    #[serde(default)]
+    pub expires_at: Option<String>,
 }
 
-/// 用 `data_key` 加密：base64url(nonce(24) || ciphertext)。
-pub fn seal(key_b64: &str, plain: &[u8], nonce: [u8; 24]) -> Option<String> {
-    let key: [u8; 32] = b64_decode(key_b64)?.try_into().ok()?;
-    let ct = XChaCha20Poly1305::new(&key.into()).encrypt(XNonce::from_slice(&nonce), plain).ok()?;
-    let mut out = nonce.to_vec();
-    out.extend_from_slice(&ct);
-    Some(b64(&out))
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Catalog {
+    pub items: Vec<CatalogItem>,
 }
 
-pub fn open(key_b64: &str, blob: &str) -> Option<Vec<u8>> {
-    let key: [u8; 32] = b64_decode(key_b64)?.try_into().ok()?;
-    let raw = b64_decode(blob)?;
-    if raw.len() < 24 + 16 {
-        return None;
-    }
-    let (nonce, ct) = raw.split_at(24);
-    XChaCha20Poly1305::new(&key.into()).decrypt(XNonce::from_slice(nonce), ct).ok()
+/// `GET /api/client/v1/plugins/{name}/release?platform=…`：签过名的 `release.json` 原文（base64url）和签名
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SignedRelease {
+    pub release: String,
+    pub sig: ReleaseSig,
 }
 
-// ---------------------------------------------------------------- 界面消息（postMessage）
+/// `POST /api/client/v1/plugins/{name}/license`
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LicenseRequest {
+    pub machine: String,
+    #[serde(default)]
+    pub version: String,
+}
 
-/// 管理台与插件 iframe 之间的 `postMessage`：`{ "ll": "plugin", "v": 1, "type": …, … }`。
-/// 管理台 → 插件：`init`（theme、locale、device、conn）、`theme`、`locale`、`device`、`conn`、`back`（手机返回键）；
-/// 插件 → 管理台：`ready`、`title`（text）、`fullscreen`（on）、`back-result`（handled）、`navigate`（to：管理台路径）、`toast`（text、kind）。
-pub const UI_MESSAGE_TAG: &str = "plugin";
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LicenseResponse {
+    pub token: String,
+    /// 凭证到期（Unix 秒）、授权到期（RFC 3339）
+    pub exp: i64,
+    pub expires_at: String,
+}
+
+pub fn catalog_path() -> &'static str {
+    "/api/client/v1/plugins"
+}
 
 #[cfg(test)]
 mod tests {
@@ -652,106 +357,83 @@ mod tests {
     fn manifest() -> Manifest {
         Manifest {
             name: "browser".into(),
-            version: "1.0.0".into(),
-            protocol: ProtocolRange { min: 1, max: 1 },
-            min_client: "1.87.0".into(),
-            platforms: vec!["linux-x86_64".into()],
-            exec: "bin/looklook-browser".into(),
-            title: Localized { zh: "远程浏览器".into(), en: "Remote browser".into() },
-            description: Localized::default(),
+            version: "1.2.0".into(),
+            protocol: PROTOCOL,
+            min_client: "1.88.0".into(),
+            title: BTreeMap::from([("zh-CN".into(), "远程浏览器".into()), ("en-US".into(), "Remote browser".into())]),
+            description: BTreeMap::new(),
             icon: "globe".into(),
-            entries: vec![Entry { id: "main".into(), title: Localized { zh: "远程浏览器".into(), en: String::new() }, icon: "globe".into(), path: String::new() }],
-            capabilities: Capabilities::default(),
+            exec: "bin/looklook-browser".into(),
             autostart_if_exists: Some("run.json".into()),
-            readonly_policy: ReadonlyPolicy::Deny,
-            inject_web_prefixes: vec!["view/".into()],
-            idle_stop_minutes: 10,
-            requires_license: true,
+            open_url: true,
         }
     }
 
     #[test]
-    fn names_and_paths() {
-        assert!(valid_name("browser") && valid_name("a1-b"));
-        assert!(!valid_name("B") && !valid_name("1a") && !valid_name("a") && !valid_name("a-") && !valid_name("a_b"));
-        assert_eq!(plugin_of_path("/api/plugins/browser/start"), Some("browser"));
-        assert_eq!(plugin_of_path("/p/browser/view/?x=1"), Some("browser"));
-        assert_eq!(plugin_of_path("/p/browser"), Some("browser"));
+    fn names_versions_paths() {
+        assert!(valid_name("browser") && valid_name("my-tool2"));
+        assert!(!valid_name("B") && !valid_name("1abc") && !valid_name("a/b") && !valid_name(&"a".repeat(33)));
+        assert!(valid_version("1.0.12") && valid_version("2.0.0-beta.1"));
+        assert!(!valid_version("1.0") && !valid_version("1.0.x") && !valid_version("1..0"));
+        assert_eq!(version_cmp("1.10.0", "1.9.9"), std::cmp::Ordering::Greater);
+        assert_eq!(version_cmp("1.2.3-rc.1", "1.2.3"), std::cmp::Ordering::Equal);
+        assert_eq!(plugin_of_path("/p/browser/view/"), Some("browser"));
+        assert_eq!(plugin_of_path("/api/plugins/browser/status"), Some("browser"));
         assert_eq!(plugin_of_path("/p/../x"), None);
         assert_eq!(plugin_of_path("/api/instances/x"), None);
-        assert_eq!(page_url("browser", "/view/"), "/p/browser/view/");
-        assert_eq!(api_url("browser", "open-url"), "/api/plugins/browser/open-url");
+        assert!(valid_platform(&current_platform()));
     }
 
     #[test]
-    fn manifest_roundtrip_and_checks() {
+    fn manifest_checks() {
         let m = manifest();
-        let bytes = serde_json::to_vec(&m).unwrap();
-        assert_eq!(Manifest::parse(&bytes).unwrap(), m);
-        assert!(m.supports_protocol(1) && !m.supports_protocol(2));
-        assert!(m.wants_web_inject("/p/browser/view/") && !m.wants_web_inject("/p/browser/") && !m.wants_web_inject("/p/other/view/"));
-        let mut bad = m.clone();
-        bad.exec = "../x".into();
-        assert_eq!(bad.validate(), Err("exec"));
-        // 缺省字段
-        let v = serde_json::json!({"name":"x1","version":"1","protocol":{"min":1,"max":1},"platforms":["linux-x86_64"],"exec":"x","title":{"zh-CN":"X"}});
-        let m2 = Manifest::parse(&serde_json::to_vec(&v).unwrap()).unwrap();
-        assert_eq!(m2.idle_stop_minutes, 10);
-        assert_eq!(m2.readonly_policy, ReadonlyPolicy::Deny);
+        assert!(m.validate().is_ok());
+        assert_eq!(m.title_for("zh-CN"), "远程浏览器");
+        assert_eq!(m.title_for("ja"), "Remote browser");
+        for bad in ["/usr/bin/x", "../x", "bin/../../x", "", "bin\\x", "./x"] {
+            assert!(Manifest { exec: bad.into(), ..manifest() }.validate().is_err(), "{bad}");
+        }
+        assert!(Manifest { autostart_if_exists: Some("../run.json".into()), ..manifest() }.validate().is_err());
+        assert!(Manifest { title: BTreeMap::new(), ..manifest() }.validate().is_err());
     }
 
     #[test]
-    fn package_signature() {
-        let k = SigningKey::from_bytes(&[3u8; 32]);
-        let mut files = BTreeMap::new();
-        files.insert(MANIFEST_FILE.to_string(), sha256_hex(b"{}"));
-        let idx = PackageIndex { name: "browser".into(), version: "1".into(), target: "linux-x86_64".into(), files, executables: vec![] };
-        let bytes = serde_json::to_vec(&idx).unwrap();
-        assert!(PackageIndex::parse(&bytes).is_ok());
-        let sig = sign_package(&k, "k1", &bytes);
-        let keys = HashMap::from([("k1".to_string(), k.verifying_key())]);
-        assert!(verify_package(&keys, &bytes, &sig));
-        assert!(!verify_package(&keys, b"{}", &sig));
-        assert!(!verify_package(&HashMap::new(), &bytes, &sig));
-        let mut evil = idx.clone();
-        evil.files.insert("../x".into(), sha256_hex(b""));
-        assert!(PackageIndex::parse(&serde_json::to_vec(&evil).unwrap()).is_err());
+    fn release_signature() {
+        let sk = SigningKey::from_bytes(&[7u8; 32]);
+        let keys = parse_keys(&format!("pk1={}, junk, pk2=notakey", b64(sk.verifying_key().as_bytes())));
+        assert_eq!(keys.len(), 1);
+        let r = Release { name: "browser".into(), version: "1.2.0".into(), platform: "linux-x86_64".into(), sha256: "a".repeat(64), size: 10, manifest: manifest(), published_at: String::new() };
+        let raw = serde_json::to_vec(&r).unwrap();
+        let sig = sign_release(&sk, "pk1", &raw);
+        assert_eq!(verify_release(&keys, &raw, &sig).unwrap(), r);
+        let mut tampered = raw.clone();
+        tampered[10] ^= 1;
+        assert!(verify_release(&keys, &tampered, &sig).is_err());
+        assert!(verify_release(&keys, &raw, &ReleaseSig { kid: "pk9".into(), ..sig.clone() }).is_err());
+        let other = SigningKey::from_bytes(&[8u8; 32]);
+        assert!(verify_release(&keys, &raw, &sign_release(&other, "pk1", &raw)).is_err());
+        // 清单和发布对不上
+        let bad = Release { version: "9.9.9".into(), ..r };
+        let raw = serde_json::to_vec(&bad).unwrap();
+        assert!(verify_release(&keys, &raw, &sign_release(&sk, "pk1", &raw)).is_err());
     }
 
     #[test]
-    fn license_and_data() {
-        let k = SigningKey::from_bytes(&[5u8; 32]);
-        let key = b64(&[9u8; 32]);
-        let c = LicenseClaims {
-            v: LICENSE_VERSION,
-            plugin: "browser".into(),
-            account: "u1".into(),
-            device: "d1".into(),
-            machine: "m".into(),
-            issued_ms: 1,
-            expires_ms: 2,
-            renew_after_ms: 1,
-            watermark: "w".into(),
-            data_key: key.clone(),
-        };
-        let lic = sign_license(&k, "p1", &c);
-        let keys = HashMap::from([("p1".to_string(), k.verifying_key())]);
-        assert_eq!(verify_license(&keys, &lic, "browser"), Some(c));
-        assert_eq!(verify_license(&keys, &lic, "other"), None);
-        let mut t = lic.clone();
-        t.payload.push('A');
-        assert_eq!(verify_license(&keys, &t, "browser"), None);
-        let blob = seal(&key, b"hello", [1u8; 24]).unwrap();
-        assert_eq!(open(&key, &blob).as_deref(), Some(&b"hello"[..]));
-        assert_eq!(open(&b64(&[8u8; 32]), &blob), None);
-    }
-
-    #[test]
-    fn open_url_json() {
-        let r = OpenUrlResponse::Confirm { id: "switch".into(), title: "t".into(), body: "b".into(), confirm: "c".into(), danger: false };
-        let v = serde_json::to_value(&r).unwrap();
-        assert_eq!(v["result"], "confirm");
-        let o: OpenUrlResponse = serde_json::from_str(r#"{"result":"opened"}"#).unwrap();
-        assert_eq!(o, OpenUrlResponse::Opened { navigate: None });
+    fn license_roundtrip() {
+        let sk = SigningKey::from_bytes(&[9u8; 32]);
+        let keys = vec![("p1".to_string(), sk.verifying_key())];
+        let mach = machine_digest("machine-id-1");
+        let c = LicenseClaims { v: 1, plugin: "browser".into(), uid: 5, did: "dev1".into(), mach: mach.clone(), iat: 100, exp: 200, ent_exp: 300, wm: "w".into() };
+        let t = issue_license(&sk, "p1", &c);
+        assert_eq!(verify_license(&keys, &t, "browser", &mach, 150).unwrap(), c);
+        assert_eq!(verify_license(&keys, &t, "browser", &mach, 200), Err(LicenseError::Expired));
+        assert_eq!(verify_license(&keys, &t, "other", &mach, 150), Err(LicenseError::WrongPlugin));
+        assert_eq!(verify_license(&keys, &t, "browser", "x", 150), Err(LicenseError::WrongMachine));
+        assert_eq!(verify_license(&[], &t, "browser", &mach, 150), Err(LicenseError::UnknownKey));
+        assert_eq!(verify_license(&keys, "nope", "browser", &mach, 150), Err(LicenseError::Malformed));
+        // 改了内容（比如把到期时间往后挪）签名就不对了
+        let mut parts: Vec<String> = t.split('.').map(String::from).collect();
+        parts[2] = b64(&serde_json::to_vec(&LicenseClaims { exp: 9_999_999_999, ..c }).unwrap());
+        assert_eq!(verify_license(&keys, &parts.join("."), "browser", &mach, 150), Err(LicenseError::BadSignature));
     }
 }

@@ -30,6 +30,7 @@ pub enum Agent {
     Codex,
     OpenCode,
     Dsh,
+    /// Antigravity CLI（`agy`）
     Agy,
 }
 
@@ -57,7 +58,7 @@ impl Agent {
         }
     }
 
-    /// 配置目录：`~/.claude` / `~/.codex` / `~/.config/opencode` / `~/.dsh` / `~/.gemini/config`
+    /// 配置目录：`~/.claude` / `~/.codex` / `~/.config/opencode` / `~/.dsh` / `~/.gemini/config`（agy）
     pub(crate) fn dir(self) -> PathBuf {
         let env = |k: &str| std::env::var_os(k).filter(|v| !v.is_empty()).map(PathBuf::from);
         match self {
@@ -72,35 +73,6 @@ impl Agent {
 
     fn skills_dir(self) -> PathBuf {
         self.dir().join("skills")
-    }
-}
-
-/// Antigravity CLI 数据目录（`~/.gemini/antigravity-cli`）
-pub fn agy_data_dir() -> PathBuf {
-    home().join(".gemini").join("antigravity-cli")
-}
-
-/// 找 `agy` 命令：先在登录 shell 的 PATH 里找；找不到看 `~/.local/bin/agy` 和 `~/.gemini/antigravity-cli/bin/agy`
-pub async fn agy_cli(shell: &str) -> Option<String> {
-    crate::tools::detect(shell).await.agy.or_else(agy_fallback)
-}
-
-pub fn agy_fallback() -> Option<String> {
-    let exe = if cfg!(windows) { "agy.exe" } else { "agy" };
-    [home().join(".local").join("bin").join(exe), agy_data_dir().join("bin").join(exe)]
-        .into_iter()
-        .find(|p| p.is_file())
-        .map(|p| p.display().to_string())
-}
-
-/// 新开的 Antigravity 终端用什么启动：PATH 里有 `agy` 就照常用名字（返回 None）；没有时用 [`agy_fallback`] 找到的完整路径。
-pub fn agy_launch_program() -> Option<String> {
-    let names: &[&str] = if cfg!(windows) { &["agy.exe", "agy.cmd", "agy.bat"] } else { &["agy"] };
-    let on_path = std::env::var_os("PATH").is_some_and(|p| std::env::split_paths(&p).any(|d| names.iter().any(|n| d.join(n).is_file())));
-    if on_path {
-        None
-    } else {
-        agy_fallback()
     }
 }
 
@@ -123,6 +95,28 @@ fn claude_json() -> PathBuf {
 /// 再找不到就用 Claude 桌面版自带的那一份（见 [`claude_desktop_bundled`]）。
 pub async fn claude_cli(shell: &str) -> Option<String> {
     crate::tools::detect(shell).await.claude.or_else(claude_fallback)
+}
+
+/// Antigravity CLI 的数据目录（会话、设置）：`~/.gemini/antigravity-cli`
+pub fn agy_data_dir() -> PathBuf {
+    home().join(".gemini").join("antigravity-cli")
+}
+
+/// PATH 里找不到 `agy` 时：官方安装器放在 `~/.local/bin/agy`
+pub fn agy_fallback() -> Option<String> {
+    let exe = if cfg!(windows) { "agy.exe" } else { "agy" };
+    Some(home().join(".local").join("bin").join(exe)).filter(|p| p.is_file()).map(|p| p.display().to_string())
+}
+
+/// 新开的 agy 终端用什么启动：PATH 里有 `agy` 就照常用名字（None），没有时用 [`agy_fallback`] 找到的完整路径
+pub fn agy_launch_program() -> Option<String> {
+    let names: &[&str] = if cfg!(windows) { &["agy.exe", "agy.cmd"] } else { &["agy"] };
+    let on_path = std::env::var_os("PATH").is_some_and(|p| std::env::split_paths(&p).any(|d| names.iter().any(|n| d.join(n).is_file())));
+    if on_path {
+        None
+    } else {
+        agy_fallback()
+    }
 }
 
 pub fn claude_fallback() -> Option<String> {
@@ -304,7 +298,7 @@ pub async fn status(shell: &str, url: &str, token: &str) -> Vec<Status> {
                     Agent::Dsh => found.dsh.is_some(),
                     Agent::Agy => found.agy.is_some(),
                 };
-                let available = cli || a.dir().is_dir() || (a == Agent::Agy && agy_data_dir().is_dir());
+                let available = cli || a.dir().is_dir();
                 let configured = match a {
                     Agent::Claude => claude_mcp(&url, &tok),
                     Agent::Codex => codex_mcp(&url, &tok),
@@ -356,6 +350,16 @@ fn opencode_mcp(url: &str, token: &str) -> &'static str {
     judge(Some(e["url"].as_str().unwrap_or("")), e["headers"]["Authorization"].as_str(), url, token)
 }
 
+fn agy_mcp(url: &str, token: &str) -> &'static str {
+    let Ok(raw) = std::fs::read_to_string(agy_mcp_json()) else { return "none" };
+    let Ok(v) = serde_json::from_str::<Value>(&raw) else { return "none" };
+    let e = &v["mcpServers"][SERVER_NAME];
+    if e.is_null() || e["disabled"] == true {
+        return "none";
+    }
+    judge(Some(e["serverUrl"].as_str().unwrap_or("")), e["headers"]["Authorization"].as_str(), url, token)
+}
+
 fn dsh_mcp(url: &str, token: &str) -> &'static str {
     let Ok(raw) = std::fs::read_to_string(dsh_patch()) else { return "none" };
     let Some(block) = dsh_block(&raw) else { return "none" };
@@ -364,17 +368,6 @@ fn dsh_mcp(url: &str, token: &str) -> &'static str {
         block.lines().find_map(|l| l.trim().strip_prefix(key)?.strip_prefix(": ").and_then(|v| serde_json::from_str::<String>(v).ok()))
     };
     judge(Some(field("url").as_deref().unwrap_or("")), field("Authorization").as_deref(), url, token)
-}
-
-fn agy_mcp(url: &str, token: &str) -> &'static str {
-    let Ok(raw) = std::fs::read_to_string(agy_mcp_json()) else { return "none" };
-    let Ok(v) = serde_json::from_str::<Value>(&raw) else { return "none" };
-    let e = &v["mcpServers"][SERVER_NAME];
-    if e.is_null() || e["disabled"].as_bool() == Some(true) {
-        return "none";
-    }
-    let entry_url = e["serverUrl"].as_str().or_else(|| e["url"].as_str()).unwrap_or("");
-    judge(Some(entry_url), e["headers"]["Authorization"].as_str(), url, token)
 }
 
 // ---------------- 安装 / 卸载 ----------------
@@ -558,37 +551,6 @@ fn opencode_edit(raw: &str, entry: Option<(&str, &str)>) -> anyhow::Result<Optio
     Ok(Some(serde_json::to_string_pretty(&doc)? + "\n"))
 }
 
-/// 改 Antigravity 的 `~/.gemini/config/mcp_config.json`；返回新的文件内容，没有要改的返回 `None`。
-fn agy_edit(raw: &str, entry: Option<(&str, &str)>) -> anyhow::Result<Option<String>> {
-    let mut doc: Value = if raw.trim().is_empty() {
-        serde_json::json!({})
-    } else {
-        serde_json::from_str(raw).map_err(|e| anyhow::anyhow!("mcp_config.json: {e}"))?
-    };
-    let root = doc.as_object_mut().ok_or_else(|| anyhow::anyhow!("mcp_config.json: not an object"))?;
-    match entry {
-        Some((url, token)) => {
-            let servers = root.entry("mcpServers").or_insert_with(|| Value::Object(Default::default()));
-            let servers = servers.as_object_mut().ok_or_else(|| anyhow::anyhow!("mcp_config.json: mcpServers is not an object"))?;
-            servers.insert(
-                SERVER_NAME.into(),
-                serde_json::json!({
-                    "serverUrl": url,
-                    "headers": { "Authorization": format!("Bearer {token}") },
-                    "disabled": false,
-                }),
-            );
-        }
-        None => {
-            let Some(servers) = root.get_mut("mcpServers").and_then(|m| m.as_object_mut()) else { return Ok(None) };
-            if servers.shift_remove(SERVER_NAME).is_none() {
-                return Ok(None);
-            }
-        }
-    }
-    Ok(Some(serde_json::to_string_pretty(&doc)? + "\n"))
-}
-
 const DSH_BEGIN: &str = "# >>> looklook (managed by Looklook; changes inside are overwritten) >>>";
 const DSH_END: &str = "# <<< looklook <<<";
 
@@ -598,6 +560,30 @@ fn marked_range(raw: &str, begin: &str, end_mark: &str) -> Option<std::ops::Rang
     let end = start + raw[start..].find(end_mark)? + end_mark.len();
     let end = if raw[end..].starts_with("\r\n") { end + 2 } else if raw[end..].starts_with('\n') { end + 1 } else { end };
     Some(start..end)
+}
+
+/// 改 Antigravity 的 `~/.gemini/config/mcp_config.json`（和 `agy mcp add` 写的一样：`serverUrl`、`headers`、`disabled`）
+fn agy_edit(raw: &str, entry: Option<(&str, &str)>) -> anyhow::Result<Option<String>> {
+    let mut doc: Value = if raw.trim().is_empty() { serde_json::json!({}) } else { serde_json::from_str(raw).map_err(|e| anyhow::anyhow!("mcp_config.json: {e}"))? };
+    let root = doc.as_object_mut().ok_or_else(|| anyhow::anyhow!("mcp_config.json: not an object"))?;
+    match entry {
+        Some((url, token)) => {
+            let servers = root.entry("mcpServers").or_insert_with(|| serde_json::json!({}));
+            let servers = servers.as_object_mut().ok_or_else(|| anyhow::anyhow!("mcp_config.json: mcpServers is not an object"))?;
+            let want = serde_json::json!({ "disabled": false, "headers": { "Authorization": format!("Bearer {token}") }, "serverUrl": url });
+            if servers.get(SERVER_NAME) == Some(&want) {
+                return Ok(None);
+            }
+            servers.insert(SERVER_NAME.to_string(), want);
+        }
+        None => {
+            let Some(servers) = root.get_mut("mcpServers").and_then(Value::as_object_mut) else { return Ok(None) };
+            if servers.shift_remove(SERVER_NAME).is_none() {
+                return Ok(None);
+            }
+        }
+    }
+    Ok(Some(serde_json::to_string_pretty(&doc)? + "\n"))
 }
 
 fn dsh_block(raw: &str) -> Option<&str> {
@@ -805,6 +791,24 @@ mod tests {
     }
 
     #[test]
+    fn agy_config_roundtrip() {
+        let raw = "{\n  \"mcpServers\": { \"other\": { \"serverUrl\": \"x\" } }\n}";
+        let out = agy_edit(raw, Some(("http://127.0.0.1:1234/mcp", "llmcp_a"))).unwrap().unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["mcpServers"]["looklook"], serde_json::json!({ "disabled": false, "headers": { "Authorization": "Bearer llmcp_a" }, "serverUrl": "http://127.0.0.1:1234/mcp" }));
+        assert_eq!(v["mcpServers"]["other"]["serverUrl"], "x", "别人的不动");
+        assert!(agy_edit(&out, Some(("http://127.0.0.1:1234/mcp", "llmcp_a"))).unwrap().is_none(), "一样的不重写");
+        let removed = agy_edit(&out, None).unwrap().unwrap();
+        assert!(!removed.contains("looklook") && removed.contains("other"));
+        assert!(agy_edit(&removed, None).unwrap().is_none());
+        assert!(agy_edit("", None).unwrap().is_none());
+        let fresh: Value = serde_json::from_str(&agy_edit("", Some(("u", "t"))).unwrap().unwrap()).unwrap();
+        assert_eq!(fresh["mcpServers"]["looklook"]["serverUrl"], "u");
+        assert!(agy_edit("[]", Some(("u", "t"))).is_err());
+        assert_eq!(from_client_name("antigravity-cli"), Some(Agent::Agy));
+    }
+
+    #[test]
     fn dsh_config_roundtrip() {
         let raw = "# mine\n- id: tools\n  disabled: true";
         let out = dsh_edit(raw, Some(("http://127.0.0.1:1234/mcp", "llmcp_a"))).unwrap().unwrap();
@@ -857,27 +861,10 @@ mod tests {
     }
 
     #[test]
-    fn agy_config_roundtrip() {
-        let raw = "{\n  \"mcpServers\": { \"other\": { \"command\": \"x\" } }\n}";
-        let out = agy_edit(raw, Some(("http://127.0.0.1:1234/mcp", "llmcp_a"))).unwrap().unwrap();
-        let v: Value = serde_json::from_str(&out).unwrap();
-        assert_eq!(v["mcpServers"]["looklook"]["serverUrl"], "http://127.0.0.1:1234/mcp");
-        assert_eq!(v["mcpServers"]["looklook"]["headers"]["Authorization"], "Bearer llmcp_a");
-        assert_eq!(v["mcpServers"]["looklook"]["disabled"], false);
-        assert_eq!(v["mcpServers"]["other"]["command"], "x");
-        let removed = agy_edit(&out, None).unwrap().unwrap();
-        assert!(!removed.contains("looklook") && removed.contains("\"other\""));
-        assert!(agy_edit(&removed, None).unwrap().is_none());
-        let fresh: Value = serde_json::from_str(&agy_edit("", Some(("u", "t"))).unwrap().unwrap()).unwrap();
-        assert_eq!(fresh["mcpServers"]["looklook"]["serverUrl"], "u");
-    }
-
-    #[test]
     fn client_names() {
         assert_eq!(from_client_name("claude-code"), Some(Agent::Claude));
         assert_eq!(from_client_name("codex-mcp-client"), Some(Agent::Codex));
         assert_eq!(from_client_name("opencode"), Some(Agent::OpenCode));
-        assert_eq!(from_client_name("Antigravity"), Some(Agent::Agy));
         assert_eq!(from_client_name("mcp-inspector"), None);
     }
 

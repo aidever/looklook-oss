@@ -370,9 +370,9 @@ impl Agent for Dsh {
     }
 }
 
-// ---------------- Antigravity (agy) ----------------
+// ---------------- Antigravity ----------------
 
-/// Antigravity (agy) 不在终端里跑：对话由看看直接通过 `agy acp` 驱动（`agy_chat.rs`），没有屏幕、没有 hooks
+/// agy 也不在终端里跑：对话由看看通过 `agy acp` 驱动（`agy_chat.rs`），没有屏幕、没有 hooks
 pub struct Agy;
 
 impl Agent for Agy {
@@ -380,6 +380,7 @@ impl Agent for Agy {
         "agy"
     }
 
+    /// 记录不是文件，是内存里按会话的那份：`agy/<会话>`
     fn valid_transcript(&self, p: &Path) -> bool {
         super::agy_log::session_of(p).is_some_and(super::agy_log::valid_session)
     }
@@ -396,6 +397,7 @@ impl Agent for Agy {
         Live::default()
     }
 
+    /// agy 的审批只有工具审批（它的提问是普通回复，用户下一句话回答）
     fn pending_kind(&self, _tool: &str) -> &'static str {
         "permission"
     }
@@ -408,12 +410,14 @@ impl Agent for Agy {
         None
     }
 
+    /// 斜杠命令从 agy 报的清单里来（`agy_commands`）
     fn commands(&self, _workdir: &Path) -> Value {
         json!([])
     }
 
+    /// 能选模型和思考强度、换权限模式、发图片；“本会话都允许”要 agy 给了 `allow_always` 才有，界面上不单独显示
     fn caps(&self) -> Value {
-        json!({ "allow_session": true, "allow_dirs": false, "images": true, "user_images": true, "plan": false, "questions": false, "models": true, "usage": true, "mode": true })
+        json!({ "allow_session": false, "allow_dirs": false, "images": true, "user_images": false, "plan": false, "questions": false, "models": true, "usage": true, "mode": true })
     }
 
     fn session_starts_on_prompt(&self) -> bool {
@@ -433,6 +437,9 @@ mod tests {
     fn picks_adapter_by_launch() {
         assert_eq!(for_launch("claude").map(|a| a.launch()), Some("claude"));
         assert_eq!(for_launch("codex").map(|a| a.launch()), Some("codex"));
+        assert_eq!(for_launch("agy").map(|a| a.launch()), Some("agy"));
+        assert!(Agy.valid_transcript(Path::new("agy/a4bdcd21-6008-4367-95ac-0c4869deac85")));
+        assert!(!Agy.valid_transcript(Path::new("agy/../../etc/passwd")));
         assert!(for_launch("shell").is_none());
     }
 

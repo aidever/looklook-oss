@@ -1,390 +1,453 @@
-//! 通用插件管理（docs/BROWSER_PLUGIN_DESIGN_2026-11-19.md）。
+//! 通用插件（docs/BROWSER_PLUGIN_DESIGN_2026-11-19.md）：看看不认识任何具体插件，只按协议
+//! （`looklook_protocol::plugin`）装、起、转发。
 //!
-//! 看看只负责发现、离线公钥验签、安装/空闲更新、按需启停、短路径 Unix socket 通信与状态缓存，
-//! 不认识任何具体插件。代码目录（`<home>/plugins/<名>/`）与持久化数据目录
-//! （`<home>/plugin-data/<名>/`）分离，更新或重装插件不会删除用户数据。
+//! - **装**：从服务端取这个平台签过名的 `release.json`（服务端查这个账号有没有这个插件的授权），用编译时内置的公钥
+//!   （`LOOKLOOK_PLUGIN_KEYS`）验签，下载包、核对大小和 SHA-256，解到临时目录、核对包里的清单和签过名的一致，
+//!   再整个换到 `<数据目录>/plugins/<名>/`。签名、哈希、清单有一处不对就不装。
+//! - **数据**：`<数据目录>/plugin-data/<名>/`，更新、卸载插件都不动它。
+//! - **起**：用到时才起（打开页面、调接口）；数据目录里有清单 `autostart_if_exists` 指的文件时，看看启动后马上起
+//!   （例如浏览器还在后台跑，要接回来）。插件是看看的子进程（Linux 上看看退出它也退出），监听看看给的 Unix Socket，
+//!   只认带口令（[`proto::HDR_TOKEN`]）的请求。崩了下次用到时再起。
+//! - **授权**：插件自己验凭证；看看只在插件调宿主接口 `/_host/license` 时，用这台设备的身份代它向服务端申请
+//!   （[`Plugins::license`]），不碰凭证内容。
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::io::Read;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use anyhow::{bail, Context, Result};
-use bytes::Bytes;
 use ed25519_dalek::VerifyingKey;
-use http_body_util::{BodyExt, Full};
-use hyper::body::Incoming;
-use hyper::{Method, Request, StatusCode};
-use hyper_util::rt::TokioIo;
-use looklook_protocol::plugin::{
-    self as proto, Manifest, PackageIndex, PackageSignature, PluginStatus, PROTOCOL_VERSION,
-};
+use looklook_protocol::plugin::{self as proto, Manifest, Release, ReleaseSig};
 use serde::Serialize;
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
-use tokio::process::Child;
-use tokio_util::sync::CancellationToken;
 
-use crate::account::{Account, VERSION};
+use crate::account::Account;
 use crate::error::LocalError;
-use crate::paths;
-use crate::settings::Settings;
-use crate::store::Store;
+use crate::paths::Paths;
 
-/// 同一插件在 60 秒内崩溃超过此次数后暂停自动拉起，避免死循环。
-const CRASH_WINDOW: Duration = Duration::from_secs(60);
-const MAX_CRASHES: usize = 3;
-/// 启动后等 Unix socket 开始接收连接的上限。
-const START_TIMEOUT: Duration = Duration::from_secs(10);
-/// 优雅停机（POST /_plugin/shutdown）等待进程退出的上限。
-const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
-/// 空闲自动更新检查周期。
-const AUTO_UPDATE_INTERVAL: Duration = Duration::from_secs(6 * 3600);
-/// 插件日志单文件上限（超过后启动时截断重来）。
-const MAX_LOG_BYTES: u64 = 1 << 20;
+/// 包最大多少（防止服务端出错时无限下载）
+const PACKAGE_MAX: u64 = 1 << 30;
+/// 起插件最多等多久（等它的 Socket 能连上）
+const START_WAIT: Duration = Duration::from_secs(20);
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-fn rlock<T>(m: &RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
-    m.read().unwrap_or_else(|e| e.into_inner())
+fn err(code: &'static str, detail: impl std::fmt::Display) -> LocalError {
+    LocalError::new(code).with("detail", detail.to_string().chars().take(500).collect::<String>())
 }
 
-fn wlock<T>(m: &RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
-    m.write().unwrap_or_else(|e| e.into_inner())
-}
-
+/// 装好的插件
 #[derive(Debug, Clone)]
-pub struct InstalledPlugin {
-    pub manifest: Manifest,
+pub struct Installed {
+    pub release: Release,
     pub dir: PathBuf,
-    /// 不兼容原因（`PROTOCOL_UNSUPPORTED` / `CLIENT_TOO_OLD` / `PLATFORM_UNSUPPORTED`），为 Some 时拒绝启动
-    pub incompatible: Option<&'static str>,
 }
 
-/// 一次发往插件的转发连接信息（同时持有活跃连接计数，断开时刷新 `last_active_ms`）。
-pub struct RunningHandle {
-    pub manifest: Manifest,
-    pub socket: PathBuf,
-    pub token: String,
-    pub guard: ActiveGuard,
-}
-
-pub struct ActiveGuard {
-    conns: Arc<AtomicUsize>,
-    last_active_ms: Arc<AtomicI64>,
-}
-
-impl Drop for ActiveGuard {
-    fn drop(&mut self) {
-        self.conns.fetch_sub(1, Ordering::SeqCst);
-        self.last_active_ms.store(crate::util::system_ms(), Ordering::SeqCst);
+impl Installed {
+    pub fn manifest(&self) -> &Manifest {
+        &self.release.manifest
     }
 }
 
-struct RunningPlugin {
-    manifest: Manifest,
-    socket: PathBuf,
-    token: String,
-    child: Child,
-    conns: Arc<AtomicUsize>,
-    last_active_ms: Arc<AtomicI64>,
-    status: PluginStatus,
+/// 一个在跑的插件
+pub struct Proc {
+    pub socket: PathBuf,
+    pub token: String,
+    child: Mutex<Option<tokio::process::Child>>,
 }
 
-impl RunningPlugin {
-    fn handle(&self) -> RunningHandle {
-        self.conns.fetch_add(1, Ordering::SeqCst);
-        self.last_active_ms.store(crate::util::system_ms(), Ordering::SeqCst);
-        RunningHandle {
-            manifest: self.manifest.clone(),
-            socket: self.socket.clone(),
-            token: self.token.clone(),
-            guard: ActiveGuard { conns: self.conns.clone(), last_active_ms: self.last_active_ms.clone() },
+impl Proc {
+    pub fn alive(&self) -> bool {
+        lock(&self.child).as_mut().is_some_and(|c| matches!(c.try_wait(), Ok(None)))
+    }
+
+    fn kill(&self) {
+        if let Some(mut c) = lock(&self.child).take() {
+            let _ = c.start_kill();
         }
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
-pub struct InstallJob {
-    pub name: String,
-    pub state: &'static str, // "running" | "ok" | "failed"
-    pub step: &'static str,  // "ticket" | "download" | "verify" | "install" | "done"
-    pub received: u64,
-    pub total: u64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
+/// 装 / 更新的进度（界面轮询）
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct Job {
+    /// `download` | `verify` | `install` | `done` | `failed`
+    pub step: &'static str,
+    pub done: u64,
+    pub total: Option<u64>,
+    pub error: Option<Value>,
 }
 
 pub struct Plugins {
-    home: PathBuf,
-    keys: HashMap<String, VerifyingKey>,
-    host_url: RwLock<String>,
-    installed: RwLock<BTreeMap<String, InstalledPlugin>>,
-    running: Mutex<HashMap<String, RunningPlugin>>,
-    crashes: Mutex<HashMap<String, VecDeque<Instant>>>,
-    start_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
-    jobs: Mutex<HashMap<String, InstallJob>>,
-    gen: AtomicU64,
+    paths: Paths,
+    account: Arc<Account>,
+    keys: Vec<(String, VerifyingKey)>,
+    /// 插件调宿主接口（`/_host/*`）带的口令
+    host_token: String,
+    /// 管理台的本机地址（插件调宿主接口用），网关起来后设置
+    host_url: Mutex<Option<String>>,
+    running: tokio::sync::Mutex<HashMap<String, Arc<Proc>>>,
+    jobs: Mutex<HashMap<String, Job>>,
 }
 
 impl Plugins {
-    pub fn new(home: PathBuf, keys: HashMap<String, VerifyingKey>) -> Arc<Self> {
-        let p = Arc::new(Self {
-            home,
-            keys,
-            host_url: RwLock::new(String::new()),
-            installed: RwLock::new(BTreeMap::new()),
-            running: Mutex::new(HashMap::new()),
-            crashes: Mutex::new(HashMap::new()),
-            start_locks: Mutex::new(HashMap::new()),
+    pub fn new(paths: Paths, account: Arc<Account>, keys: &str) -> Arc<Self> {
+        Arc::new(Self {
+            paths,
+            account,
+            keys: proto::parse_keys(keys),
+            host_token: crate::util::random_secret(),
+            host_url: Mutex::new(None),
+            running: Default::default(),
             jobs: Mutex::new(HashMap::new()),
-            gen: AtomicU64::new(1),
-        });
-        p.scan();
-        p
+        })
     }
 
-    pub fn set_host_url(&self, url: String) {
-        *wlock(&self.host_url) = url;
+    pub fn set_host(&self, addr: std::net::SocketAddr) {
+        *lock(&self.host_url) = Some(format!("http://127.0.0.1:{}", addr.port()));
     }
 
-    pub fn plugins_dir(&self) -> PathBuf {
-        self.home.join("plugins")
+    /// 宿主接口的口令对不对
+    pub fn host_token_ok(&self, token: &str) -> bool {
+        let a = token.as_bytes();
+        let b = self.host_token.as_bytes();
+        a.len() == b.len() && a.iter().zip(b).fold(0u8, |x, (p, q)| x | (p ^ q)) == 0
+    }
+
+    fn root(&self) -> PathBuf {
+        self.paths.home.join("plugins")
+    }
+
+    pub fn dir(&self, name: &str) -> PathBuf {
+        self.root().join(name)
     }
 
     pub fn data_dir(&self, name: &str) -> PathBuf {
-        self.home.join("plugin-data").join(name)
+        self.paths.home.join("plugin-data").join(name)
     }
 
-    /// 扫描 `<home>/plugins/*`：只接受目录名合法且离线签名 + 文件哈希全部通过的插件。
-    pub fn scan(&self) {
-        let mut found = BTreeMap::new();
-        let Ok(rd) = std::fs::read_dir(self.plugins_dir()) else {
-            *wlock(&self.installed) = found;
-            return;
+    /// 装好的插件：签名重新验一遍（防止别的程序改了 `release.json`），清单的协议版本要对得上
+    pub fn installed(&self, name: &str) -> Result<Installed, LocalError> {
+        if !proto::valid_name(name) {
+            return Err(LocalError::new("PLUGIN_NOT_FOUND"));
+        }
+        let dir = self.dir(name);
+        let raw = std::fs::read(dir.join("release.json")).map_err(|_| LocalError::new("PLUGIN_NOT_INSTALLED").with("plugin", name))?;
+        let sig: ReleaseSig = std::fs::read(dir.join("release.sig")).ok().and_then(|b| serde_json::from_slice(&b).ok()).ok_or_else(|| LocalError::new("PLUGIN_INVALID").with("plugin", name))?;
+        let release = proto::verify_release(&self.keys, &raw, &sig).map_err(|e| err("PLUGIN_INVALID", e).with("plugin", name))?;
+        if release.name != name {
+            return Err(LocalError::new("PLUGIN_INVALID").with("plugin", name));
+        }
+        Ok(Installed { release, dir })
+    }
+
+    /// 本机装着的插件名（目录在就算，装坏了的也列出来，界面上提示重新装）
+    pub fn installed_names(&self) -> Vec<String> {
+        let Ok(rd) = std::fs::read_dir(self.root()) else { return vec![] };
+        let mut v: Vec<String> = rd.flatten().filter(|e| e.path().is_dir()).map(|e| e.file_name().to_string_lossy().into_owned()).filter(|n| proto::valid_name(n)).collect();
+        v.sort();
+        v
+    }
+
+    /// 这个插件能不能在这个看看上跑：协议版本、最低客户端版本
+    fn compatible(m: &Manifest) -> Result<(), LocalError> {
+        if m.protocol != proto::PROTOCOL {
+            return Err(LocalError::new("PLUGIN_PROTOCOL").with("plugin", m.name.clone()));
+        }
+        if !m.min_client.is_empty() && proto::version_cmp(env!("CARGO_PKG_VERSION"), &m.min_client) == std::cmp::Ordering::Less {
+            return Err(LocalError::new("PLUGIN_NEEDS_CLIENT").with("plugin", m.name.clone()).with("version", m.min_client.clone()));
+        }
+        Ok(())
+    }
+
+    /// 界面上的插件列表：本机装着的、服务端目录里的（带这个账号的授权），合在一起
+    pub async fn list(&self, with_catalog: bool) -> Value {
+        let platform = proto::current_platform();
+        let catalog = if with_catalog && self.account.session().is_some() {
+            match self.account.plugin_catalog(&platform).await {
+                Ok(c) => Ok(c.items),
+                Err(e) => Err(LocalError::from(e)),
+            }
+        } else {
+            Ok(vec![])
         };
-        for entry in rd.flatten() {
-            let path = entry.path();
-            if !path.is_dir() {
-                continue;
-            }
-            let Some(name) = entry.file_name().to_str().map(str::to_owned) else { continue };
-            if !proto::valid_name(&name) {
-                continue;
-            }
-            match verify_dir(&path, &self.keys, Some(&name)) {
-                Ok((manifest, _)) => {
-                    let incompatible = check_compat(&manifest);
-                    found.insert(name, InstalledPlugin { manifest, dir: path, incompatible });
-                }
-                Err(e) => {
-                    tracing::warn!(plugin = %name, error = %e, "跳过未通过验签的插件目录");
+        let running = self.running.lock().await;
+        let mut names = self.installed_names();
+        if let Ok(c) = &catalog {
+            for i in c {
+                if !names.contains(&i.name) {
+                    names.push(i.name.clone());
                 }
             }
         }
-        *wlock(&self.installed) = found;
-    }
-
-    pub fn get_installed(&self, name: &str) -> Option<InstalledPlugin> {
-        rlock(&self.installed).get(name).cloned()
-    }
-
-    pub fn list_installed(&self) -> Vec<InstalledPlugin> {
-        rlock(&self.installed).values().cloned().collect()
-    }
-
-    /// 给 `GET /api/status` 的摘要：**绝不拉起未运行的插件**。
-    pub fn brief(&self) -> Vec<Value> {
-        let installed = self.list_installed();
-        let running = lock(&self.running);
-        installed
-            .into_iter()
-            .map(|p| {
-                let run = running.get(&p.manifest.name);
+        let jobs = lock(&self.jobs).clone();
+        let items: Vec<Value> = names
+            .iter()
+            .map(|n| {
+                let local = self.installed(n);
+                let remote = catalog.as_ref().ok().and_then(|c| c.iter().find(|i| &i.name == n));
+                let m = local.as_ref().ok().map(|i| i.manifest().clone());
+                let update = match (&local, remote) {
+                    (Ok(l), Some(r)) => proto::version_cmp(&r.version, &l.release.version) == std::cmp::Ordering::Greater,
+                    _ => false,
+                };
                 json!({
-                    "name": p.manifest.name,
-                    "version": p.manifest.version,
-                    "title": p.manifest.title,
-                    "description": p.manifest.description,
-                    "icon": p.manifest.icon,
-                    "entries": p.manifest.entries,
-                    "capabilities": p.manifest.capabilities,
-                    "readonly_policy": p.manifest.readonly_policy,
-                    "incompatible": p.incompatible,
-                    "process_running": run.is_some(),
-                    "running": run.is_some_and(|r| r.status.running),
-                    "busy": run.is_some_and(|r| r.status.busy),
-                    "badge": run.and_then(|r| r.status.badge.clone()),
+                    "name": n,
+                    "installed": local.is_ok(),
+                    // 目录在但签名不对、旧格式：要重新装
+                    "broken": local.as_ref().err().filter(|e| e.code != "PLUGIN_NOT_INSTALLED").map(|e| e.code.to_string()),
+                    "version": m.as_ref().map(|m| m.version.clone()),
+                    "latest": remote.map(|r| r.version.clone()),
+                    "update": update,
+                    "title": m.as_ref().map(|m| json!(m.title)).or_else(|| remote.map(|r| json!(r.title))),
+                    "description": m.as_ref().map(|m| json!(m.description)).or_else(|| remote.map(|r| json!(r.description))),
+                    "icon": m.as_ref().map(|m| m.icon.clone()).or_else(|| remote.map(|r| r.icon.clone())),
+                    "size": remote.map(|r| r.size),
+                    "open_url": m.as_ref().is_some_and(|m| m.open_url),
+                    "incompatible": m.as_ref().and_then(|m| Self::compatible(m).err()).map(|e| json!({ "code": e.code, "params": e.params })),
+                    "licensed": remote.map(|r| r.licensed),
+                    "expires_at": remote.and_then(|r| r.expires_at.clone()),
+                    "running": running.get(n).is_some_and(|p| p.alive()),
+                    "job": jobs.get(n),
                 })
+            })
+            .collect();
+        json!({
+            "platform": platform,
+            "items": items,
+            "signed_in": self.account.session().is_some(),
+            "catalog_error": catalog.err().map(|e| json!({ "code": e.code, "params": e.params })),
+            "keys": !self.keys.is_empty(),
+        })
+    }
+
+    /// 状态栏：在跑的插件（工具菜单上的“运行中”）
+    pub async fn brief(&self) -> Vec<Value> {
+        let running = self.running.lock().await;
+        self.installed_names()
+            .into_iter()
+            .filter_map(|n| {
+                let i = self.installed(&n).ok()?;
+                let m = i.manifest();
+                Some(json!({ "name": n, "title": m.title, "icon": m.icon, "open_url": m.open_url, "running": running.get(&n).is_some_and(|p| p.alive()), "incompatible": Self::compatible(m).is_err() }))
             })
             .collect()
     }
 
-    pub fn all_jobs(&self) -> HashMap<String, InstallJob> {
-        lock(&self.jobs).clone()
+    fn set_job(&self, name: &str, f: impl FnOnce(&mut Job)) {
+        let mut j = lock(&self.jobs);
+        f(j.entry(name.to_string()).or_default());
     }
 
-    /// 校验插件调宿主白名单接口时带的 `HDR_TOKEN`（常量时间比较），返回对应的插件名。
-    pub fn verify_host_token(&self, token: &str) -> Option<String> {
-        if token.is_empty() {
-            return None;
-        }
-        let running = lock(&self.running);
-        for (name, r) in running.iter() {
-            if crate::gateway::ct_eq(&r.token, token) {
-                return Some(name.clone());
-            }
-        }
-        None
-    }
-
-    fn start_lock(&self, name: &str) -> Arc<tokio::sync::Mutex<()>> {
-        let mut map = lock(&self.start_locks);
-        map.entry(name.to_string()).or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))).clone()
-    }
-
-    /// 看看启动时调用：对声明了 `autostart_if_exists` 且数据目录下存在该标记文件的插件立即拉起（如接回重启前在跑的浏览器）。
-    pub fn autostart(self: &Arc<Self>) {
-        for p in self.list_installed() {
-            if p.incompatible.is_some() {
-                continue;
-            }
-            let Some(rel) = p.manifest.autostart_if_exists.as_deref() else { continue };
-            if self.data_dir(&p.manifest.name).join(rel).exists() {
-                let this = self.clone();
-                let name = p.manifest.name.clone();
-                tokio::spawn(async move {
-                    tracing::info!(plugin = %name, "检测到运行标记，自动拉起插件以接回后台任务");
-                    if let Err(e) = this.ensure_running(&name).await {
-                        tracing::warn!(plugin = %name, code = %e.code, "自动拉起插件失败");
-                    }
-                });
-            }
-        }
-    }
-
-    /// 确保插件已启动并返回连接句柄（未运行时按需拉起；启动前再次核验目录签名与文件哈希）。
-    pub async fn ensure_running(&self, name: &str) -> Result<RunningHandle, LocalError> {
+    /// 后台装 / 更新：进度在 [`Plugins::list`] 的 `job` 里
+    pub fn start_install(self: &Arc<Self>, name: &str) -> Result<(), LocalError> {
         if !proto::valid_name(name) {
             return Err(LocalError::new("PLUGIN_NOT_FOUND"));
         }
-        // 快路径：已在跑且进程活着
-        if let Some(h) = self.running_handle(name) {
-            return Ok(h);
+        if self.keys.is_empty() {
+            return Err(LocalError::new("PLUGIN_NO_KEYS"));
         }
-        let mu = self.start_lock(name);
-        let _guard = mu.lock().await;
-        if let Some(h) = self.running_handle(name) {
-            return Ok(h);
-        }
-        #[cfg(not(unix))]
         {
-            return Err(LocalError::new("PLUGIN_UNSUPPORTED"));
+            let mut j = lock(&self.jobs);
+            if j.get(name).is_some_and(|j| !matches!(j.step, "done" | "failed")) {
+                return Err(LocalError::new("PLUGIN_BUSY"));
+            }
+            j.insert(name.to_string(), Job { step: "download", ..Default::default() });
         }
-        #[cfg(unix)]
-        {
-            let inst = self.get_installed(name).ok_or_else(|| LocalError::new("PLUGIN_NOT_FOUND"))?;
-            if let Some(reason) = inst.incompatible {
-                return Err(LocalError::new("PLUGIN_INCOMPATIBLE").with("reason", reason));
+        let (me, name) = (self.clone(), name.to_string());
+        tokio::spawn(async move {
+            match me.install(&name).await {
+                Ok(()) => me.set_job(&name, |j| j.step = "done"),
+                Err(e) => {
+                    tracing::warn!(plugin = name, error = ?e, "插件没装上");
+                    me.set_job(&name, |j| {
+                        j.step = "failed";
+                        j.error = Some(json!({ "code": e.code, "params": e.params }));
+                    });
+                }
             }
-            if self.crash_limited(name) {
-                return Err(LocalError::new("PLUGIN_START_FAILED").with("reason", "crash_limit"));
-            }
-            // 启动前再次校验离线签名与每个文件 SHA-256，防止安装后被篡改
-            let (manifest, _) = verify_dir(&inst.dir, &self.keys, Some(name)).map_err(|e| {
-                tracing::error!(plugin = %name, error = %e, "插件启动前验签失败");
-                LocalError::new("PLUGIN_BAD_SIGNATURE")
+        });
+        Ok(())
+    }
+
+    async fn install(&self, name: &str) -> Result<(), LocalError> {
+        let platform = proto::current_platform();
+        let r = self.account.plugin_release(name, &platform).await?;
+        let signed: proto::SignedRelease = serde_json::from_value(r["signed"].clone()).map_err(|e| err("PLUGIN_INVALID", e))?;
+        let raw = looklook_protocol::signing::b64_decode(&signed.release).ok_or_else(|| err("PLUGIN_INVALID", "release"))?;
+        let release = proto::verify_release(&self.keys, &raw, &signed.sig).map_err(|e| err("PLUGIN_INVALID", e))?;
+        if release.name != name || release.platform != platform {
+            return Err(err("PLUGIN_INVALID", "release does not match"));
+        }
+        Self::compatible(&release.manifest)?;
+        let path = r["download_path"].as_str().filter(|p| p.starts_with("/plugins/download/")).ok_or_else(|| err("PLUGIN_INVALID", "download_path"))?;
+        let platform_api = self.account.platform();
+        let url = format!("{}{path}", platform_api.base);
+        let root = self.root();
+        std::fs::create_dir_all(&root).map_err(|e| err("PLUGIN_INSTALL", e))?;
+        let tmp = root.join(format!(".{name}.download"));
+        self.set_job(name, |j| {
+            j.step = "download";
+            j.total = Some(release.size);
+        });
+        let jobs = &self.jobs;
+        let n = name.to_string();
+        let sha = platform_api
+            .download(&url, &tmp, release.size.min(PACKAGE_MAX), |done, _| {
+                if let Some(j) = lock(jobs).get_mut(&n) {
+                    j.done = done;
+                }
+            })
+            .await
+            .map_err(|e| {
+                let _ = std::fs::remove_file(&tmp);
+                LocalError::from(e)
             })?;
-            if let Some(reason) = check_compat(&manifest) {
-                return Err(LocalError::new("PLUGIN_INCOMPATIBLE").with("reason", reason));
+        self.set_job(name, |j| j.step = "verify");
+        let size = std::fs::metadata(&tmp).map(|m| m.len()).unwrap_or(0);
+        if sha != release.sha256 || size != release.size {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(err("PLUGIN_INVALID", "package hash mismatch"));
+        }
+        self.set_job(name, |j| j.step = "install");
+        let staging = root.join(format!(".{name}.new"));
+        let (t, s, rel) = (tmp.clone(), staging.clone(), release.clone());
+        let unpacked = tokio::task::spawn_blocking(move || unpack(&t, &s, &rel)).await.map_err(|e| err("PLUGIN_INSTALL", e))?;
+        let _ = std::fs::remove_file(&tmp);
+        if let Err(e) = unpacked {
+            let _ = std::fs::remove_dir_all(&staging);
+            return Err(e);
+        }
+        std::fs::write(staging.join("release.json"), &raw).map_err(|e| err("PLUGIN_INSTALL", e))?;
+        std::fs::write(staging.join("release.sig"), serde_json::to_vec(&signed.sig).unwrap_or_default()).map_err(|e| err("PLUGIN_INSTALL", e))?;
+        // 换之前停掉旧的（下次用到时起新的）
+        self.stop(name).await;
+        let dir = self.dir(name);
+        let old = root.join(format!(".{name}.old"));
+        let _ = std::fs::remove_dir_all(&old);
+        if dir.exists() {
+            std::fs::rename(&dir, &old).map_err(|e| err("PLUGIN_INSTALL", e))?;
+        }
+        if let Err(e) = std::fs::rename(&staging, &dir) {
+            let _ = std::fs::rename(&old, &dir);
+            return Err(err("PLUGIN_INSTALL", e));
+        }
+        let _ = std::fs::remove_dir_all(&old);
+        restrict(&dir);
+        tracing::info!(plugin = name, version = %release.version, "插件装好了");
+        // 原来在后台跑着的（例如浏览器）：按清单接回来
+        if self.should_autostart(name) {
+            let _ = self.ensure(name).await;
+        }
+        Ok(())
+    }
+
+    /// 卸载程序（数据目录留着，重新装后接着用）
+    pub async fn uninstall(&self, name: &str) -> Result<(), LocalError> {
+        if !proto::valid_name(name) {
+            return Err(LocalError::new("PLUGIN_NOT_FOUND"));
+        }
+        self.stop(name).await;
+        let dir = self.dir(name);
+        if dir.exists() {
+            std::fs::remove_dir_all(&dir).map_err(|e| err("PLUGIN_INSTALL", e))?;
+        }
+        lock(&self.jobs).remove(name);
+        Ok(())
+    }
+
+    fn should_autostart(&self, name: &str) -> bool {
+        self.installed(name).ok().and_then(|i| i.manifest().autostart_if_exists.clone()).is_some_and(|f| self.data_dir(name).join(f).is_file())
+    }
+
+    /// 看看启动后：清单说要接回来的插件马上起
+    pub async fn autostart(&self) {
+        for n in self.installed_names() {
+            if self.should_autostart(&n) {
+                match self.ensure(&n).await {
+                    Ok(_) => tracing::info!(plugin = n, "插件随看看启动"),
+                    Err(e) => tracing::warn!(plugin = n, error = ?e, "插件没能随看看启动"),
+                }
             }
-            let r = self.spawn_unix(name, &inst.dir, manifest).await.map_err(|e| {
-                tracing::error!(plugin = %name, error = %e, "启动插件失败");
-                self.record_crash(name);
-                LocalError::new("PLUGIN_START_FAILED")
-            })?;
-            let h = r.handle();
-            lock(&self.running).insert(name.to_string(), r);
-            Ok(h)
         }
     }
 
-    fn running_handle(&self, name: &str) -> Option<RunningHandle> {
-        let mut map = lock(&self.running);
-        let alive = matches!(map.get_mut(name)?.child.try_wait(), Ok(None));
-        if !alive {
-            if let Some(r) = map.remove(name) {
-                let _ = std::fs::remove_file(&r.socket);
-            }
-            return None;
+    /// 插件在跑（没跑就起）：返回它的 Socket 和口令
+    pub async fn ensure(&self, name: &str) -> Result<Arc<Proc>, LocalError> {
+        let mut running = self.running.lock().await;
+        if let Some(p) = running.get(name).filter(|p| p.alive()) {
+            return Ok(p.clone());
         }
-        map.get(name).map(RunningPlugin::handle)
+        if let Some(old) = running.remove(name) {
+            old.kill();
+        }
+        let inst = self.installed(name)?;
+        Self::compatible(inst.manifest())?;
+        let p = Arc::new(self.spawn(&inst).await?);
+        running.insert(name.to_string(), p.clone());
+        Ok(p)
     }
 
-    fn crash_limited(&self, name: &str) -> bool {
-        let now = Instant::now();
-        let mut map = lock(&self.crashes);
-        let q = map.entry(name.to_string()).or_default();
-        while q.front().is_some_and(|t| now.duration_since(*t) > CRASH_WINDOW) {
-            q.pop_front();
+    pub async fn stop(&self, name: &str) {
+        if let Some(p) = self.running.lock().await.remove(name) {
+            p.kill();
         }
-        q.len() >= MAX_CRASHES
     }
 
-    fn record_crash(&self, name: &str) {
-        let now = Instant::now();
-        let mut map = lock(&self.crashes);
-        let q = map.entry(name.to_string()).or_default();
-        while q.front().is_some_and(|t| now.duration_since(*t) > CRASH_WINDOW) {
-            q.pop_front();
+    pub async fn stop_all(&self) {
+        for (_, p) in self.running.lock().await.drain() {
+            p.kill();
         }
-        q.push_back(now);
+    }
+
+    /// Socket 放在短路径下（Unix Socket 路径有 108 字节的上限）：`$XDG_RUNTIME_DIR/llp-<数据目录摘要>/`，
+    /// 没有时 `/tmp/llp-<uid>-<数据目录摘要>/`，目录只有自己能进
+    fn socket_dir(&self) -> PathBuf {
+        let tag = &looklook_protocol::signing::sha256_hex(self.paths.home.to_string_lossy().as_bytes())[..8];
+        match std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from).filter(|d| d.is_dir()) {
+            Some(d) => d.join(format!("llp-{tag}")),
+            None => std::env::temp_dir().join(format!("llp-{}-{tag}", uid())),
+        }
     }
 
     #[cfg(unix)]
-    async fn spawn_unix(&self, name: &str, dir: &Path, manifest: Manifest) -> Result<RunningPlugin> {
-        use std::os::unix::fs::PermissionsExt;
-
-        let data_dir = self.data_dir(name);
-        std::fs::create_dir_all(&data_dir)?;
-        let _ = std::fs::set_permissions(&data_dir, std::fs::Permissions::from_mode(0o700));
-
-        let sock_dir = unix_socket_dir()?;
-        let gen = self.gen.fetch_add(1, Ordering::Relaxed);
-        let socket = sock_dir.join(format!("{name}-{gen}.sock"));
-        let _ = std::fs::remove_file(&socket);
-
-        let token = data_encoding::HEXLOWER.encode(&crate::util::random_bytes::<32>());
-        let host_url = rlock(&self.host_url).clone();
-        let exec = dir.join(&manifest.exec);
-
-        let logs = self.home.join("logs");
-        std::fs::create_dir_all(&logs)?;
-        let log_path = logs.join(format!("plugin-{name}.log"));
-        if std::fs::metadata(&log_path).is_ok_and(|m| m.len() > MAX_LOG_BYTES) {
-            let _ = std::fs::File::create(&log_path);
+    async fn spawn(&self, inst: &Installed) -> Result<Proc, LocalError> {
+        let m = inst.manifest();
+        let exe = inst.dir.join(&m.exec);
+        if !exe.is_file() {
+            return Err(err("PLUGIN_INVALID", format!("{} missing", m.exec)));
         }
-        let log_out = std::fs::OpenOptions::new().create(true).append(true).open(&log_path)?;
-        let log_err = log_out.try_clone()?;
-
-        let mut cmd = tokio::process::Command::new(&exec);
-        cmd.current_dir(dir)
+        let sdir = self.socket_dir();
+        std::fs::create_dir_all(&sdir).map_err(|e| err("PLUGIN_START", e))?;
+        restrict(&sdir);
+        let socket = sdir.join(format!("{}.sock", m.name));
+        let _ = std::fs::remove_file(&socket);
+        let data = self.data_dir(&m.name);
+        std::fs::create_dir_all(&data).map_err(|e| err("PLUGIN_START", e))?;
+        restrict(&data);
+        let token = crate::util::random_secret();
+        let log_path = self.paths.home.join("logs").join(format!("plugin-{}.log", m.name));
+        let log = std::fs::OpenOptions::new().create(true).append(true).open(&log_path).ok();
+        let mut cmd = tokio::process::Command::new(&exe);
+        cmd.current_dir(&data)
             .env(proto::ENV_SOCKET, &socket)
             .env(proto::ENV_TOKEN, &token)
-            .env(proto::ENV_DATA_DIR, &data_dir)
-            .env(proto::ENV_HOST_URL, &host_url)
-            .env(proto::ENV_NAME, name)
-            .env(proto::ENV_PROTOCOL, PROTOCOL_VERSION.to_string())
-            .env(proto::ENV_CLIENT_VERSION, VERSION)
-            .env(proto::ENV_HOME, &self.home)
+            .env(proto::ENV_DATA_DIR, &data)
+            .env(proto::ENV_BASE, format!("{}{}/", proto::PAGE_PREFIX, m.name))
+            .env(proto::ENV_HOST_TOKEN, &self.host_token)
+            .env(proto::ENV_CLIENT_VERSION, env!("CARGO_PKG_VERSION"))
+            // 1.86 以前的内置浏览器数据在 `<数据目录>/browser/`：插件第一次起时自己搬过去
+            .env("LOOKLOOK_HOME", &self.paths.home)
             .stdin(std::process::Stdio::null())
-            .stdout(log_out)
-            .stderr(log_err);
-
+            .stdout(log.as_ref().and_then(|f| f.try_clone().ok()).map(std::process::Stdio::from).unwrap_or_else(std::process::Stdio::null))
+            .stderr(log.map(std::process::Stdio::from).unwrap_or_else(std::process::Stdio::null))
+            .kill_on_drop(true);
+        if let Some(h) = lock(&self.host_url).clone() {
+            cmd.env(proto::ENV_HOST_URL, h);
+        }
+        // 看看退出（包括被强制结束）时插件也退出；插件自己的子进程（浏览器）由插件决定留不留
         #[cfg(target_os = "linux")]
         unsafe {
             cmd.pre_exec(|| {
@@ -392,616 +455,265 @@ impl Plugins {
                 Ok(())
             });
         }
-
-        let mut child = cmd.spawn().with_context(|| format!("spawn {}", exec.display()))?;
-
-        // 等 Unix socket 开始监听
-        let deadline = Instant::now() + START_TIMEOUT;
+        let child = cmd.spawn().map_err(|e| err("PLUGIN_START", format!("{}: {e}", exe.display())))?;
+        let proc = Proc { socket: socket.clone(), token, child: Mutex::new(Some(child)) };
+        let deadline = Instant::now() + START_WAIT;
         loop {
-            if let Ok(Some(st)) = child.try_wait() {
-                let _ = std::fs::remove_file(&socket);
-                bail!("插件进程启动后立即退出: {st}");
-            }
             if tokio::net::UnixStream::connect(&socket).await.is_ok() {
-                break;
+                tracing::info!(plugin = %m.name, version = %m.version, "插件起来了");
+                return Ok(proc);
             }
-            if Instant::now() >= deadline {
-                let _ = child.kill().await;
-                let _ = child.wait().await;
-                let _ = std::fs::remove_file(&socket);
-                bail!("等待插件监听 socket 超时");
+            if !proc.alive() || Instant::now() > deadline {
+                proc.kill();
+                let tail = log_tail(&log_path);
+                return Err(err("PLUGIN_START", if tail.is_empty() { "plugin did not start".to_string() } else { tail }).with("plugin", m.name.clone()));
             }
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
-
-        tracing::info!(plugin = %name, version = %manifest.version, socket = %socket.display(), "插件已启动");
-        Ok(RunningPlugin {
-            manifest,
-            socket,
-            token,
-            child,
-            conns: Arc::new(AtomicUsize::new(0)),
-            last_active_ms: Arc::new(AtomicI64::new(crate::util::system_ms())),
-            status: PluginStatus::default(),
-        })
-    }
-
-    /// 优雅停止插件：先发 `POST /_plugin/shutdown`，等 5 秒未退出再 SIGTERM / KILL。
-    pub async fn stop(&self, name: &str) {
-        let running = lock(&self.running).remove(name);
-        let Some(mut r) = running else { return };
-        #[cfg(unix)]
-        {
-            let _ = tokio::time::timeout(
-                Duration::from_secs(2),
-                unix_request(&r.socket, Method::POST, proto::PLUGIN_SHUTDOWN_PATH, &r.token, None, None),
-            )
-            .await;
-        }
-        if tokio::time::timeout(SHUTDOWN_TIMEOUT, r.child.wait()).await.is_err() {
-            #[cfg(unix)]
-            if let Some(pid) = r.child.id() {
-                unsafe {
-                    libc::kill(pid as i32, libc::SIGTERM);
-                }
-            }
-            if tokio::time::timeout(Duration::from_secs(2), r.child.wait()).await.is_err() {
-                let _ = r.child.kill().await;
-                let _ = r.child.wait().await;
-            }
-        }
-        let _ = std::fs::remove_file(&r.socket);
-        tracing::info!(plugin = %name, "插件已停止");
-    }
-
-    pub async fn stop_all(&self) {
-        let names: Vec<String> = lock(&self.running).keys().cloned().collect();
-        for name in names {
-            self.stop(&name).await;
-        }
-    }
-
-    /// 查询插件状态（只在已运行时问，不会触发拉起）。
-    #[cfg(unix)]
-    async fn refresh_status(&self, name: &str) -> Option<PluginStatus> {
-        let (socket, token) = {
-            let map = lock(&self.running);
-            let r = map.get(name)?;
-            (r.socket.clone(), r.token.clone())
-        };
-        let (status, body) = unix_request(&socket, Method::GET, proto::PLUGIN_STATUS_PATH, &token, None, None).await.ok()?;
-        if status != StatusCode::OK {
-            return None;
-        }
-        let parsed: PluginStatus = serde_json::from_slice(&body).ok()?;
-        if let Some(r) = lock(&self.running).get_mut(name) {
-            r.status = parsed.clone();
-        }
-        Some(parsed)
-    }
-
-    /// 后台看护：回收意外退出的进程、刷新运行中插件状态、按 `busy` 与闲置时间自动停、空闲时自动更新。
-    pub async fn watch(self: Arc<Self>, account: Arc<Account>, store: Arc<Store>, shutdown: CancellationToken) {
-        let mut last_update_check = Instant::now();
-        loop {
-            tokio::select! {
-                _ = shutdown.cancelled() => {
-                    self.stop_all().await;
-                    return;
-                }
-                _ = tokio::time::sleep(Duration::from_secs(15)) => {}
-            }
-            self.tick().await;
-            if last_update_check.elapsed() >= AUTO_UPDATE_INTERVAL {
-                last_update_check = Instant::now();
-                if Settings::load(&store).auto_update && account.session().is_some() {
-                    self.auto_update_idle(&account).await;
-                }
-            }
-        }
-    }
-
-    async fn tick(&self) {
-        // 1. 清理意外退出的插件
-        let mut exited = Vec::new();
-        {
-            let mut map = lock(&self.running);
-            let names: Vec<String> = map.keys().cloned().collect();
-            for name in names {
-                if let Some(r) = map.get_mut(&name) {
-                    if let Ok(Some(st)) = r.child.try_wait() {
-                        tracing::warn!(plugin = %name, status = %st, "插件意外退出");
-                        if let Some(dead) = map.remove(&name) {
-                            let _ = std::fs::remove_file(&dead.socket);
-                            exited.push((name, dead.manifest.autostart_if_exists));
-                        }
-                    }
-                }
-            }
-        }
-        for (name, autostart) in exited {
-            self.record_crash(&name);
-            if let Some(rel) = autostart {
-                if self.data_dir(&name).join(rel).exists() && !self.crash_limited(&name) {
-                    tracing::info!(plugin = %name, "插件存在运行标记，尝试自动拉起");
-                    let _ = self.ensure_running(&name).await;
-                }
-            }
-        }
-
-        // 2. 刷新运行中插件状态 & 闲置回收（尊重 busy）
-        let names: Vec<String> = lock(&self.running).keys().cloned().collect();
-        let now = crate::util::system_ms();
-        for name in names {
-            #[cfg(unix)]
-            let st = self.refresh_status(&name).await;
-            #[cfg(not(unix))]
-            let st: Option<PluginStatus> = None;
-
-            let should_stop = {
-                let map = lock(&self.running);
-                map.get(&name).is_some_and(|r| {
-                    let idle_min = r.manifest.idle_stop_minutes;
-                    let busy = st.as_ref().map_or(r.status.busy, |s| s.busy);
-                    let active = r.conns.load(Ordering::SeqCst) > 0;
-                    let idle_ms = now.saturating_sub(r.last_active_ms.load(Ordering::SeqCst));
-                    idle_min > 0 && !busy && !active && idle_ms >= idle_min as i64 * 60_000
-                })
-            };
-            if should_stop {
-                tracing::info!(plugin = %name, "插件闲置且不忙，自动停止");
-                self.stop(&name).await;
-            }
-        }
-    }
-
-    async fn auto_update_idle(&self, account: &Arc<Account>) {
-        let Ok(cat) = account.plugin_catalog(paths::target()).await else { return };
-        for item in cat.plugins {
-            if !item.licensed || item.sha256.is_empty() {
-                continue;
-            }
-            let Some(inst) = self.get_installed(&item.name) else { continue };
-            if !is_newer(&item.version, &inst.manifest.version) {
-                continue;
-            }
-            // 只在空闲（未运行，或运行中且 !busy && 无活跃连接）时自动更新
-            let busy = {
-                let map = lock(&self.running);
-                map.get(&item.name).is_some_and(|r| r.status.busy || r.conns.load(Ordering::SeqCst) > 0)
-            };
-            if busy {
-                continue;
-            }
-            tracing::info!(plugin = %item.name, from = %inst.manifest.version, to = %item.version, "发现插件新版本，空闲自动更新");
-            if let Err(e) = self.install_now(account, &item.name, false).await {
-                tracing::warn!(plugin = %item.name, error = %e.code, "插件自动更新失败");
-            }
-        }
-    }
-
-    /// 异步启动安装/更新任务（立即返回进行中的任务）。
-    pub fn start_install(self: &Arc<Self>, account: Arc<Account>, name: String) -> Result<InstallJob, LocalError> {
-        if !proto::valid_name(&name) {
-            return Err(LocalError::new("PLUGIN_NOT_FOUND"));
-        }
-        if account.session().is_none() {
-            return Err(LocalError::new("NOT_LOGGED_IN"));
-        }
-        let job = {
-            let mut jobs = lock(&self.jobs);
-            if let Some(cur) = jobs.get(&name) {
-                if cur.state == "running" {
-                    return Err(LocalError::new("PLUGIN_INSTALLING"));
-                }
-            }
-            let j = InstallJob { name: name.clone(), state: "running", step: "ticket", received: 0, total: 0, error: None };
-            jobs.insert(name.clone(), j.clone());
-            j
-        };
-        let this = self.clone();
-        tokio::spawn(async move {
-            match this.install_now(&account, &name, true).await {
-                Ok(()) => {
-                    this.update_job(&name, |j| {
-                        j.state = "ok";
-                        j.step = "done";
-                        j.error = None;
-                    });
-                }
-                Err(e) => {
-                    tracing::warn!(plugin = %name, code = %e.code, "安装插件失败");
-                    this.update_job(&name, |j| {
-                        j.state = "failed";
-                        j.error = Some(e.code.clone());
-                    });
-                }
-            }
-        });
-        Ok(job)
-    }
-
-    fn update_job(&self, name: &str, f: impl FnOnce(&mut InstallJob)) {
-        if let Some(j) = lock(&self.jobs).get_mut(name) {
-            f(j);
-        }
-    }
-
-    /// 完整安装流程：向平台申请下载票据 → 下载并校验 tar.gz SHA-256 → 解包到暂存目录 → 验离线签名与每文件 SHA-256 → 停旧进程 → 原子替换（不动 plugin-data）。
-    pub async fn install_now(&self, account: &Arc<Account>, name: &str, track_job: bool) -> Result<(), LocalError> {
-        let ticket = account.plugin_download(name, paths::target()).await?;
-        if ticket.size > proto::MAX_PACKAGE_BYTES {
-            return Err(LocalError::new("VALIDATION_FAILED").with("field", "size"));
-        }
-        if track_job {
-            self.update_job(name, |j| {
-                j.step = "download";
-                j.total = ticket.size;
-            });
-        }
-        let stage_root = self.home.join("plugins").join(".staging");
-        std::fs::create_dir_all(&stage_root)?;
-        let tmp_tar = stage_root.join(format!("{name}-{}.tar.gz", crate::util::random_id(6)));
-        let dl_res = account
-            .platform()
-            .download(&ticket.url, &tmp_tar, proto::MAX_PACKAGE_BYTES, |got, total| {
-                if track_job {
-                    self.update_job(name, |j| {
-                        j.received = got;
-                        if let Some(t) = total {
-                            j.total = t;
-                        }
-                    });
-                }
-            })
-            .await;
-        let got_sha = match dl_res {
-            Ok(s) => s,
-            Err(e) => {
-                let _ = std::fs::remove_file(&tmp_tar);
-                return Err(e.into());
-            }
-        };
-        if !got_sha.eq_ignore_ascii_case(&ticket.sha256) {
-            let _ = std::fs::remove_file(&tmp_tar);
-            return Err(LocalError::new("PLUGIN_BAD_SIGNATURE"));
-        }
-
-        if track_job {
-            self.update_job(name, |j| j.step = "verify");
-        }
-        let res = self.install_from_archive(&tmp_tar, name, Some(&ticket.version)).await;
-        let _ = std::fs::remove_file(&tmp_tar);
-        res
-    }
-
-    /// 从本地已下载的 `.tar.gz` 验签并原子安装（安装逻辑与单测共用）。
-    pub async fn install_from_archive(&self, archive: &Path, name: &str, expected_version: Option<&str>) -> Result<(), LocalError> {
-        let stage_root = self.plugins_dir().join(".staging");
-        std::fs::create_dir_all(&stage_root)?;
-        let stage = stage_root.join(format!("{name}-{}", crate::util::random_id(6)));
-        std::fs::create_dir_all(&stage)?;
-
-        let unpack = crate::archive::extract_plugin_tar_gz(archive, &stage);
-        if let Err(e) = unpack {
-            let _ = std::fs::remove_dir_all(&stage);
-            tracing::warn!(plugin = %name, error = %e, "解包插件失败");
-            return Err(LocalError::new("PLUGIN_BAD_SIGNATURE"));
-        }
-
-        let (manifest, pkg) = match verify_dir(&stage, &self.keys, Some(name)) {
-            Ok(v) => v,
-            Err(e) => {
-                let _ = std::fs::remove_dir_all(&stage);
-                tracing::warn!(plugin = %name, error = %e, "插件验签失败");
-                return Err(LocalError::new("PLUGIN_BAD_SIGNATURE"));
-            }
-        };
-        if let Some(v) = expected_version {
-            if manifest.version != v {
-                let _ = std::fs::remove_dir_all(&stage);
-                return Err(LocalError::new("PLUGIN_BAD_SIGNATURE"));
-            }
-        }
-        if let Some(reason) = check_compat(&manifest) {
-            let _ = std::fs::remove_dir_all(&stage);
-            return Err(LocalError::new("PLUGIN_INCOMPATIBLE").with("reason", reason));
-        }
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&stage, std::fs::Permissions::from_mode(0o700));
-            let mut execs = pkg.executables.clone();
-            if !execs.iter().any(|e| e == &manifest.exec) {
-                execs.push(manifest.exec.clone());
-            }
-            for rel in execs {
-                let _ = std::fs::set_permissions(stage.join(rel), std::fs::Permissions::from_mode(0o755));
-            }
-        }
-        #[cfg(not(unix))]
-        let _ = pkg;
-
-        // 停旧进程后再原子替换代码目录；plugin-data 目录原样保留
-        self.stop(name).await;
-        let dest = self.plugins_dir().join(name);
-        let backup = stage_root.join(format!("{name}-old-{}", crate::util::random_id(6)));
-        if dest.exists() {
-            std::fs::rename(&dest, &backup)?;
-        }
-        if let Err(e) = std::fs::rename(&stage, &dest) {
-            if backup.exists() {
-                let _ = std::fs::rename(&backup, &dest);
-            }
-            let _ = std::fs::remove_dir_all(&stage);
-            return Err(e.into());
-        }
-        if backup.exists() {
-            let _ = std::fs::remove_dir_all(&backup);
-        }
-        self.scan();
-        tracing::info!(plugin = %name, version = %manifest.version, "插件安装完成");
-        Ok(())
-    }
-
-    pub async fn uninstall(&self, name: &str, remove_data: bool) -> Result<(), LocalError> {
-        if !proto::valid_name(name) {
-            return Err(LocalError::new("PLUGIN_NOT_FOUND"));
-        }
-        if self.get_installed(name).is_none() {
-            return Err(LocalError::new("PLUGIN_NOT_FOUND"));
-        }
-        self.stop(name).await;
-        let dir = self.plugins_dir().join(name);
-        if dir.exists() {
-            std::fs::remove_dir_all(&dir)?;
-        }
-        if remove_data {
-            let data = self.data_dir(name);
-            if data.exists() {
-                std::fs::remove_dir_all(&data)?;
-            }
-        }
-        self.scan();
-        Ok(())
-    }
-
-    /// 调插件的 JSON HTTP 接口（用于 `open_url` 等宿主聚合能力）。
-    #[cfg(unix)]
-    pub async fn call_json(&self, name: &str, method: Method, path: &str, locale: Option<&str>, body: Option<Vec<u8>>) -> Result<(StatusCode, Value), LocalError> {
-        let h = self.ensure_running(name).await?;
-        let (status, bytes) = unix_request(&h.socket, method, path, &h.token, locale, body)
-            .await
-            .map_err(|_| LocalError::new("PLUGIN_START_FAILED"))?;
-        let v = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
-        Ok((status, v))
     }
 
     #[cfg(not(unix))]
-    pub async fn call_json(&self, _name: &str, _method: Method, _path: &str, _locale: Option<&str>, _body: Option<Vec<u8>>) -> Result<(StatusCode, Value), LocalError> {
+    async fn spawn(&self, _inst: &Installed) -> Result<Proc, LocalError> {
         Err(LocalError::new("PLUGIN_UNSUPPORTED"))
     }
+
+    /// 宿主接口 `/_host/license`：代插件向服务端申请授权凭证
+    pub async fn license(&self, name: &str, req: &proto::LicenseRequest) -> Result<proto::LicenseResponse, LocalError> {
+        self.installed(name)?;
+        if self.account.session().is_none() {
+            return Err(LocalError::new("NOT_LOGGED_IN"));
+        }
+        Ok(self.account.plugin_license(name, req).await?)
+    }
+
+    /// 宿主接口 `/_host/info`：这台设备、这个看看
+    pub fn info(&self) -> Value {
+        let s = self.account.session();
+        json!({
+            "client_version": env!("CARGO_PKG_VERSION"),
+            "protocol": proto::PROTOCOL,
+            "platform": proto::current_platform(),
+            "signed_in": s.is_some(),
+            "device_id": s.as_ref().map(|s| s.device_id.clone()),
+        })
+    }
+
+    /// 这个 Socket 是哪个插件的（宿主接口按口令认插件之外，再核对一下名字）
+    pub async fn running_names(&self) -> Vec<String> {
+        self.running.lock().await.iter().filter(|(_, p)| p.alive()).map(|(n, _)| n.clone()).collect()
+    }
 }
 
-/// 核验一个插件目录：离线 Ed25519 签名 + `package.json` 列表里的每个文件 SHA-256 + `manifest.json` 合法性。
-pub fn verify_dir(dir: &Path, keys: &HashMap<String, VerifyingKey>, expected_name: Option<&str>) -> Result<(Manifest, PackageIndex)> {
-    let pkg_bytes = std::fs::read(dir.join(proto::PACKAGE_FILE)).context("缺少 package.json")?;
-    let sig_bytes = std::fs::read(dir.join(proto::SIGNATURE_FILE)).context("缺少 package.sig")?;
-    let sig: PackageSignature = serde_json::from_slice(&sig_bytes).context("package.sig 格式错误")?;
-    if !proto::verify_package(keys, &pkg_bytes, &sig) {
-        bail!("插件包签名校验失败");
-    }
-    let pkg = PackageIndex::parse(&pkg_bytes).map_err(|e| anyhow::anyhow!(e))?;
-    if let Some(n) = expected_name {
-        if pkg.name != n {
-            bail!("插件名不匹配: 期望 {n}, 实际 {}", pkg.name);
-        }
-    }
-    for (rel, expected_sha) in &pkg.files {
-        let p = dir.join(rel);
-        let meta = std::fs::symlink_metadata(&p).with_context(|| format!("缺少文件 {rel}"))?;
-        if !meta.file_type().is_file() {
-            bail!("非法文件类型（禁止符号链接）: {rel}");
-        }
-        let actual = sha256_file(&p)?;
-        if !actual.eq_ignore_ascii_case(expected_sha) {
-            bail!("文件校验和不匹配: {rel}");
-        }
-    }
-    let manifest_bytes = std::fs::read(dir.join(proto::MANIFEST_FILE)).context("缺少 manifest.json")?;
-    let manifest = Manifest::parse(&manifest_bytes).map_err(|e| anyhow::anyhow!(e))?;
-    if manifest.name != pkg.name || manifest.version != pkg.version {
-        bail!("manifest 与 package 信息不一致");
-    }
-    if !pkg.files.contains_key(&manifest.exec) {
-        bail!("可执行文件不在签名清单中: {}", manifest.exec);
-    }
-    Ok((manifest, pkg))
+#[cfg(unix)]
+fn uid() -> u32 {
+    unsafe { libc::getuid() }
 }
 
-fn sha256_file(path: &Path) -> Result<String> {
-    let mut f = std::fs::File::open(path)?;
-    let mut h = Sha256::new();
-    let mut buf = [0u8; 64 * 1024];
-    loop {
-        let n = f.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        h.update(&buf[..n]);
-    }
-    Ok(data_encoding::HEXLOWER.encode(&h.finalize()))
+#[cfg(not(unix))]
+fn uid() -> u32 {
+    0
 }
 
-fn check_compat(m: &Manifest) -> Option<&'static str> {
-    if !m.supports_protocol(PROTOCOL_VERSION) {
-        return Some("PROTOCOL_UNSUPPORTED");
+/// 只有自己能进（插件程序、数据、Socket 目录）
+fn restrict(p: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o700));
     }
-    if !m.supports_platform(paths::target()) {
-        return Some("PLATFORM_UNSUPPORTED");
-    }
-    if !m.min_client.is_empty() {
-        if let (Ok(cur), Ok(min)) = (semver::Version::parse(VERSION), semver::Version::parse(&m.min_client)) {
-            if cur < min {
-                return Some("CLIENT_TOO_OLD");
+    #[cfg(not(unix))]
+    let _ = p;
+}
+
+fn log_tail(p: &Path) -> String {
+    let text = std::fs::read_to_string(p).unwrap_or_default();
+    let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+    lines[lines.len().saturating_sub(5)..].join("\n")
+}
+
+/// 把包解到 `dest`：只要普通文件和目录，路径不能跑出去；解完核对 `manifest.json` 和签过名的一致
+fn unpack(tgz: &Path, dest: &Path, release: &Release) -> Result<(), LocalError> {
+    let _ = std::fs::remove_dir_all(dest);
+    std::fs::create_dir_all(dest).map_err(|e| err("PLUGIN_INSTALL", e))?;
+    let f = std::fs::File::open(tgz).map_err(|e| err("PLUGIN_INSTALL", e))?;
+    let mut ar = tar::Archive::new(flate2::read::GzDecoder::new(f));
+    for entry in ar.entries().map_err(|e| err("PLUGIN_INVALID", e))? {
+        let mut e = entry.map_err(|e| err("PLUGIN_INVALID", e))?;
+        let path = e.path().map_err(|e| err("PLUGIN_INVALID", e))?.into_owned();
+        let safe = !path.as_os_str().is_empty() && path.components().all(|c| matches!(c, std::path::Component::Normal(_)));
+        if !safe {
+            return Err(err("PLUGIN_INVALID", format!("bad path {}", path.display())));
+        }
+        let out = dest.join(&path);
+        match e.header().entry_type() {
+            tar::EntryType::Directory => std::fs::create_dir_all(&out).map_err(|e| err("PLUGIN_INSTALL", e))?,
+            tar::EntryType::Regular | tar::EntryType::Continuous => {
+                if let Some(d) = out.parent() {
+                    std::fs::create_dir_all(d).map_err(|e| err("PLUGIN_INSTALL", e))?;
+                }
+                let mode = e.header().mode().unwrap_or(0o644);
+                let mut w = std::fs::File::create(&out).map_err(|e| err("PLUGIN_INSTALL", e))?;
+                std::io::copy(&mut e, &mut w).map_err(|e| err("PLUGIN_INSTALL", e))?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = std::fs::set_permissions(&out, std::fs::Permissions::from_mode(if mode & 0o111 != 0 { 0o700 } else { 0o600 }));
+                }
+                #[cfg(not(unix))]
+                let _ = mode;
             }
+            other => return Err(err("PLUGIN_INVALID", format!("unsupported entry {other:?} {}", path.display()))),
         }
     }
-    None
-}
-
-fn is_newer(remote: &str, local: &str) -> bool {
-    match (semver::Version::parse(remote), semver::Version::parse(local)) {
-        (Ok(r), Ok(l)) => r > l,
-        _ => remote != local,
+    let m: Manifest = std::fs::read(dest.join("manifest.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).ok_or_else(|| err("PLUGIN_INVALID", "manifest.json"))?;
+    if m != release.manifest {
+        return Err(err("PLUGIN_INVALID", "manifest.json does not match the signed release"));
     }
-}
-
-/// 短路径 Unix socket 目录（避开 108 字节 `sun_path` 上限），目录权限 0700。
-#[cfg(unix)]
-fn unix_socket_dir() -> Result<PathBuf> {
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
-    let uid = unsafe { libc::geteuid() };
-    let candidate = std::env::var_os("XDG_RUNTIME_DIR")
-        .map(|d| PathBuf::from(d).join("looklook-p"))
-        .filter(|p| p.to_string_lossy().len() <= 64)
-        .unwrap_or_else(|| PathBuf::from(format!("/tmp/looklook-p-{uid}")));
-    std::fs::create_dir_all(&candidate)?;
-    let meta = std::fs::symlink_metadata(&candidate)?;
-    if !meta.file_type().is_dir() || meta.uid() != uid {
-        bail!("socket 目录所有权异常: {}", candidate.display());
+    if !dest.join(&m.exec).is_file() {
+        return Err(err("PLUGIN_INVALID", format!("{} missing", m.exec)));
     }
-    std::fs::set_permissions(&candidate, std::fs::Permissions::from_mode(0o700))?;
-    Ok(candidate)
-}
-
-#[cfg(unix)]
-async fn unix_request(
-    socket: &Path,
-    method: Method,
-    path: &str,
-    token: &str,
-    locale: Option<&str>,
-    body: Option<Vec<u8>>,
-) -> Result<(StatusCode, Bytes)> {
-    let stream = tokio::time::timeout(Duration::from_secs(5), tokio::net::UnixStream::connect(socket)).await??;
-    let (mut sender, conn) = hyper::client::conn::http1::handshake::<_, Full<Bytes>>(TokioIo::new(stream)).await?;
-    tokio::spawn(async move {
-        let _ = conn.await;
-    });
-    let mut builder = Request::builder()
-        .method(method)
-        .uri(path)
-        .header(hyper::header::HOST, "localhost")
-        .header(proto::HDR_TOKEN, token);
-    if let Some(l) = locale {
-        builder = builder.header(proto::HDR_LOCALE, l);
-    }
-    let body_bytes = if let Some(b) = body {
-        builder = builder.header(hyper::header::CONTENT_TYPE, "application/json");
-        Bytes::from(b)
-    } else {
-        Bytes::new()
-    };
-    let req = builder.body(Full::new(body_bytes))?;
-    let resp: hyper::Response<Incoming> = tokio::time::timeout(Duration::from_secs(15), sender.send_request(req)).await??;
-    let status = resp.status();
-    let bytes = tokio::time::timeout(Duration::from_secs(15), resp.into_body().collect()).await??.to_bytes();
-    Ok((status, bytes))
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
-    use flate2::write::GzEncoder;
-    use flate2::Compression;
-    use looklook_protocol::plugin::{Capabilities, Entry, Localized, ProtocolRange, ReadonlyPolicy};
-    use looklook_protocol::signing::sha256_hex;
+    use std::collections::BTreeMap;
+    use std::io::Write;
 
-    fn make_test_archive(dir: &Path, key: &SigningKey, name: &str, version: &str, script: &str) -> PathBuf {
-        let manifest = Manifest {
-            name: name.into(),
-            version: version.into(),
-            protocol: ProtocolRange { min: 1, max: 1 },
-            min_client: "1.0.0".into(),
-            platforms: vec![paths::target().into()],
-            exec: "bin/run.sh".into(),
-            title: Localized { zh: "测试插件".into(), en: "Test plugin".into() },
-            description: Localized::default(),
-            icon: "globe".into(),
-            entries: vec![Entry { id: "main".into(), title: Localized { zh: "测试".into(), en: "Test".into() }, icon: "globe".into(), path: String::new() }],
-            capabilities: Capabilities::default(),
-            autostart_if_exists: None,
-            readonly_policy: ReadonlyPolicy::Deny,
-            inject_web_prefixes: vec![],
-            idle_stop_minutes: 10,
-            requires_license: false,
-        };
-        let m_bytes = serde_json::to_vec(&manifest).unwrap();
-        let s_bytes = script.as_bytes();
-        let mut files = BTreeMap::new();
-        files.insert(proto::MANIFEST_FILE.into(), sha256_hex(&m_bytes));
-        files.insert("bin/run.sh".into(), sha256_hex(s_bytes));
-        let idx = PackageIndex {
-            name: name.into(),
-            version: version.into(),
-            target: paths::target().into(),
-            files,
-            executables: vec!["bin/run.sh".into()],
-        };
-        let idx_bytes = serde_json::to_vec(&idx).unwrap();
-        let sig = proto::sign_package(key, "k1", &idx_bytes);
-        let sig_bytes = serde_json::to_vec(&sig).unwrap();
-
-        let tar_path = dir.join(format!("{name}-{version}.tar.gz"));
-        let f = std::fs::File::create(&tar_path).unwrap();
-        let enc = GzEncoder::new(f, Compression::default());
-        let mut ar = tar::Builder::new(enc);
-        let mut append = |path: &str, data: &[u8]| {
-            let mut h = tar::Header::new_gnu();
-            h.set_size(data.len() as u64);
-            h.set_mode(0o644);
-            h.set_cksum();
-            ar.append_data(&mut h, path, data).unwrap();
-        };
-        append(proto::MANIFEST_FILE, &m_bytes);
-        append(proto::PACKAGE_FILE, &idx_bytes);
-        append(proto::SIGNATURE_FILE, &sig_bytes);
-        append("bin/run.sh", s_bytes);
-        ar.into_inner().unwrap().finish().unwrap();
-        tar_path
+    fn manifest(exec: &str) -> Manifest {
+        Manifest {
+            name: "demo".into(),
+            version: "1.0.0".into(),
+            protocol: proto::PROTOCOL,
+            min_client: String::new(),
+            title: BTreeMap::from([("en-US".into(), "Demo".into())]),
+            description: BTreeMap::new(),
+            icon: String::new(),
+            exec: exec.into(),
+            autostart_if_exists: Some("run.json".into()),
+            open_url: false,
+        }
     }
 
+    fn tgz(files: &[(&str, &[u8], u32)]) -> Vec<u8> {
+        let mut out = vec![];
+        {
+            let gz = flate2::write::GzEncoder::new(&mut out, flate2::Compression::fast());
+            let mut t = tar::Builder::new(gz);
+            for (p, data, mode) in files {
+                let mut h = tar::Header::new_gnu();
+                h.set_size(data.len() as u64);
+                h.set_mode(*mode);
+                h.set_cksum();
+                t.append_data(&mut h, p, *data).unwrap();
+            }
+            t.into_inner().unwrap().finish().unwrap().flush().unwrap();
+        }
+        out
+    }
+
+    fn release(m: Manifest) -> Release {
+        Release { name: m.name.clone(), version: m.version.clone(), platform: proto::current_platform(), sha256: "0".repeat(64), size: 1, manifest: m, published_at: String::new() }
+    }
+
+    #[test]
+    fn unpack_checks_paths_and_manifest() {
+        let d = tempfile::tempdir().unwrap();
+        let m = manifest("bin/demo");
+        let mj = serde_json::to_vec(&m).unwrap();
+        let good = d.path().join("good.tgz");
+        std::fs::write(&good, tgz(&[("manifest.json", &mj, 0o644), ("bin/demo", b"#!/bin/sh\n", 0o755)])).unwrap();
+        let dest = d.path().join("out");
+        unpack(&good, &dest, &release(m.clone())).unwrap();
+        assert!(dest.join("bin/demo").is_file());
+        // 清单和签过名的不一样
+        let other = Manifest { version: "2.0.0".into(), ..m.clone() };
+        assert!(unpack(&good, &dest, &release(other)).is_err());
+        // 程序不在包里
+        let nobin = d.path().join("nobin.tgz");
+        std::fs::write(&nobin, tgz(&[("manifest.json", &mj, 0o644)])).unwrap();
+        assert!(unpack(&nobin, &dest, &release(m.clone())).is_err());
+        // 路径跑出去：tar 库本身也拒绝写 `..`，这里手写一个头
+        let mut raw = vec![];
+        {
+            let gz = flate2::write::GzEncoder::new(&mut raw, flate2::Compression::fast());
+            let mut t = tar::Builder::new(gz);
+            let mut h = tar::Header::new_gnu();
+            h.as_gnu_mut().unwrap().name[..9].copy_from_slice(b"../evil.x");
+            h.set_size(1);
+            h.set_mode(0o644);
+            h.set_cksum();
+            t.append(&h, &b"x"[..]).unwrap();
+            t.into_inner().unwrap().finish().unwrap();
+        }
+        let evil = d.path().join("evil.tgz");
+        std::fs::write(&evil, raw).unwrap();
+        assert!(unpack(&evil, &dest, &release(m)).is_err());
+        assert!(!d.path().join("evil.x").exists());
+    }
+
+    /// 装好的插件要验签：用测试密钥签一个，改了 release.json 就不认
+    #[test]
+    fn installed_checks_signature() {
+        let home = tempfile::tempdir().unwrap();
+        let paths = Paths::discover(Some(home.path().to_path_buf())).unwrap();
+        let store = Arc::new(crate::store::Store::memory().unwrap());
+        let account = crate::account::Account::new(store, paths.clone(), "https://looklook.example", "").unwrap();
+        let sk = SigningKey::from_bytes(&[3; 32]);
+        let keys = format!("pk1={}", looklook_protocol::signing::b64(sk.verifying_key().as_bytes()));
+        let p = Plugins::new(paths, account, &keys);
+        let dir = p.dir("demo");
+        std::fs::create_dir_all(&dir).unwrap();
+        let raw = serde_json::to_vec(&release(manifest("bin/demo"))).unwrap();
+        std::fs::write(dir.join("release.json"), &raw).unwrap();
+        std::fs::write(dir.join("release.sig"), serde_json::to_vec(&proto::sign_release(&sk, "pk1", &raw)).unwrap()).unwrap();
+        assert_eq!(p.installed("demo").unwrap().release.version, "1.0.0");
+        assert_eq!(p.installed_names(), ["demo"]);
+        let bad = serde_json::to_vec(&release(Manifest { version: "9.0.0".into(), ..manifest("bin/demo") })).unwrap();
+        std::fs::write(dir.join("release.json"), bad).unwrap();
+        assert_eq!(p.installed("demo").unwrap_err().code, "PLUGIN_INVALID");
+        assert_eq!(p.installed("missing").unwrap_err().code, "PLUGIN_NOT_INSTALLED");
+        assert_eq!(p.installed("../x").unwrap_err().code, "PLUGIN_NOT_FOUND");
+        assert!(p.host_token_ok(&p.host_token.clone()) && !p.host_token_ok("nope"));
+        // 要的看看版本比现在高
+        assert_eq!(Plugins::compatible(&Manifest { min_client: "99.0.0".into(), ..manifest("x") }).unwrap_err().code, "PLUGIN_NEEDS_CLIENT");
+        assert_eq!(Plugins::compatible(&Manifest { protocol: 99, ..manifest("x") }).unwrap_err().code, "PLUGIN_PROTOCOL");
+    }
+
+    /// 起一个假插件（shell 脚本 + python 监听 Socket），确认环境变量给到了、能连上
+    #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn install_verify_tamper_and_preserve_data() {
-        let tmp = tempfile::tempdir().unwrap();
-        let key = SigningKey::from_bytes(&[11u8; 32]);
-        let keys = HashMap::from([("k1".into(), key.verifying_key())]);
-        let plugins = Plugins::new(tmp.path().to_path_buf(), keys.clone());
-
-        let pkg1 = make_test_archive(tmp.path(), &key, "demo", "1.0.0", "#!/bin/sh\nexit 0\n");
-        plugins.install_from_archive(&pkg1, "demo", Some("1.0.0")).await.unwrap();
-        assert_eq!(plugins.list_installed().len(), 1);
-        assert_eq!(plugins.brief().len(), 1);
-
-        // 在数据目录放文件：升级插件后必须保留
-        let data = plugins.data_dir("demo");
-        std::fs::create_dir_all(&data).unwrap();
-        std::fs::write(data.join("keep.txt"), "ok").unwrap();
-
-        let pkg2 = make_test_archive(tmp.path(), &key, "demo", "1.1.0", "#!/bin/sh\nexit 0\n");
-        plugins.install_from_archive(&pkg2, "demo", Some("1.1.0")).await.unwrap();
-        assert_eq!(plugins.get_installed("demo").unwrap().manifest.version, "1.1.0");
-        assert_eq!(std::fs::read_to_string(data.join("keep.txt")).unwrap(), "ok");
-
-        // 篡改文件：验签必须拒绝
-        std::fs::write(plugins.plugins_dir().join("demo/bin/run.sh"), "evil").unwrap();
-        assert!(verify_dir(&plugins.plugins_dir().join("demo"), &keys, Some("demo")).is_err());
-
-        // 错误公钥安装必须拒绝
-        let other = Plugins::new(tmp.path().join("other"), HashMap::new());
-        assert!(other.install_from_archive(&pkg2, "demo", None).await.is_err());
+    async fn spawns_and_stops() {
+        if crate::shells::which("python3").is_none() {
+            return;
+        }
+        let home = tempfile::tempdir().unwrap();
+        let paths = Paths::discover(Some(home.path().to_path_buf())).unwrap();
+        let store = Arc::new(crate::store::Store::memory().unwrap());
+        let account = crate::account::Account::new(store, paths.clone(), "https://looklook.example", "").unwrap();
+        let sk = SigningKey::from_bytes(&[3; 32]);
+        let p = Plugins::new(paths, account, &format!("pk1={}", looklook_protocol::signing::b64(sk.verifying_key().as_bytes())));
+        let dir = p.dir("demo");
+        std::fs::create_dir_all(dir.join("bin")).unwrap();
+        let script = "#!/bin/sh\nexec python3 -c 'import os,socket\ns=socket.socket(socket.AF_UNIX)\ns.bind(os.environ[\"LOOKLOOK_PLUGIN_SOCKET\"])\ns.listen(1)\nopen(\"env.txt\",\"w\").write(os.environ[\"LOOKLOOK_PLUGIN_BASE\"])\nimport time\ntime.sleep(60)'\n";
+        std::fs::write(dir.join("bin/demo"), script).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir.join("bin/demo"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let raw = serde_json::to_vec(&release(manifest("bin/demo"))).unwrap();
+        std::fs::write(dir.join("release.json"), &raw).unwrap();
+        std::fs::write(dir.join("release.sig"), serde_json::to_vec(&proto::sign_release(&sk, "pk1", &raw)).unwrap()).unwrap();
+        assert!(!p.should_autostart("demo"));
+        let proc = p.ensure("demo").await.unwrap();
+        assert!(proc.alive());
+        let again = p.ensure("demo").await.unwrap();
+        assert!(Arc::ptr_eq(&proc, &again), "在跑就不再起");
+        assert_eq!(std::fs::read_to_string(p.data_dir("demo").join("env.txt")).unwrap(), "/p/demo/");
+        std::fs::write(p.data_dir("demo").join("run.json"), "{}").unwrap();
+        assert!(p.should_autostart("demo"));
+        p.stop("demo").await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!proc.alive());
     }
 }

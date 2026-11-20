@@ -3054,7 +3054,7 @@ checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 
 [[package]]
 name = "looklook-client"
-version = "1.87.0"
+version = "1.88.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -3121,7 +3121,6 @@ name = "looklook-protocol"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
- "chacha20poly1305",
  "ed25519-dalek",
  "hex",
  "hmac",

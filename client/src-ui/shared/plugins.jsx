@@ -1,52 +1,24 @@
-// 通用插件前端工具：图标映射、多语言取值、路由与 iframe 地址拼接。
-import { Activity, Bot, FolderOpen, Globe, Globe2, Monitor, Puzzle, Server, Shield, Terminal, Wrench } from 'lucide-react';
+// 插件（src/plugins.rs）在界面上的公共部分：路由、按语言挑名字、图标。看看不认识任何具体插件，入口都来自插件的清单。
+import { Box, Globe, Monitor, Puzzle, Terminal } from 'lucide-react';
 
-const ICONS = {
-  globe: Globe2,
-  web: Globe,
-  monitor: Monitor,
-  puzzle: Puzzle,
-  terminal: Terminal,
-  wrench: Wrench,
-  bot: Bot,
-  folder: FolderOpen,
-  server: Server,
-  shield: Shield,
-  activity: Activity,
-};
+import { isLocalDevice, selectedDevice } from './api.js';
 
-export function pluginIcon(name) {
-  return ICONS[String(name || '').toLowerCase()] || Puzzle;
+/** 插件页：`/plugin/<名>` */
+export const PLUGIN_ROUTE = /^\/plugin\/([a-z][a-z0-9-]{1,31})$/;
+export const pluginRoute = (name) => `/plugin/${name}`;
+export const parsePluginRoute = (path) => PLUGIN_ROUTE.exec(path)?.[1] ?? null;
+
+/** 清单里的多语言文字（`{ 'zh-CN': …, 'en-US': … }`）：按界面语言挑，没有就英文，再没有随便一个 */
+export function pickLocalized(map, lang) {
+  if (!map || typeof map !== 'object') return '';
+  return map[lang] || map[String(lang).startsWith('zh') ? 'zh-CN' : 'en-US'] || map['en-US'] || Object.values(map)[0] || '';
 }
 
-export function pickLocalized(obj, lang = 'zh-CN') {
-  if (!obj) return '';
-  if (typeof obj === 'string') return obj;
-  if (String(lang).toLowerCase().startsWith('en') && obj['en-US']) return obj['en-US'];
-  return obj['zh-CN'] || obj['en-US'] || '';
+const ICONS = { globe: Globe, monitor: Monitor, terminal: Terminal, box: Box, puzzle: Puzzle };
+/** 清单里的图标名（lucide 的名字），认不出用拼图 */
+export const pluginIcon = (name) => ICONS[name] ?? Puzzle;
+
+/** 插件页面的地址：在别的电脑上时带 `__lldev`（本机客户端 / 启动页按它把插件的请求转给那台电脑） */
+export function pluginFrameUrl(name, device = selectedDevice()) {
+  return device && !isLocalDevice(device) ? `/p/${name}/?__lldev=${encodeURIComponent(device)}` : `/p/${name}/`;
 }
-
-export const PLUGIN_ROUTE = /^\/plugin\/([a-z][a-z0-9-]{1,31})(?:\/(.*))?$/;
-
-export function parsePluginRoute(path) {
-  const m = String(path || '').match(PLUGIN_ROUTE);
-  if (!m) return null;
-  return { name: m[1], entryPath: m[2] || '' };
-}
-
-export function pluginRoute(name, entryPath = '') {
-  const rel = String(entryPath || '').replace(/^\/+/, '');
-  return rel ? `/plugin/${name}/${rel}` : `/plugin/${name}`;
-}
-
-/** 构造同源插件 iframe 地址：多台电脑时始终带上 __lldev（包括本机），让本机 to_peer / 远程 boot.js 更新路由归属。 */
-export function pluginIframeSrc(name, entryPath = '', deviceId = null, extraQuery = '') {
-  const rel = String(entryPath || '').replace(/^\/+/, '');
-  const base = `/p/${name}/${rel}`;
-  const params = new URLSearchParams(extraQuery ? extraQuery.replace(/^\?/, '') : '');
-  if (deviceId) params.set('__lldev', deviceId);
-  const q = params.toString();
-  return q ? `${base}?${q}` : base;
-}
-
-export const UI_MESSAGE_TAG = 'plugin';

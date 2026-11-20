@@ -13,7 +13,7 @@ use tokio::process::Command;
 use crate::error::LocalError;
 
 const TIMEOUT: Duration = Duration::from_secs(8);
-const AGENTS: [&str; 4] = ["claude", "codex", "opencode", "agy"];
+const AGENTS: [&str; 3] = ["claude", "codex", "opencode"];
 
 /// 会话所在的容器（存在 kv：`instance_container.{id}`）。
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
