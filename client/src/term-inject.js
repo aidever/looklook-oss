@@ -915,12 +915,19 @@
   }
 
   // 链接（xterm.js 的网址识别、OSC 8 超链接）：它们最后都调 window.open（网址识别是先开空白窗口再设地址，
-  // OSC 8 先 confirm 一下）。⌘ / Ctrl + 点击直接打开；普通点击在鼠标旁边弹出“打开 / 复制链接”，免得点一下终端就跳走。
+  // OSC 8 先 confirm 一下）。嵌在管理台 iframe 中时统一通过 postMessage 上报给父窗口渲染精美悬浮菜单；
+  // 独立打开终端时保留本地“打开 / 复制链接”气泡兜底。
   function setupLinks() {
     var nativeOpen = window.open, nativeConfirm = window.confirm;
+    var inFrame = false;
+    try { inFrame = Boolean(window.parent && window.parent !== window); } catch (e) { inFrame = true; }
     var press = { t: 0, x: 0, y: 0, mod: false };
     document.addEventListener('mouseup', function (e) {
       press = { t: Date.now(), x: e.clientX, y: e.clientY, mod: e.metaKey || e.ctrlKey };
+    }, true);
+    document.addEventListener('touchend', function (e) {
+      var c = e.changedTouches && e.changedTouches[0];
+      press = { t: Date.now(), x: c ? c.clientX : window.innerWidth / 2, y: c ? c.clientY : window.innerHeight / 2, mod: false };
     }, true);
     var pop = null;
     function hidePop() { if (pop) { pop.remove(); pop = null; } }
@@ -952,9 +959,15 @@
       p.style.left = Math.max(8, Math.min(press.x - 12, window.innerWidth - w - 8)) + 'px';
       p.style.top = (press.y + 14 + h < window.innerHeight ? press.y + 14 : Math.max(8, press.y - h - 14)) + 'px';
     }
-    // 是不是刚才那一下点击打开的链接（触屏上照常打开，没有悬停和修饰键）
-    function fromClick() { return Date.now() - press.t < 800 && !touch; }
+    // 是不是刚才那一下点击打开的链接（嵌在管理台时触屏同样上报给父窗口弹底部菜单）
+    function fromClick() { return Date.now() - press.t < 800 && (inFrame || !touch); }
     function handle(url) {
+      if (inFrame && /^https?:/i.test(url)) {
+        try {
+          window.parent.postMessage({ type: 'looklook:open-link', url: url, x: press.x, y: press.y, mod: press.mod }, '*');
+          return true;
+        } catch (e) {}
+      }
       if (!/^(https?|ftp|mailto):/i.test(url)) return false;
       if (press.mod) openUrl(url);
       else offer(url);

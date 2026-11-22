@@ -78,21 +78,42 @@ impl DataChannelHandler for DcHandler {
     }
 }
 
-/// 一条 DataChannel（浏览器开的，或者本机作为发起方开的）。释放它就关闭通道（libdatachannel 先发完已排队的数据）。
+/// 一条 DataChannel（浏览器开的，或者本机作为发起方开的），或者公网 HTTPS 直连的 WebSocket 里复用的一条通道
+/// （[`super::mux`]）。释放它就关闭通道（libdatachannel 先发完已排队的数据；复用的通道在已排队的数据后面发关闭）。
 pub struct Channel {
-    dc: Box<RtcDataChannel<DcHandler>>,
+    sink: Sink,
     rx: mpsc::UnboundedReceiver<DcEvent>,
     pub label: String,
 }
 
+enum Sink {
+    Dc(Box<RtcDataChannel<DcHandler>>),
+    Mux(super::mux::ChannelSink),
+}
+
 impl Channel {
+    fn dc(dc: Box<RtcDataChannel<DcHandler>>, rx: mpsc::UnboundedReceiver<DcEvent>, label: String) -> Self {
+        Self { sink: Sink::Dc(dc), rx, label }
+    }
+
+    /// 复用在一条 WebSocket 里的通道：`rx` 收这条通道的事件，发出的消息交给 `sink`。
+    pub(crate) fn mux(sink: super::mux::ChannelSink, rx: mpsc::UnboundedReceiver<DcEvent>, label: String) -> Self {
+        Self { sink: Sink::Mux(sink), rx, label }
+    }
+
     pub fn send(&mut self, msg: &[u8]) -> Result<()> {
-        self.dc.send(msg).map_err(|e| anyhow!("DataChannel 发送失败：{e:?}"))
+        match &mut self.sink {
+            Sink::Dc(dc) => dc.send(msg).map_err(|e| anyhow!("DataChannel 发送失败：{e:?}")),
+            Sink::Mux(m) => m.send(msg),
+        }
     }
 
     /// 发送缓冲超过高水位，应等 [`DcEvent::Low`] 再发。
     pub fn congested(&self) -> bool {
-        self.dc.buffered_amount() > HIGH_WATER
+        match &self.sink {
+            Sink::Dc(dc) => dc.buffered_amount() > HIGH_WATER,
+            Sink::Mux(m) => m.buffered() > HIGH_WATER,
+        }
     }
 
     /// 下一个事件；通道关闭后为 None（之后一直是 None）。
@@ -180,7 +201,7 @@ impl PeerConnectionHandler for PcHandler {
     fn on_data_channel(&mut self, mut dc: Box<RtcDataChannel<DcHandler>>) {
         if let Some((label, rx)) = self.pending.take() {
             let _ = dc.set_buffered_amount_low_threshold(LOW_WATER);
-            let _ = self.incoming.send(Channel { dc, rx, label });
+            let _ = self.incoming.send(Channel::dc(dc, rx, label));
         }
     }
 
@@ -392,7 +413,7 @@ impl Pc {
         let (tx, rx) = mpsc::unbounded_channel();
         let mut dc = self.pc.create_data_channel(label, DcHandler(tx)).map_err(|e| anyhow!("创建 DataChannel 失败：{e:?}"))?;
         let _ = dc.set_buffered_amount_low_threshold(LOW_WATER);
-        Ok(Channel { dc, rx, label: label.to_string() })
+        Ok(Channel::dc(dc, rx, label.to_string()))
     }
 
     /// 本机开一条不重传、不保序的通道（丢包率探测用，见 `super::probe`）。
@@ -400,7 +421,7 @@ impl Pc {
         let (tx, rx) = mpsc::unbounded_channel();
         let init = DataChannelInit::default().reliability(Reliability { unordered: true, unreliable: true, max_packet_life_time: 0, max_retransmits: 0 });
         let dc = self.pc.create_data_channel_ex(label, DcHandler(tx), &init).map_err(|e| anyhow!("创建 DataChannel 失败：{e:?}"))?;
-        Ok(Channel { dc, rx, label: label.to_string() })
+        Ok(Channel::dc(dc, rx, label.to_string()))
     }
 
     /// 发起方：设置对端的 answer。

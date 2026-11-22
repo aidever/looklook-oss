@@ -4,6 +4,7 @@
 //!   这里再校验授权票据（平台签名、未过期、一次性、发给本机用户与本设备、同一子站会话、未被吊销），
 //!   核对 offer 里浏览器的 DTLS 指纹等于票据里的 `browser_fp`，建立 PeerConnection，用设备私钥为 answer 签名；
 //! - **连接**（[`run_peer`]）：浏览器开的每条 DataChannel 交给 [`bridge`]，请求带 `Access::Rtc` 进现有路由；
+//!   开了公网 HTTPS 直连的电脑，专属域名下的页面改走 [`mux`]（一条 WebSocket 复用多条通道，帧相同）；
 //! - **失效与吊销**（§8.2）：子站会话到期、30 秒内没连上、连接失败或断开超过 30 秒时关闭；心跳下发的吊销列表、
 //!   退出登录、账户被停用时关闭（[`Rtc::watch`] 监视账户状态）；中转经通道推送的吊销（[`revoke`]）同样处理，
 //!   它只用来更快地关闭，不作为放行的依据。连接断开后还保留着的终端会话（[`resume`]）同样关闭。
@@ -11,6 +12,7 @@
 pub mod bridge;
 pub mod frame;
 pub mod mdns;
+pub mod mux;
 pub mod nat;
 pub mod net;
 pub mod outbound;

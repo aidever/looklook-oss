@@ -1,5 +1,10 @@
 {
   "NETWORK": "连不上看看服务器，请检查网络后再试",
+  "BROWSER_KEY_INVALID": "指纹浏览器访问密钥无效或已被重置，请重新绑定",
+  "BROWSER_LICENSE_INVALID": "远端指纹浏览器服务授权未激活或已过期",
+  "BROWSER_NOT_BOUND": "当前主机尚未绑定指纹浏览器",
+  "BROWSER_PROFILE_CONFLICT": "远端主机正运行其他浏览器配置，暂时无法启动当前配置",
+  "BROWSER_OPEN_FAILED": "指纹浏览器打开链接失败，请检查远端浏览器状态",
   "VALIDATION_FAILED": "填写的内容不正确：{{field_text}} {{rule_text}}",
   "UNAUTHENTICATED": "请先登录",
   "CSRF_FAILED": "页面已过期，请刷新后重试",

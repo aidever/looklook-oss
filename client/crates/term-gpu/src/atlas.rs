@@ -1,6 +1,8 @@
 //! 字形图集（设计稿 §7.2）：字交给浏览器光栅化——在一块小画布上用 Canvas2D 画（系统字体回退、中文、emoji 都有），
 //! 按设备像素读出来放进图集，再上传 GPU。宽字符按两格宽画，不裁；比格子宽的字横向压进格子里，后面的列不受影响。
 //! 框线、方块等自己画（boxdraw.rs）。
+//! 单色字不在透明底上画：浏览器（尤其 Windows）画字时按字和底的深浅做灰度 / 对比度补偿，白字透明底的遮罩
+//! 拿去画浅色主题的深色字会发粗发虚。所以按 `GlyphKey::dark` 在不透明画布上画黑字白底或白字黑底，再换成遮罩。
 
 use std::collections::HashMap;
 
@@ -23,6 +25,9 @@ pub struct Upload {
 pub struct Atlas {
     canvas: HtmlCanvasElement,
     ctx: CanvasRenderingContext2d,
+    /// 不透明画布：画单色字
+    solid: HtmlCanvasElement,
+    solid_ctx: CanvasRenderingContext2d,
     map: HashMap<GlyphKey, Slot>,
     pub uploads: Vec<Upload>,
     shelf_x: u32,
@@ -32,9 +37,12 @@ pub struct Atlas {
     font_px: f64,
 }
 
-fn context(canvas: &HtmlCanvasElement) -> Result<CanvasRenderingContext2d, JsValue> {
+fn context(canvas: &HtmlCanvasElement, opaque: bool) -> Result<CanvasRenderingContext2d, JsValue> {
     let opts = js_sys::Object::new();
     js_sys::Reflect::set(&opts, &"willReadFrequently".into(), &JsValue::TRUE)?;
+    if opaque {
+        js_sys::Reflect::set(&opts, &"alpha".into(), &JsValue::FALSE)?;
+    }
     canvas
         .get_context_with_context_options("2d", &opts)?
         .ok_or_else(|| JsValue::from_str("no 2d context"))?
@@ -48,10 +56,16 @@ impl Atlas {
         let canvas = doc.create_element("canvas")?.dyn_into::<HtmlCanvasElement>()?;
         canvas.set_width(64);
         canvas.set_height(32);
-        let ctx = context(&canvas)?;
+        let ctx = context(&canvas, false)?;
+        let solid = doc.create_element("canvas")?.dyn_into::<HtmlCanvasElement>()?;
+        solid.set_width(64);
+        solid.set_height(32);
+        let solid_ctx = context(&solid, true)?;
         Ok(Atlas {
             canvas,
             ctx,
+            solid,
+            solid_ctx,
             map: HashMap::new(),
             uploads: Vec::new(),
             shelf_x: 0,
@@ -94,9 +108,14 @@ impl Atlas {
         self.metrics = Metrics { cw, ch, pad_x: pad, pad_y: pad, baseline, underline_y, strike_y, thin };
         self.canvas.set_width(cw * 2 + 8);
         self.canvas.set_height(ch);
+        self.solid.set_width(cw * 2 + 8);
+        self.solid.set_height(ch);
         // 画布尺寸变了，上下文的状态会被重置：重新拿一次
-        if let Ok(ctx) = context(&self.canvas) {
+        if let Ok(ctx) = context(&self.canvas, false) {
             self.ctx = ctx;
+        }
+        if let Ok(ctx) = context(&self.solid, true) {
+            self.solid_ctx = ctx;
         }
         self.clear();
         self.metrics
@@ -109,8 +128,7 @@ impl Atlas {
         self.shelf_y = 0;
     }
 
-    fn draw_prims(&self, prims: &[Prim]) {
-        let ctx = &self.ctx;
+    fn draw_prims(ctx: &CanvasRenderingContext2d, prims: &[Prim]) {
         for p in prims {
             match p {
                 Prim::Rect(x, y, w, h, a) => {
@@ -142,11 +160,19 @@ impl Atlas {
         }
     }
 
-    fn rasterize(&self, key: &GlyphKey, w: u32, h: u32) -> Option<Vec<u8>> {
-        let ctx = &self.ctx;
-        ctx.clear_rect(0.0, 0.0, self.canvas.width() as f64, self.canvas.height() as f64);
-        ctx.set_fill_style_str("#fff");
-        ctx.set_stroke_style_str("#fff");
+    /// 画一个字：`ink` 是字的颜色，`paper` 是底色（None = 透明底）
+    fn rasterize(&self, key: &GlyphKey, w: u32, h: u32, ink: &str, paper: Option<&str>) -> Option<Vec<u8>> {
+        let (ctx, canvas) = if paper.is_some() { (&self.solid_ctx, &self.solid) } else { (&self.ctx, &self.canvas) };
+        let (cw, chh) = (canvas.width() as f64, canvas.height() as f64);
+        match paper {
+            Some(p) => {
+                ctx.set_fill_style_str(p);
+                ctx.fill_rect(0.0, 0.0, cw, chh);
+            }
+            None => ctx.clear_rect(0.0, 0.0, cw, chh),
+        }
+        ctx.set_fill_style_str(ink);
+        ctx.set_stroke_style_str(ink);
         let m = self.metrics;
         let mut chars = key.text.chars();
         let single = match (chars.next(), chars.next()) {
@@ -154,9 +180,9 @@ impl Atlas {
             _ => None,
         };
         if key.curl {
-            self.draw_prims(&boxdraw::undercurl(w, h, m.underline_y as f32, m.thin as f32));
+            Self::draw_prims(ctx, &boxdraw::undercurl(w, h, m.underline_y as f32, m.thin as f32));
         } else if let Some(prims) = single.and_then(|c| boxdraw::prims(c, w, h)) {
-            self.draw_prims(&prims);
+            Self::draw_prims(ctx, &prims);
         } else {
             ctx.set_font(&self.font(key.bold, key.italic));
             ctx.set_text_baseline("alphabetic");
@@ -184,7 +210,7 @@ impl Glyphs for Atlas {
         let m = self.metrics;
         let w = m.cw * key.cells.max(1) as u32;
         let h = m.ch;
-        let data = self.rasterize(key, w, h)?;
+        let mut data = self.rasterize(key, w, h, "#fff", None)?;
         let mut empty = true;
         let mut color = false;
         for px in data.as_chunks::<4>().0 {
@@ -196,6 +222,16 @@ impl Glyphs for Atlas {
                 let (r, g, b) = (px[0] as i32, px[1] as i32, px[2] as i32);
                 if (r - g).abs() > 24 || (g - b).abs() > 24 || r < 200 {
                     color = true;
+                }
+            }
+        }
+        if !empty && !color {
+            // 单色字：按深浅在不透明底上重画，三个通道取平均当覆盖度（有 LCD 抗锯齿时也成灰度）
+            let (ink, paper) = if key.dark { ("#000", "#fff") } else { ("#fff", "#000") };
+            if let Some(solid) = self.rasterize(key, w, h, ink, Some(paper)) {
+                for (dst, src) in data.as_chunks_mut::<4>().0.iter_mut().zip(solid.as_chunks::<4>().0) {
+                    let v = (src[0] as u32 + src[1] as u32 + src[2] as u32) / 3;
+                    *dst = [255, 255, 255, if key.dark { 255 - v } else { v } as u8];
                 }
             }
         }

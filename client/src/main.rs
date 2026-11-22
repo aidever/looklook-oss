@@ -77,6 +77,7 @@ mod provider_quota;
 mod push;
 mod relay;
 mod relay_watch;
+mod remote_browser;
 mod rtc;
 mod run_actions;
 mod settings;

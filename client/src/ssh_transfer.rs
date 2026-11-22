@@ -1240,7 +1240,16 @@ pub(crate) mod e2e {
         assert_eq!(via_router(&a, remote.clone(), "/api/ssh/transfer/list", json!({})).await.1, "SSH_TRANSFER_NEED_RTC");
         assert_eq!(via_router(&a, Access::Local, "/api/ssh/transfer/list", json!({})).await.1, "SSH_TRANSFER_NEED_RTC");
         assert_eq!(via_router(&a, rtc.clone(), "/api/ssh/transfer/x/approve", json!({ "code": "123456" })).await.1, "SSH_TRANSFER_LOCAL_APPROVE");
-        assert_eq!(via_router(&a, remote, "/api/ssh/transfer/x/approve", json!({ "code": "123456" })).await.1, "SSH_TRANSFER_NEED_RTC");
+        assert_eq!(via_router(&a, remote.clone(), "/api/ssh/transfer/x/approve", json!({ "code": "123456" })).await.1, "SSH_TRANSFER_NEED_RTC");
+        // 横幅轮询的 pending：没资格确认时回 200 + blocked（不回 400，免得控制台刷屏），不给列表
+        for (access, code) in [(rtc.clone(), "SSH_TRANSFER_LOCAL_APPROVE"), (remote.clone(), "SSH_TRANSFER_NEED_RTC")] {
+            let mut req = Request::builder().uri("/api/ssh/transfer/pending").header(crate::gateway::CLIENT_HEADER, "1").body(Body::empty()).unwrap();
+            req.extensions_mut().insert(access);
+            let r = gateway::router(a.clone()).oneshot(req).await.unwrap();
+            assert_eq!(r.status(), StatusCode::OK);
+            let v: Value = serde_json::from_slice(&axum::body::to_bytes(r.into_body(), 1 << 20).await.unwrap()).unwrap();
+            assert_eq!(v, json!({ "items": [], "last_export": null, "blocked": code }));
+        }
 
         // B 列出 A 的主机：不含秘密
         let listed = remote_hosts(&b, "deva").await.unwrap();

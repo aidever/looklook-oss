@@ -314,12 +314,13 @@ export function TransferBanner() {
     }
   });
   const load = useCallback(() => localApi.get('/ssh/transfer/pending').then(setData, () => setData(null)), []);
+  // 没资格确认（blocked：远程会话、没开远程确认）或出错时也隔一会儿再看看，设置可能刚改
+  const idle = data === null || Boolean(data.blocked);
   useEffect(() => {
     load();
-    // 打不开（远程会话、没开远程确认）也隔一会儿再看看，设置可能刚改
-    const timer = setInterval(load, data === null ? 30000 : 4000);
+    const timer = setInterval(load, idle ? 30000 : 4000);
     return () => clearInterval(timer);
-  }, [load, data === null]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [load, idle]);
   const items = data?.items ?? [];
   const last = data?.last_export;
   const recent = last && last.at !== seen && Date.now() - Date.parse(last.at) < 3600_000;

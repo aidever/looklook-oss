@@ -109,7 +109,6 @@ const TOOLS = [
   { to: '/ssh', icon: Server, key: 'nav.ssh', short: 'nav.short.ssh' },
   { to: '/pages', icon: Globe, key: 'nav.pages', short: 'nav.short.pages' },
   { to: '/system', icon: Activity, key: 'nav.system', short: 'nav.short.system' },
-  { to: '/plugins', icon: Puzzle, key: 'nav.plugins', short: 'nav.short.plugins' },
   { to: '/ai', icon: Bot, key: 'nav.ai', short: 'nav.short.ai', config: true },
   { to: '/settings', icon: SettingsIcon, key: 'nav.settings', short: 'nav.short.settings', config: true },
 ];
@@ -121,7 +120,7 @@ const SESS = /^\/s\/([a-z2-7]{8})$/;
 const ACCOUNT_PAGES = ['/devices', '/membership', '/account'];
 // 从右边滑出来的抽屉（地址照旧，链接、刷新都能直接打开）：盖在会话上面，不换掉它，关掉回到会话。
 // 会话为主（docs/SESSION_FIRST_DESIGN_2026-11-16.md P0）：文件、SSH、网页、系统、AI 这些工具也是抽屉（更宽一档）
-const TOOL_DRAWERS = ['/files', '/ssh', '/pages', '/system', '/plugins', '/ai'];
+const TOOL_DRAWERS = ['/files', '/ssh', '/pages', '/system', '/ai'];
 const DRAWER_PAGES = {
   '/settings': 'nav.settings',
   '/devices': 'acct.computers',
@@ -472,15 +471,11 @@ function usePluginItems() {
     .map((p) => ({ icon: pluginIcon(p.icon), label: pickLocalized(p.title, i18n.language) || p.name, hint: p.running ? t('plugins.running') : undefined, onClick: () => navigate(pluginRoute(p.name)) }));
 }
 
-/** 工具菜单：装着的插件、文件、SSH、网页、系统、插件管理 */
+/** 工具菜单：文件、SSH、网页、系统 */
 function useToolMenu() {
   const { t } = useTranslation();
   const { navigate } = useRouter();
-  const plugins = usePluginItems();
-  return [
-    ...plugins,
-    ...TOOLS.filter((x) => !x.config).map((x) => ({ icon: x.icon, label: t(x.key), onClick: () => navigate(x.to) })),
-  ].filter(Boolean);
+  return TOOLS.filter((x) => !x.config).map((x) => ({ icon: x.icon, label: t(x.key), onClick: () => navigate(x.to) }));
 }
 
 /**
@@ -568,10 +563,8 @@ function useMeMenu({ tasks = true } = {}) {
   const { status } = useStatus();
   const { navigate } = useRouter();
   const n = useAttnCount();
-  const plugins = usePluginItems();
   const item = (x) => ({ icon: x.icon, label: t(x.short), onClick: () => navigate(x.to) });
   return useUserMenu([
-    ...plugins,
     tasks && { icon: ListTodo, label: t('nav.short.tasks'), count: n, onClick: () => navigate('/tasks') },
     { icon: History, label: t('nav.short.history'), onClick: () => navigate('/history') },
     ...TOOLS.filter((x) => !x.config).map(item),

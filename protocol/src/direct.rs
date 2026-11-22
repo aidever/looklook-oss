@@ -15,6 +15,19 @@ use crate::signing::{b64, b64_decode, sign, verify};
 pub const GRANT_PATH: &str = "/_ll/direct-grant";
 /// 电脑上接收票据的页面（GET 返回页面，POST 提交票据）。
 pub const CLIENT_PATH: &str = "/__looklook/direct";
+/// 电脑上的直连传输（专属域名下的页面跨源连过来）：`wss://IP:端口/__looklook/mux?g=<票据>`。
+///
+/// 一条 WebSocket 里复用多条通道，每条通道上跑的帧与 WebRTC DataChannel 完全相同（服务端 docs/06 §6.2）。
+/// WebSocket 的每条二进制消息：`[op: u8][通道 id: u32 大端][内容]`，op 见 [`MUX_OPEN`]、[`MUX_MSG`]、[`MUX_CLOSE`]。
+/// 通道只由浏览器打开（id 由浏览器分配），任一方都可以关。
+pub const MUX_PATH: &str = "/__looklook/mux";
+/// 打开通道，内容是通道名（`ctl`、`r`）。
+pub const MUX_OPEN: u8 = 1;
+/// 通道上的一条消息。
+pub const MUX_MSG: u8 = 2;
+/// 关闭通道（内容为空）。
+pub const MUX_CLOSE: u8 = 3;
+
 /// 电脑上的自检地址：只返回固定内容 [`PING_BODY`]，不需要认证。
 pub const PING_PATH: &str = "/__looklook/ping";
 pub const PING_BODY: &str = "looklook-direct-ok";
@@ -71,6 +84,12 @@ pub struct DirectGrant {
     pub dev: String,
     /// 直连地址的源（`https://34.168.24.68:1234`），电脑校验等于这次请求的源。
     pub origin: String,
+    /// 签发票据的用户站（稳定地址，`alice.looklook.example`）与它的源：专属域名下经 [`MUX_PATH`] 直连时，
+    /// 电脑把请求当作来自这个站（同 RtcGrant 的 host / origin），并校验 WebSocket 的 Origin 等于 `site`。旧平台签的票据没有。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub host: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub site: String,
     /// 子站会话的绝对到期时间（Unix 毫秒）：电脑发的 Cookie 最多活到这时。
     pub abs_exp: i64,
     pub iat: i64,
@@ -161,11 +180,23 @@ mod tests {
             sid: "s1".into(),
             dev: "dev1".into(),
             origin: "https://203.0.113.7:1234".into(),
+            host: "alice.looklook.example".into(),
+            site: "https://alice.looklook.example".into(),
             abs_exp: 10_000_000,
             iat: 0,
             exp: GRANT_TTL_MS,
             jti: "j".into(),
         }
+    }
+
+    #[test]
+    fn old_grant_without_site_parses() {
+        let mut g = grant();
+        g.host.clear();
+        g.site.clear();
+        let json = serde_json::to_string(&g).unwrap();
+        assert!(!json.contains("site"), "空的不写出来：{json}");
+        assert_eq!(serde_json::from_str::<DirectGrant>(&json).unwrap(), g);
     }
 
     #[test]

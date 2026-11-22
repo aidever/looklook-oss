@@ -1,5 +1,10 @@
 {
   "NETWORK": "Can't reach the Looklook server. Check your network and try again",
+  "BROWSER_KEY_INVALID": "Fingerprint browser access key is invalid or has been reset. Please reconnect.",
+  "BROWSER_LICENSE_INVALID": "Remote fingerprint browser service license is inactive or expired.",
+  "BROWSER_NOT_BOUND": "No fingerprint browser is bound to this host.",
+  "BROWSER_PROFILE_CONFLICT": "Another browser profile is currently running on the remote host.",
+  "BROWSER_OPEN_FAILED": "Failed to open link in the fingerprint browser.",
   "VALIDATION_FAILED": "Invalid input: {{field_text}} {{rule_text}}",
   "UNAUTHENTICATED": "Please sign in first",
   "CSRF_FAILED": "The page has expired. Refresh and try again",

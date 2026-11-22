@@ -380,6 +380,11 @@ impl Direct {
     fn note_login(&self, ip: IpAddr, via: &'static str) {
         tracing::info!(%ip, via, "公网直连登录");
         let mut l = lock(&self.logins);
+        // 同一来源、同一方式 10 分钟内又来（直连传输断了重连）：只更新时间
+        if let Some(last) = l.back_mut().filter(|x| x.ip == ip && x.via == via && now_ms() - x.at < 600_000) {
+            last.at = now_ms();
+            return;
+        }
         l.push_back(Login { ip, at: now_ms(), via });
         while l.len() > MAX_LOGINS {
             l.pop_front();
@@ -435,9 +440,23 @@ impl Direct {
 
     /// `POST /__looklook/direct`：校验平台签的票据，通过就发 Cookie。`origin`：这次请求的源（`https://` + Host）。
     pub fn accept_grant(&self, account: &crate::account::Account, ip: IpAddr, origin: &str, token: &str) -> Response {
+        let g = match self.check_grant(account, ip, origin, token, "grant") {
+            Ok(g) => g,
+            Err(why) => return (StatusCode::FORBIDDEN, axum::Json(serde_json::json!({ "error": why }))).into_response(),
+        };
+        let Some(session) = account.session() else { return (StatusCode::FORBIDDEN, axum::Json(serde_json::json!({ "error": "not_logged_in" }))).into_response() };
+        let now = account.clock.now_ms();
+        let mut r = axum::Json(serde_json::json!({ "ok": true })).into_response();
+        Self::set_cookie(&mut r, &self.grant_cookie(&session.user.id, &g.sid, g.abs_exp), (g.abs_exp - now) / 1000);
+        r
+    }
+
+    /// 校验直连票据（§5）：签名、本机用户与设备、`origin` 是这次请求的源、没过期、没吊销、`jti` 没用过。
+    /// 通过时记一次公网登录（`via`：`grant` 打开直连页面，`site` 专属域名下的直连传输 [`crate::rtc::mux`]）。
+    pub fn check_grant(&self, account: &crate::account::Account, ip: IpAddr, origin: &str, token: &str, via: &'static str) -> Result<proto::DirectGrant, &'static str> {
         let fail = |why: &'static str| {
-            tracing::info!(%ip, why, "直连票据没通过");
-            (StatusCode::FORBIDDEN, axum::Json(serde_json::json!({ "error": why }))).into_response()
+            tracing::info!(%ip, why, via, "直连票据没通过");
+            Err(why)
         };
         let Some(session) = account.session() else { return fail("not_logged_in") };
         let now = account.clock.now_ms();
@@ -462,10 +481,8 @@ impl Direct {
                 return fail("replay");
             }
         }
-        self.note_login(ip, "grant");
-        let mut r = axum::Json(serde_json::json!({ "ok": true })).into_response();
-        Self::set_cookie(&mut r, &self.grant_cookie(&session.user.id, &g.sid, g.abs_exp), (g.abs_exp - now) / 1000);
-        r
+        self.note_login(ip, via);
+        Ok(g)
     }
 
     // ---------------- 后台：申请与续期 ----------------

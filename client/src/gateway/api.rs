@@ -44,6 +44,15 @@ pub fn routes(app: App) -> Router<App> {
         .route("/platform/{*rest}", get(platform_web).post(platform_web).put(platform_web).patch(platform_web).delete(platform_web))
         // 助理（assistant.rs）
         .merge(super::plugins::api_routes())
+        // 远程指纹浏览器密钥绑定（remote_browser.rs，按设备存储，支持 HTTP/HTTPS）
+        .route(
+            "/browser-binding",
+            get(crate::remote_browser::get_binding)
+                .put(crate::remote_browser::put_binding)
+                .delete(crate::remote_browser::delete_binding),
+        )
+        .route("/browser-binding/test", post(crate::remote_browser::test_binding))
+        .route("/browser-binding/open-url", post(crate::remote_browser::open_url))
         .route("/assistant", get(super::assistant::state))
         .route("/assistant/summary", get(super::assistant::summary))
         .route("/assistant/enable", post(super::assistant::enable))
@@ -1722,7 +1731,12 @@ async fn xfer_cancel(State(app): State<App>, Extension(access): Extension<Access
 }
 
 async fn xfer_pending(State(app): State<App>, Extension(access): Extension<Access>) -> R<Json<Value>> {
-    let remote = approver(&app, &access)?;
+    // 这条横幅每个页面都轮询：这次访问没资格确认（远程会话、没开远程确认）时照常回 200，用 `blocked` 说明原因，
+    // 不回 400——否则浏览器控制台一直刷错误。不给列表，也不给最近一次导出。
+    let remote = match approver(&app, &access) {
+        Ok(r) => r,
+        Err(e) => return Ok(Json(json!({ "items": [], "last_export": null, "blocked": e.code }))),
+    };
     let mut v = xfer::pending(&app);
     v["remote"] = remote.into();
     Ok(Json(v))

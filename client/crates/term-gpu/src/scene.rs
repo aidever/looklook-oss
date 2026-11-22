@@ -32,6 +32,17 @@ pub struct GlyphKey {
     pub italic: bool,
     /// 波浪下划线（不是字）
     pub curl: bool,
+    /// 字比底色暗（浅色主题）：按黑字白底光栅化，否则按白字黑底。浏览器画字的灰度 / 对比度补偿跟深浅有关，
+    /// 同一张白字透明底的遮罩拿去画深色字会发虚发粗
+    pub dark: bool,
+}
+
+/// 字的颜色比底色暗
+pub fn darker(fg: u32, bg: u32) -> bool {
+    fn luma(c: u32) -> u32 {
+        ((c >> 16) & 0xff) * 299 + ((c >> 8) & 0xff) * 587 + (c & 0xff) * 114
+    }
+    luma(fg) < luma(bg)
 }
 
 /// 图集里的一个位置（像素）
@@ -190,6 +201,7 @@ impl Scene<'_> {
                         bold: flags.contains(StyleFlags::BOLD),
                         italic: flags.contains(StyleFlags::ITALIC),
                         curl: false,
+                        dark: darker(colors.fg, colors.bg.unwrap_or(theme.get(BG))),
                     };
                     match glyphs.glyph(&key) {
                         Some(slot) if !slot.empty => fgs.push(glyph_inst(x, y, slot, fg)),
@@ -219,7 +231,14 @@ impl Scene<'_> {
                 }
                 if flags.contains(StyleFlags::UNDERCURL) {
                     for k in 0..w {
-                        let key = GlyphKey { text: String::new(), cells: 1, bold: false, italic: false, curl: true };
+                        let key = GlyphKey {
+                            text: String::new(),
+                            cells: 1,
+                            bold: false,
+                            italic: false,
+                            curl: true,
+                            dark: darker(colors.underline, colors.bg.unwrap_or(theme.get(BG))),
+                        };
                         match glyphs.glyph(&key) {
                             Some(slot) if !slot.empty => fgs.push(glyph_inst(x + k as f32 * cw, y, slot, ul)),
                             Some(_) => {}
@@ -248,7 +267,14 @@ impl Scene<'_> {
                 let x = m.pad_x as f32 + p.col as f32 * cw;
                 let y = m.pad_y as f32 + (abs - first) as f32 * ch + y_off;
                 tops.push(rect(x, y, cw, ch, bg));
-                let key = GlyphKey { text: p.c.to_string(), cells: 1, bold: false, italic: false, curl: false };
+                let key = GlyphKey {
+                    text: p.c.to_string(),
+                    cells: 1,
+                    bold: false,
+                    italic: false,
+                    curl: false,
+                    dark: darker(fg, theme.get(BG)),
+                };
                 match glyphs.glyph(&key) {
                     Some(slot) if !slot.empty => tops.push(glyph_inst(x, y, slot, argb(fg))),
                     Some(_) => {}
@@ -280,16 +306,17 @@ impl Scene<'_> {
                 CursorShape::Block => {
                     tops.push(rect(x, y, w, ch, cur));
                     if let Some(cell) = cell.filter(|cell| !blank(cell.c)) {
+                        let tc = theme.get(CURSOR_TEXT);
+                        let tc = if tc >> 24 == 0 { theme.get(BG) } else { tc };
                         let key = GlyphKey {
                             text: format!("{}{}", cell.c, cell.extra),
                             cells: cell.width.max(1),
                             bold: cell.style.flags.contains(StyleFlags::BOLD),
                             italic: cell.style.flags.contains(StyleFlags::ITALIC),
                             curl: false,
+                            dark: darker(tc, theme.get(CURSOR)),
                         };
                         if let Some(slot) = glyphs.glyph(&key).filter(|s| !s.empty) {
-                            let tc = theme.get(CURSOR_TEXT);
-                            let tc = if tc >> 24 == 0 { theme.get(BG) } else { tc };
                             tops.push(glyph_inst(x, y, slot, argb(tc | 0xff00_0000)));
                         }
                     }

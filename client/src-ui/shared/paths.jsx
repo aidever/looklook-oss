@@ -285,13 +285,14 @@ export function PathRows({ p, ms = p?.rtt_ms ?? null, device = null }) {
             )}
             {(p.local || p.remote) && (
               <span className="muted small mono" style={{ display: 'block', wordBreak: 'break-all' }}>
-                {p.local} ⟷ {p.remote}
+                {p.local ? `${p.local} ⟷ ${p.remote}` : p.remote}
               </span>
             )}
           </dd>
         </>
       )}
-      {device && <DirectOnlyRow device={device} fellBack={Boolean(p?.direct_fallback)} kind={p?.kind} />}
+      {/* “只直连”是 WebRTC 的选项：走公网 HTTPS 直连时不用 */}
+      {device && p?.kind !== 'https' && <DirectOnlyRow device={device} fellBack={Boolean(p?.direct_fallback)} kind={p?.kind} />}
     </>
   );
 }

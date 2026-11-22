@@ -16,6 +16,7 @@ import AccessCard from './Access.jsx';
 import DirectCard from './DirectConnect.jsx';
 import PublicHttpsCard from './PublicHttps.jsx';
 import { AttachmentsCard } from '../shared/Attachments.jsx';
+import { BrowserBindingCard } from '../shared/BrowserBinding.jsx';
 import { MacFoldersCard } from '../shared/MacFolders.jsx';
 import { MOVED_TO_AI } from './Ai.jsx';
 import { FolderField, ShellPicker } from './Terminals.jsx';
@@ -227,6 +228,7 @@ export default function Settings() {
           </Row>
         </Card>
         {caps.os === 'darwin' && status.access === 'local' && <MacFoldersCard />}
+        <BrowserBindingCard />
         <SyncCard />
         <IdleCard value={s.idle_stop_days ?? 7} onChange={set('idle_stop_days')} />
         <AttachmentsCard />

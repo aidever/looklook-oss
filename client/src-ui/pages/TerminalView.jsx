@@ -25,6 +25,7 @@ import { customName, sessionTitle, useSessions } from '../shared/sessions.jsx';
 import { SessionIcon } from '../shared/brands.jsx';
 import TextSelect, { useTextSelect } from '../shared/TextSelect.jsx';
 import { TermThemeModal } from '../shared/ThemePicker.jsx';
+import { useTerminalLinkOpen } from '../shared/linkOpen.jsx';
 import { Button, Card, useLoad, useToast } from '../shared/ui.jsx';
 import ChatView from './ChatView.jsx';
 import FileBrowser from './FileBrowser.jsx';
@@ -454,6 +455,7 @@ export function TermPane({ id, inst, active, missing, offline = false, onStart, 
   const files = useTermFiles({ id, inst, frame, enabled: running && active && tab !== 'chat', touch: false, hostOs: status.capabilities.os, keybar: false });
   useRefitOnReturn(frame, running && active);
   useFocusWhenReady(frame, running && active && tab === 'term');
+  const termLinks = useTerminalLinkOpen(frame, terminalDevice(id), running && active && tab === 'term');
   const [selecting, setSelecting, selectAt] = useTextSelect(frame, running && active && tab === 'term');
   // 切会话时在提交那一刻就交接焦点，不等下面的 30 ms：切完马上打字的话，字会进上一个会话藏起来的输入框
   // （Mac 上 WKWebView 不让藏起来的输入框失焦，输入法候选框飘在左上角，字还写进了别的会话的草稿）。
@@ -620,6 +622,7 @@ export function TermPane({ id, inst, active, missing, offline = false, onStart, 
         {tab !== 'chat' && files.layer}
         {selecting && <TextSelect id={id} frame={frame} at={selectAt} onClose={() => { setSelecting(false); termFocus(frame); }} />}
         <TermThemeModal open={picking} onClose={() => { setPicking(false); termFocus(frame); }} />
+        {termLinks.menu}
         {running && side.seen.has('git') && (
           <div className="term-files-tab" hidden={tab !== 'git'}>
             <GitPanel id={id} active={active && tab === 'git'} />
@@ -711,6 +714,7 @@ function TermPage({ id }) {
   useTermTheme(frame, status.settings.theme, loaded);
   useRefitOnReturn(frame, live);
   useFocusWhenReady(frame, live && tab === 'term' && !touch);
+  const termLinks = useTerminalLinkOpen(frame, terminalDevice(id), live && tab === 'term');
   const [selecting, setSelecting, selectAt] = useTextSelect(frame, live && tab === 'term');
   // 选择文字时收起手机键盘，屏幕留给文字
   useEffect(() => {
@@ -905,6 +909,7 @@ function TermPage({ id }) {
         )}
         {selecting && <TextSelect id={id} frame={frame} at={selectAt} onClose={() => { setSelecting(false); if (!touch) termFocus(frame); }} />}
         <TermThemeModal open={picking} onClose={() => { setPicking(false); if (!touch) termFocus(frame); }} />
+        {termLinks.menu}
         {live && side.seen.has('git') && (
           <div className="term-files-tab" hidden={tab !== 'git'}>
             <GitPanel id={id} active={tab === 'git'} />

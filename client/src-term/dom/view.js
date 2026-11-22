@@ -795,7 +795,7 @@ export class DomTerminal {
     root.addEventListener('click', (e) => {
       if (this.touch) return;
       const link = e.target.closest?.('.lk');
-      if (link && (e.metaKey || e.ctrlKey)) {
+      if (link && !this.selectionInside()) {
         window.open(link.dataset.l, '_blank');
         return;
       }

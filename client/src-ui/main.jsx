@@ -17,6 +17,20 @@ window.addEventListener('unhandledrejection', (e) => {
   reportUiError(r?.message ?? String(r), r?.stack ?? '');
 });
 
+// 按需加载的模块取不到（入口页是缓存的旧版、电脑刚升级，旧文件名已经没了）：重新打开一次就是新版的入口页。
+// 30 秒内只重开一次，免得一直取不到时来回刷新
+window.addEventListener('vite:preloadError', (e) => {
+  const KEY = 'looklook.preload-reload';
+  try {
+    if (Date.now() - Number(sessionStorage.getItem(KEY) || 0) < 30_000) return;
+    sessionStorage.setItem(KEY, String(Date.now()));
+  } catch {
+    return;
+  }
+  e.preventDefault();
+  window.location.reload();
+});
+
 installRtcDownloads();
 // 从链接直接打开会话、终端、工具页时垫一条首页：手机上按返回回到首页，而不是离开网站（docs/REMOTE_UX_2026-11-07.md §7.2）。
 // 抽屉页（设置、账户……）关掉时自己会回到下面那页，不垫

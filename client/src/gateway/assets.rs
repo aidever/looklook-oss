@@ -21,6 +21,11 @@ pub async fn ui(uri: Uri) -> Response {
         let cache = if path.starts_with("assets/") { "public, max-age=31536000, immutable" } else { "no-cache" };
         return ([(header::CONTENT_TYPE, mime.as_ref().to_string()), (header::CACHE_CONTROL, cache.to_string())], f.data.into_owned()).into_response();
     }
+    // 带内容哈希的静态资源找不到：老页面（缓存的入口页、刚升级）要的旧文件。照实回 404，不回入口页——
+    // 回入口页是 200 的 text/html，Service Worker 会当成拿到了，页面报“模块脚本 MIME 不对”，也不会去试别的来源。
+    if path.starts_with("assets/") {
+        return ([(header::CACHE_CONTROL, "no-store")], StatusCode::NOT_FOUND).into_response();
+    }
     // 单页应用：其余路径都回到入口页面。
     match Ui::get("index.html") {
         Some(f) => ([(header::CONTENT_TYPE, "text/html; charset=utf-8"), (header::CACHE_CONTROL, "no-cache")], f.data.into_owned()).into_response(),
@@ -166,4 +171,15 @@ pub fn code_page(next: &str, error: Option<&str>) -> Response {
 
 fn esc(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn missing_asset_is_404_not_index() {
+        let r = ui("/assets/no-such-chunk-0000.js".parse().unwrap()).await;
+        assert_eq!(r.status(), StatusCode::NOT_FOUND);
+    }
 }

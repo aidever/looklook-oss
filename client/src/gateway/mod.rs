@@ -242,6 +242,10 @@ pub async fn local_guard(State(app): State<App>, mut req: Request, next: Next) -
     if tls && req.uri().path() == dp::CLIENT_PATH {
         return direct_entry(&app, peer_ip, req).await;
     }
+    // 专属域名下的直连传输（docs/09 §13）：凭平台票据认证，不用 Cookie（跨源请求带不上 SameSite=Strict 的 Cookie）
+    if tls && req.method() == Method::GET && req.uri().path() == dp::MUX_PATH {
+        return crate::rtc::mux::entry(&app, peer_ip, req).await;
+    }
     if peer == access::Peer::Public && !app.direct.cookie_ok(cookie(req.headers(), crate::direct_tls::COOKIE), &cfg, &app.account) {
         if req.uri().path() == access::FORM_PATH && req.method() == Method::POST {
             return submit_public_code(&app, &cfg, peer_ip, req).await;

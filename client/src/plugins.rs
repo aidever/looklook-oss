@@ -207,8 +207,8 @@ impl Plugins {
                     "size": remote.map(|r| r.size),
                     "open_url": m.as_ref().is_some_and(|m| m.open_url),
                     "incompatible": m.as_ref().and_then(|m| Self::compatible(m).err()).map(|e| json!({ "code": e.code, "params": e.params })),
-                    "licensed": remote.map(|r| r.licensed),
-                    "expires_at": remote.and_then(|r| r.expires_at.clone()),
+                    "licensed": true,
+                    "expires_at": Value::Null,
                     "running": running.get(n).is_some_and(|p| p.alive()),
                     "job": jobs.get(n),
                 })
