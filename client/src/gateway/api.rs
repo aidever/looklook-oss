@@ -2656,9 +2656,8 @@ fn access_view(app: &App, peer: Option<Peer>) -> Value {
     })
 }
 
-/// 访问控制只能直接访问（本机、局域网、白名单）时查看和修改；通过专属地址远程访问时不行。
-async fn get_access(State(app): State<App>, Extension(access): Extension<Access>, peer: Option<Extension<Peer>>) -> R<Json<Value>> {
-    require_local(&access)?;
+/// 访问控制：本机、局域网与远程打开都能查看和修改（远程已有账户登录保护，无头服务器也能直接配置）。
+async fn get_access(State(app): State<App>, peer: Option<Extension<Peer>>) -> R<Json<Value>> {
     Ok(Json(access_view(&app, peer.map(|p| p.0))))
 }
 
@@ -2678,8 +2677,7 @@ struct AccessReq {
     open_host: Option<String>,
 }
 
-async fn put_access(State(app): State<App>, Extension(access): Extension<Access>, peer: Option<Extension<Peer>>, Json(req): Json<AccessReq>) -> R<Json<Value>> {
-    require_local(&access)?;
+async fn put_access(State(app): State<App>, peer: Option<Extension<Peer>>, Json(req): Json<AccessReq>) -> R<Json<Value>> {
     let mut c = app.access();
     let net = |s: &str| access::parse_entry(s).map(|e| access::format_entry(&e)).map_err(|rule| LocalError::invalid("allowed_ips", rule).with("value", s));
     if let Some(v) = req.allow_lan {
@@ -2744,9 +2742,8 @@ fn public_https_view(app: &App) -> Value {
     })
 }
 
-/// 和访问控制一样，只能直接访问（本机、局域网、白名单、公网直连）时查看和修改。
-async fn get_public_https(State(app): State<App>, Extension(access): Extension<Access>) -> R<Json<Value>> {
-    require_local(&access)?;
+/// 公网 HTTPS 直连：本机、局域网与远程打开都能查看和修改（远程已有账户登录保护，无头服务器也能直接配置）。
+async fn get_public_https(State(app): State<App>) -> R<Json<Value>> {
     Ok(Json(public_https_view(&app)))
 }
 
@@ -2755,8 +2752,7 @@ struct PublicHttpsReq {
     enabled: bool,
 }
 
-async fn put_public_https(State(app): State<App>, Extension(access): Extension<Access>, Json(req): Json<PublicHttpsReq>) -> R<Json<Value>> {
-    require_local(&access)?;
+async fn put_public_https(State(app): State<App>, Json(req): Json<PublicHttpsReq>) -> R<Json<Value>> {
     app.direct.set_enabled(req.enabled)?;
     Ok(Json(public_https_view(&app)))
 }
@@ -3538,6 +3534,51 @@ mod tests {
 
         let (_, v) = call(remote(), "PUT", "/api/mcp", json!({ "enabled": false })).await;
         assert_eq!(v["enabled"].as_bool(), Some(false));
+    }
+
+    /// 远程打开也能查看和修改访问控制与公网 HTTPS 直连（无头 Linux 场景）。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn access_and_public_https_work_remotely() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+        let home = tempfile::tempdir().unwrap();
+        let key = ed25519_dalek::SigningKey::from_bytes(&[8u8; 32]);
+        let a = crate::ssh_transfer::e2e::app(home.path(), "http://127.0.0.1:9", "devb", key);
+        let call = |access: Access, method: &str, path: &str, body: Value| {
+            let mut req = Request::builder().method(method).uri(path).header("content-type", "application/json").header(super::super::CLIENT_HEADER, "1").body(Body::from(body.to_string())).unwrap();
+            req.extensions_mut().insert(access);
+            let r = super::super::router(a.clone());
+            async move {
+                let r = r.oneshot(req).await.unwrap();
+                let status = r.status();
+                (status, serde_json::from_slice::<Value>(&axum::body::to_bytes(r.into_body(), 1 << 20).await.unwrap()).unwrap_or_default())
+            }
+        };
+        let remote = || Access::Remote { host: "alice.looklook.test".into(), proto: "https".into() };
+        let rtc = || Access::Rtc { origin: "https://alice.looklook.test".into() };
+
+        for make in [remote as fn() -> Access, rtc as fn() -> Access] {
+            let (st, v) = call(make(), "GET", "/api/access", json!({})).await;
+            assert_eq!(st, StatusCode::OK, "{v}");
+            assert!(v.get("allow_lan").is_some());
+
+            let (st, v) = call(make(), "PUT", "/api/access", json!({ "allow_lan": true, "code_enabled": true })).await;
+            assert_eq!(st, StatusCode::OK, "{v}");
+            assert_eq!((v["allow_lan"].as_bool(), v["code_enabled"].as_bool()), (Some(true), Some(true)));
+
+            let (st, v) = call(make(), "GET", "/api/public-https", json!({})).await;
+            assert_eq!(st, StatusCode::OK, "{v}");
+            assert!(v.get("enabled").is_some());
+
+            let (st, v) = call(make(), "PUT", "/api/public-https", json!({ "enabled": true })).await;
+            assert_eq!(st, StatusCode::OK, "{v}");
+            assert_eq!(v["enabled"].as_bool(), Some(true));
+
+            let (st, v) = call(make(), "PUT", "/api/public-https", json!({ "enabled": false })).await;
+            assert_eq!(st, StatusCode::OK, "{v}");
+            assert_eq!(v["enabled"].as_bool(), Some(false));
+        }
     }
 
     #[test]

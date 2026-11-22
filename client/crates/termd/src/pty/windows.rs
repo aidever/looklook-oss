@@ -23,7 +23,7 @@ use windows_sys::Win32::System::Threading::{
     CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DeleteProcThreadAttributeList,
     EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess, InitializeProcThreadAttributeList,
     OpenProcess, PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
-    STARTUPINFOEXW, STARTUPINFOW, TerminateProcess, UpdateProcThreadAttribute,
+    STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW, TerminateProcess, UpdateProcThreadAttribute,
 };
 
 use super::{ProcessInspect, PtyEvent};
@@ -127,6 +127,12 @@ impl PlatformPty {
             let mut si_ex: STARTUPINFOEXW = std::mem::zeroed();
             si_ex.StartupInfo = std::mem::zeroed::<STARTUPINFOW>();
             si_ex.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
+            // 标准句柄显式设成无效：不设的话，termd 自己的标准输入输出被重定向时（主进程拉起 termd 时把输出接到
+            // logs/termd.log），程序会继承这些重定向的句柄，输出写进日志、读到 termd 的空输入马上退出，ConPTY 里什么都没有
+            si_ex.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+            si_ex.StartupInfo.hStdInput = INVALID_HANDLE_VALUE;
+            si_ex.StartupInfo.hStdOutput = INVALID_HANDLE_VALUE;
+            si_ex.StartupInfo.hStdError = INVALID_HANDLE_VALUE;
             si_ex.lpAttributeList = attr_list;
 
             let cmd_line = build_command_line(&req.cmd, &req.args);

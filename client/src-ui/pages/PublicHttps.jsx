@@ -1,6 +1,6 @@
 // 设置 → 网络与访问 → 公网 HTTPS 直连（服务端 docs/09）：有固定公网 IPv4 的电脑自己向 Let's Encrypt 申请这个 IP 的证书，
 // 管理台在原端口上同时提供 HTTPS。浏览器直接打开 https://IP:端口，不经过平台和中转；想加速就在 Clash 里给这个 IP 加一条规则。
-// 默认关闭；公网来源必须认证（平台的“直接打开”或至少 12 位的访问码）。只能直接访问时查看和修改（和访问控制一样）。
+// 默认关闭；公网来源必须认证（平台的“直接打开”或至少 12 位的访问码）。本机、局域网和远程打开均可查看和修改。
 import { Globe } from 'lucide-react';
 import { useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
@@ -76,13 +76,6 @@ export default function PublicHttpsCard() {
     return () => clearInterval(id);
   }, [phase]);
 
-  if (loadError?.code === 'REMOTE_FORBIDDEN') {
-    return (
-      <Card title={t('public_https.title')}>
-        <Note>{t('public_https.remote_only')}</Note>
-      </Card>
-    );
-  }
   if (loadError) return <ErrorNote error={loadError} />;
   if (!data) return <Skeleton height={160} />;
 

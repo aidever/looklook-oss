@@ -193,13 +193,6 @@ export default function AccessCard() {
     }
     return Boolean(r);
   };
-  if (loadError?.code === 'REMOTE_FORBIDDEN') {
-    return (
-      <Card title={t('access.title')}>
-        <Note>{t('access.remote_only')}</Note>
-      </Card>
-    );
-  }
   if (loadError) return <ErrorNote error={loadError} />;
   if (!data) return <Skeleton height={240} />;
   // 白名单的错误显示在白名单输入框下面，不放到卡片最下面

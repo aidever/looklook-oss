@@ -133,7 +133,7 @@ impl TermdClient {
             tracing::info!(old_pid = pong.pid, new_pid = new_pong.pid, sessions = new_pong.session_count, "termd 升级交接完成");
             return Ok(true);
         }
-        if pong.session_count == 0 {
+        if pong.session_count == 0 || self.clear_dead_sessions().await {
             if let Ok(mut io) = connect_endpoint(&self.endpoint).await {
                 let _ = rpc_on(&mut *io, &ControlRequest::ShutdownIfIdle).await;
             }
@@ -188,7 +188,7 @@ impl TermdClient {
                 }
             }
         }
-        if pong.session_count == 0 {
+        if pong.session_count == 0 || self.clear_dead_sessions().await {
             if let Ok(mut io) = connect_endpoint(&self.endpoint).await {
                 if matches!(rpc_on(&mut *io, &ControlRequest::ShutdownIfIdle).await, Ok(ControlResponse::Ok { changed: true })) {
                     drop(io);
@@ -200,6 +200,21 @@ impl TermdClient {
             }
         }
         Ok(None)
+    }
+
+    /// 不能交接的平台（Windows）上，会话里的程序都已经退出时，这些会话留着也没用：结束掉，好让 termd 换成新版本。
+    /// 返回 true 表示现在一个会话都不剩（可以按“没有会话”重启 termd）。
+    /// 1.89.0 的 termd 在 Windows 上起的程序拿不到 ConPTY、马上退出，升级后靠这里换掉旧 termd。
+    async fn clear_dead_sessions(&self) -> bool {
+        let Some(list) = self.list_sessions_if_running().await else { return false };
+        if list.is_empty() || list.iter().any(|s| s.alive) {
+            return list.is_empty();
+        }
+        for s in &list {
+            let _ = self.stop_session(&s.id).await;
+        }
+        tracing::info!(sessions = list.len(), "termd 里的会话都已退出，结束它们以便升级 termd");
+        self.list_sessions_if_running().await.is_some_and(|v| v.is_empty())
     }
 
     fn mark_upgrade_attempt(&self, pid: u32) -> bool {
