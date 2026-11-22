@@ -252,7 +252,7 @@ async fn dispatch_control(
         ControlRequest::Ping => ControlResponse::Pong {
             control_version: TERMD_CONTROL_VERSION,
             protocol_version: PROTOCOL_VERSION.into(),
-            binary_version: env!("CARGO_PKG_VERSION").into(),
+            binary_version: crate::build_id().into(),
             pid: std::process::id(),
             session_count: mgr.len().await,
             handover_supported: HANDOVER_SUPPORTED,

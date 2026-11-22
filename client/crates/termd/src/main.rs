@@ -15,9 +15,11 @@ async fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
+    // 先记下自己文件的哈希（之后磁盘上的文件可能被升级换掉）
+    termd::init_build_id();
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--version" || a == "-V") {
-        println!("looklook-termd {}", env!("CARGO_PKG_VERSION"));
+        println!("looklook-termd {}", termd::build_id());
         return Ok(());
     }
 

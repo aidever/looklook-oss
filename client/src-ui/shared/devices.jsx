@@ -203,8 +203,16 @@ export function deviceName(t, d) {
  * `side`：侧栏“工具”上方的整行样式，表示下面的工具作用在哪台电脑上。
  */
 export function DeviceSwitcher({ perDevice, helpUrl, side = false }) {
+  const d = useDevices();
+  if (!d.multi && !d.localOnly) return null;
+  if (d.localOnly) return <LocalOnlySwitcher side={side} />;
+  return <MultiDeviceSwitcher perDevice={perDevice} helpUrl={helpUrl} side={side} />;
+}
+
+function MultiDeviceSwitcher({ perDevice, helpUrl, side = false }) {
   const { t } = useTranslation();
   const d = useDevices();
+  const links = useLinks();
   const [open, setOpen] = useState(false);
   const ref = useRef(null);
   // 侧栏里的按钮本身写着“工具作用于这台电脑”，不再弹提示（免得盖住下面的工具）
@@ -221,11 +229,8 @@ export function DeviceSwitcher({ perDevice, helpUrl, side = false }) {
       document.removeEventListener('keydown', close);
     };
   }, [open]);
-  if (!d.multi && !d.localOnly) return null;
-  if (d.localOnly) return <LocalOnlySwitcher side={side} />;
   const current = d.byId(d.selected);
   const online = d.items.filter((x) => x.online).length;
-  const links = useLinks();
   const toggle = () => {
     dismissTip();
     setOpen((o) => !o);
