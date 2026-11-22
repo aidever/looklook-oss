@@ -362,5 +362,8 @@
   "PLUGIN_BUSY": "The plugin is being installed; please wait",
   "PLUGIN_INSTALL": "The plugin couldn't be installed: {{detail}}",
   "PLUGIN_START": "The plugin didn't start: {{detail}}",
-  "PLUGIN_UNSUPPORTED": "Plugins aren't supported on this system yet"
+  "PLUGIN_UNSUPPORTED": "Plugins aren't supported on this system yet",
+  "NATIVE_TERM_HERE_ONLY": "Native terminals can only be opened on this computer",
+  "NATIVE_TERM_FAILED": "Couldn't open the terminal: {{error}}",
+  "NOT_RUNNING": "The terminal isn't running"
 }

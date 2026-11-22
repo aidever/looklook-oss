@@ -9,9 +9,10 @@ import { useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 
 import { useStatus } from '../App.jsx';
-import { api } from './api.js';
+import { api, deviceApi, rtcMode } from './api.js';
+import { connManaged, isOnline, reconnectDevice, retryNow, useDeviceConn, useFocusedDevice } from './conn.js';
 import { deviceName, useDevices } from './devices.jsx';
-import { lossLevel, lossText, PathRows, usePaths, usePop } from './paths.jsx';
+import { linkLabel, linkState, lossLevel, lossText, PathRows, refreshPaths, useLinks, usePaths, usePop } from './paths.jsx';
 import { errorText } from './i18n.js';
 import { RELAYS_ANCHOR } from './RelayPicker.jsx';
 import { Link } from './router.jsx';
@@ -92,17 +93,21 @@ export default function RelayStatus() {
 }
 
 /** 往返时间（毫秒）：每 10 秒请求一次这台电脑的 /api/ping，取最近 3 次的中位数，免得一次抖动就跳。 */
-export function useRemoteLatency(enabled) {
+export function useRemoteLatency(enabled, device = null) {
   const [ms, setMs] = useState(null);
   useEffect(() => {
-    if (!enabled) return undefined;
+    if (!enabled) {
+      setMs(null);
+      return undefined;
+    }
     const samples = [];
     let alive = true;
+    const client = device ? deviceApi(device) : api;
     const once = async () => {
       if (document.hidden) return;
       const t0 = performance.now();
       try {
-        await api.get('/ping');
+        await client.get('/ping');
       } catch (e) {
         if (e.status === 0 || e.status >= 500) {
           if (alive) setMs(null);
@@ -123,7 +128,7 @@ export function useRemoteLatency(enabled) {
       clearInterval(id);
       window.removeEventListener('focus', once);
     };
-  }, [enabled]);
+  }, [enabled, device]);
   return ms;
 }
 
@@ -170,10 +175,15 @@ function LocalPop() {
   );
 }
 
-/** 远程打开：连着哪台电脑、加密、延迟、线路。 */
+/** 远程打开：连着哪台电脑、加密、延迟、线路，以及所有在线电脑各自独立状态。 */
 function RemotePop({ ms, name, path, device }) {
   const { t } = useTranslation();
   const { status } = useStatus();
+  const devices = useDevices();
+  const paths = usePaths();
+  const links = useLinks();
+  const [reconnectingId, setReconnectingId] = useState(null);
+  const onlineList = rtcMode && devices.multi ? devices.items.filter((d) => d.online) : [];
   return (
     <>
       <b className="conn-pop-title">{t('conn.remote_title', { name })}</b>
@@ -192,6 +202,44 @@ function RemotePop({ ms, name, path, device }) {
           </>
         )}
       </dl>
+      {onlineList.length > 1 && (
+        <div className="conn-dev-list">
+          <span className="muted small conn-dev-head">{t('conn.all_devices')}</span>
+          {onlineList.map((d) => {
+            const st = linkState(d, links);
+            const p = paths[d.id];
+            const dotCls = st === 'failed' ? 'bad' : st === 'connecting' || st === 'reconnecting' ? 'wait' : p ? `path-${p.kind}` : 'path-none';
+            const subText = st === 'online' ? (p ? [t(`path.${p.kind}`), p.rtt_ms != null ? `${p.rtt_ms} ms` : null].filter(Boolean).join(' · ') : t('devices.online')) : linkLabel(t, d, links);
+            const busy = reconnectingId === d.id;
+            return (
+              <div key={d.id} className={`conn-dev-row ${d.id === device ? 'on' : ''}`}>
+                <span className={`dot ${dotCls}`} aria-hidden="true" />
+                <span className="conn-dev-name ellipsis">{deviceName(t, d)}</span>
+                <span className="conn-dev-meta">{subText}</span>
+                <button
+                  type="button"
+                  className="btn btn-plain btn-icon conn-dev-btn"
+                  disabled={busy}
+                  title={t(st === 'failed' ? 'devices.retry' : 'path.reconnect')}
+                  aria-label={t(st === 'failed' ? 'devices.retry' : 'path.reconnect')}
+                  onClick={async () => {
+                    setReconnectingId(d.id);
+                    try {
+                      if (st === 'failed') await retryNow(d.id);
+                      else await reconnectDevice(d.id);
+                      await refreshPaths();
+                    } finally {
+                      setReconnectingId(null);
+                    }
+                  }}
+                >
+                  <RefreshCw size={12} className={busy ? 'spin' : undefined} />
+                </button>
+              </div>
+            );
+          })}
+        </div>
+      )}
       <p className="muted small" style={{ margin: 0 }}>{t('conn.remote_note')}</p>
     </>
   );
@@ -202,12 +250,17 @@ export function ConnChip() {
   const { t } = useTranslation();
   const { status } = useStatus();
   const devices = useDevices();
+  const focused = useFocusedDevice();
   const { open, setOpen, ref } = usePop();
   const mode = status.access === 'local' ? 'local' : 'remote';
-  // 远程打开时按当前电脑实际走的路给色点上色（只有一台时就是唯一那条连接）
+  const activeDev = focused || devices.selected;
+  const activeConn = useDeviceConn(activeDev);
+  const activeOnline = !connManaged || isOnline(activeConn);
+  // 远程打开时优先显示当前正在查看的会话所在电脑的连接状态（各台电脑独立）
   const paths = usePaths();
-  const path = mode === 'remote' ? (devices.selected ? paths[devices.selected] : Object.values(paths)[0]) ?? null : null;
-  const ms = useRemoteLatency(mode === 'remote');
+  const path = mode === 'remote' ? (activeDev ? paths[activeDev] : Object.values(paths)[0]) ?? null : null;
+  const pingMs = useRemoteLatency(mode === 'remote' && activeOnline && path?.rtt_ms == null, activeDev);
+  const ms = mode === 'remote' ? (activeOnline ? (path?.rtt_ms ?? pingMs) : null) : pingMs;
   const r = status.relay;
   // 没登录：这里就是开通远程访问的入口
   if (mode === 'local' && !status.account.logged_in) {
@@ -219,7 +272,7 @@ export function ConnChip() {
     );
   }
   if (mode === 'local' && (!r || r.state === 'off')) return null;
-  const name = devices.multi ? deviceName(t, devices.byId(devices.selected)) : status.settings?.device_name || deviceName(t, null);
+  const name = devices.multi ? deviceName(t, devices.byId(activeDev)) : status.settings?.device_name || deviceName(t, null);
   let kind = 'ok';
   let label;
   let sub = null;
@@ -228,6 +281,10 @@ export function ConnChip() {
     kind = pill === 'connected' ? 'ok' : pill === 'failed' ? 'bad' : pill === 'blocked' ? 'warn' : 'wait';
     label = t('conn.local');
     sub = t(`relay.pill.${pill}`);
+  } else if (!activeOnline) {
+    kind = activeConn.phase === 'failed' || activeConn.phase === 'offline' ? 'bad' : 'wait';
+    label = t('conn.remote');
+    sub = t(activeConn.phase === 'failed' ? 'devices.unreachable' : activeConn.phase === 'offline' ? 'devices.offline' : 'devices.reconnecting');
   } else {
     // 延迟和丢包率取更差的那个
     const lag = ms === null ? 'ok' : ms >= VERY_SLOW_MS ? 'bad' : ms >= SLOW_MS ? 'warn' : 'ok';
@@ -254,7 +311,7 @@ export function ConnChip() {
       {open && (
         <div className="relay-pop" role="dialog" aria-label={t('conn.title')}>
           {mode === 'local' && <LocalPop />}
-          {mode === 'remote' && <RemotePop ms={ms} name={name} path={path} device={path ? (devices.selected ?? Object.keys(paths)[0]) : null} />}
+          {mode === 'remote' && <RemotePop ms={ms} name={name} path={path} device={path ? (activeDev ?? Object.keys(paths)[0]) : activeDev} />}
         </div>
       )}
     </span>

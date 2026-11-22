@@ -430,23 +430,32 @@ pub async fn ping(addr: &str) -> Result<u32, String> {
 
 /// 经中转的 STUN 看这台电脑的出口地址（检测公网地址用，`rtc::net`）：发 3 次 Binding 请求，取第一个成功响应里的地址。
 pub async fn stun_mapped(addr: &str) -> Result<std::net::IpAddr, String> {
-    let sock = stun_socket(addr).await?;
+    let to = resolve(addr).await?;
+    let bind: SocketAddr = if to.is_ipv4() { (std::net::Ipv4Addr::UNSPECIFIED, 0).into() } else { (std::net::Ipv6Addr::UNSPECIFIED, 0).into() };
+    let sock = tokio::net::UdpSocket::bind(bind).await.map_err(|_| "network".to_string())?;
+    stun_mapped_on(&sock, to).await.map(|a| a.ip())
+}
+
+/// 从给定的 socket 问 `to` 上的 STUN 看到的映射地址（`IP:端口`）：发 3 次 Binding 请求，每次等 1 秒。
+/// socket 不 connect，同一个 socket 可以先后问几台（NAT 类型检测，`rtc::nat`）；只认来自 `to` 的响应。
+pub async fn stun_mapped_on(sock: &tokio::net::UdpSocket, to: SocketAddr) -> Result<SocketAddr, String> {
     let mut buf = [0u8; 1024];
     for _ in 0..3 {
         let tx: [u8; 12] = rand::random();
-        sock.send(&stun_binding_request(&tx)).await.map_err(|_| "network".to_string())?;
+        sock.send_to(&stun_binding_request(&tx), to).await.map_err(|_| "network".to_string())?;
         let reply = tokio::time::timeout(Duration::from_secs(1), async {
             loop {
-                let n = sock.recv(&mut buf).await?;
-                if is_stun_binding_success(&buf[..n], &tx) {
+                let (n, from) = sock.recv_from(&mut buf).await?;
+                if from == to && is_stun_binding_success(&buf[..n], &tx) {
                     return Ok::<_, std::io::Error>(stun_mapped_addr(&buf[..n]));
                 }
             }
         })
         .await;
         match reply {
-            Ok(Ok(Some(ip))) => return Ok(ip),
+            Ok(Ok(Some(a))) => return Ok(a),
             Ok(Ok(None)) => return Err("no_ip".into()),
+            // Windows 上收到 ICMP 端口不可达时 recv_from 报错：对面没有 STUN 服务
             Ok(Err(_)) => return Err("connect".into()),
             Err(_) => {}
         }
@@ -527,7 +536,7 @@ fn is_stun_binding_success(m: &[u8], tx: &[u8; 12]) -> bool {
 }
 
 /// Binding 成功响应里的地址：XOR-MAPPED-ADDRESS（0x0020），没有时用 MAPPED-ADDRESS（0x0001）。
-fn stun_mapped_addr(m: &[u8]) -> Option<std::net::IpAddr> {
+fn stun_mapped_addr(m: &[u8]) -> Option<SocketAddr> {
     let len = u16::from_be_bytes([*m.get(2)?, *m.get(3)?]) as usize;
     let body = m.get(20..20 + len)?;
     let (mut i, mut plain) = (0, None);
@@ -537,23 +546,20 @@ fn stun_mapped_addr(m: &[u8]) -> Option<std::net::IpAddr> {
         let v = body.get(i + 4..i + 4 + n)?;
         let xor = typ == 0x0020;
         if (xor || typ == 0x0001) && v.len() >= 8 {
-            // 第 2 字节是地址族：1 = IPv4，2 = IPv6；异或用 magic cookie 加事务 id
-            let key: Vec<u8> = m[4..20].to_vec();
+            // 第 2 字节是地址族：1 = IPv4，2 = IPv6；异或用 magic cookie 加事务 id（端口只异或 cookie 的前 2 字节）
+            let key: &[u8] = if xor { &m[4..20] } else { &[0u8; 16] };
+            let port = u16::from_be_bytes([v[2] ^ key[0], v[3] ^ key[1]]);
             let raw = &v[4..];
             let ip = match (v[1], raw.len()) {
-                (1, 4) => Some(std::net::IpAddr::from(<[u8; 4]>::try_from(&raw[..4]).ok()?)),
-                (2, 16) => Some(std::net::IpAddr::from(<[u8; 16]>::try_from(&raw[..16]).ok()?)),
+                (1, 4) => Some(std::net::IpAddr::from(std::array::from_fn::<u8, 4, _>(|k| raw[k] ^ key[k]))),
+                (2, 16) => Some(std::net::IpAddr::from(std::array::from_fn::<u8, 16, _>(|k| raw[k] ^ key[k]))),
                 _ => None,
             };
-            let ip = ip.map(|ip| match (xor, ip) {
-                (false, ip) => ip,
-                (true, std::net::IpAddr::V4(a)) => std::net::IpAddr::from(std::array::from_fn::<u8, 4, _>(|k| a.octets()[k] ^ key[k])),
-                (true, std::net::IpAddr::V6(a)) => std::net::IpAddr::from(std::array::from_fn::<u8, 16, _>(|k| a.octets()[k] ^ key[k])),
-            });
+            let a = ip.map(|ip| SocketAddr::new(ip, port));
             if xor {
-                return ip;
+                return a;
             }
-            plain = plain.or(ip);
+            plain = plain.or(a);
         }
         i += 4 + n.div_ceil(4) * 4;
     }
@@ -575,7 +581,7 @@ mod tests {
         let port = (50000u16 ^ 0x2112).to_be_bytes();
         m.extend_from_slice(&[0x00, 0x20, 0, 8, 0, 1, port[0], port[1], ip[0], ip[1], ip[2], ip[3]]);
         assert!(is_stun_binding_success(&m, &tx));
-        assert_eq!(stun_mapped_addr(&m), Some("203.0.113.7".parse().unwrap()));
+        assert_eq!(stun_mapped_addr(&m), Some("203.0.113.7:50000".parse().unwrap()));
         assert_eq!(stun_mapped_addr(&m[..20]), None);
     }
 

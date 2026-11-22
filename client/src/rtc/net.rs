@@ -4,7 +4,8 @@
 //! - 公网地址：等候选收集完，在签名前写进本机 SDP（[`add_public`]），对端连得进来就直连，连不进来 ICE 照常走中转；
 //!   也可以填域名（DDNS），后台定时解析（[`resolve_loop`]），写 SDP 时用最近一次的结果，不在建连时等 DNS；
 //!   系统 DNS 解析不出可用地址（开着代理软件的 fake-ip 模式时只给 198.18.x.x）就改问公共 DoH（[`doh`]）；
-//! - 检测（[`detect`]）：电脑自己去问中转的 STUN 和 cip.cc、ip.me 等服务，只用来辅助填写，不自动保存。
+//! - 检测（[`detect`]）：电脑自己去问中转的 STUN 和 cip.cc、ip.me 等服务，只用来辅助填写，不自动保存；
+//!   经接口检测时顺带做 NAT 类型检测（[`super::nat`]）。
 //!
 //! 存在本机数据库（`kv.rtc_net`），不在电脑之间同步；改了只对新建的连接生效。
 
@@ -367,6 +368,9 @@ pub struct Detected {
     /// 多数来源一致的地址（一样多时取靠前的来源）。
     pub suggest_v4: Option<Ipv4Addr>,
     pub suggest_v6: Option<Ipv6Addr>,
+    /// NAT 类型检测（[`super::nat`]）：经接口检测时一起做；命令行在客户端没运行时没有
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nat: Option<super::nat::Report>,
 }
 
 const V4_SITES: &[(&str, &str)] = &[("cip.cc", "http://cip.cc/"), ("ip.me", "https://ip.me/"), ("4.ipw.cn", "https://4.ipw.cn/"), ("ipify", "https://api.ipify.org/")];
@@ -397,7 +401,7 @@ pub async fn detect(stun: Option<String>) -> Detected {
         IpAddr::V6(v) => Some(v),
         _ => None,
     });
-    Detected { v4, v6, suggest_v4, suggest_v6 }
+    Detected { v4, v6, suggest_v4, suggest_v6, nat: None }
 }
 
 fn majority(probes: &[Probe]) -> Option<IpAddr> {
@@ -479,6 +483,7 @@ pub fn view(c: &NetConfig) -> Value {
         "ipv6": c.ipv6,
         "default_ports": [DEFAULT_PORTS.0, DEFAULT_PORTS.1],
         "nic_v6": nic_v6(),
+        "nat": super::nat::last(),
     });
     // 填的是域名时加上它现在解析出的地址（还没解析出来是 null）；填的是 IP 或没填时没有这一项
     for (k, s, v6) in [("resolved_v4", &c.public_v4, false), ("resolved_v6", &c.public_v6, true)] {
@@ -496,18 +501,30 @@ pub async fn get_net(State(app): State<App>) -> Json<Value> {
 
 /// `PUT /api/rtc/net`：远程打开的管理台也能改（改错了最多直连不了，中转仍然可用）。
 pub async fn put_net(State(app): State<App>, Json(u): Json<NetUpdate>) -> Result<Json<Value>, LocalError> {
-    let c = NetConfig::load(&app.store).updated(&u).map_err(|(f, r)| LocalError::invalid(f, r))?;
+    let old = NetConfig::load(&app.store);
+    let c = old.updated(&u).map_err(|(f, r)| LocalError::invalid(f, r))?;
     c.save(&app.store)?;
     set_current(c.clone());
     // 新填的域名马上解析一次，界面能立刻显示解析结果
     resolve(&c).await;
+    // 公网地址变了：直连证书按新地址重新申请（docs/09 §4.1 第 7 条）
+    app.direct.wake();
+    // 端口范围、公网 IPv4 变了：后台重做一次 NAT 检测（结论随心跳上报，设置页下次打开时显示）
+    if (old.port_begin, old.port_end, &old.public_v4) != (c.port_begin, c.port_end, &c.public_v4) {
+        let (account, store) = (app.account.clone(), app.store.clone());
+        tokio::spawn(async move { super::nat::check(&account, &store, None).await });
+    }
     tracing::info!(ports = %format!("{}-{}", c.port_begin, c.port_end), public_v4 = ?c.public_v4, public_v6 = ?c.public_v6, ipv6 = c.ipv6, "WebRTC 网络设置已修改");
     Ok(Json(view(&c)))
 }
 
 /// `POST /api/rtc/net/detect`：只返回结果，不保存。
+/// 同时做 NAT 类型检测；各网站查到的出口 IPv4 用来判断代理软件是否在接管 UDP（docs/08 §4）。
 pub async fn post_detect(State(app): State<App>) -> Json<Detected> {
-    Json(detect(relay_stun(&app)).await)
+    let mut d = detect(relay_stun(&app)).await;
+    let sites: Vec<Probe> = d.v4.iter().filter(|p| p.source != "relay").cloned().collect();
+    d.nat = Some(super::nat::check(&app.account, &app.store, majority(&sites)).await);
+    Json(d)
 }
 
 /// 当前中转的 STUN 地址：中转主机名 + TURN 端口（与线路测速相同）。

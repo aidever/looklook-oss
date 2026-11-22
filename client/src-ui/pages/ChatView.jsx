@@ -83,7 +83,7 @@ import { createContext, useCallback, useContext, useEffect, useLayoutEffect, use
 import { createPortal } from 'react-dom';
 import { useTranslation } from 'react-i18next';
 
-import { api, deviceApi, fetchRaw, plainLinksWork, terminalDevice } from '../shared/api.js';
+import { api, deviceApi, fetchRaw, plainLinksWork, selectedDevice, terminalDevice } from '../shared/api.js';
 import { isTouch } from '../shared/KeyBar.jsx';
 import { chatEventsMode, onChatEventsMode, subscribeChat } from '../shared/chatEvents.js';
 import { spinnerText } from '../shared/spinner.js';
@@ -176,7 +176,7 @@ import { shownFocus } from '../shared/termFrame.js';
 import { splitTitle } from '../shared/title.js';
 import { clockAt } from '../shared/board.js';
 import { touchUi, useLayer } from '../shared/layers.js';
-import { connManaged, isOnline, useConn } from '../shared/conn.js';
+import { connManaged, isOnline, useDeviceConn } from '../shared/conn.js';
 import { takeChatInsert } from '../shared/chatInsert.js';
 import { AssistantOpen, useOpenSession } from '../shared/assistantOpen.js';
 import { useLinkOpen } from '../shared/linkOpen.jsx';
@@ -3649,8 +3649,9 @@ function Composer({ id, active, status, phase, touch, offline, models, usage, it
   const [dialog, setDialog] = useState(null);
   const confirm = useConfirm();
   const sessionsCtx = useSessions();
-  // 远程连接断着、恢复中：草稿照写，发送等连上（不排队自动发，docs/REMOTE_UX_2026-11-07.md 决定 2）
-  const conn = useConn();
+  // 远程连接断着、恢复中：草稿照写，发送等连上（不排队自动发，docs/REMOTE_UX_2026-11-07.md 决定 2），只看这台电脑
+  const dev = terminalDevice(id) ?? selectedDevice();
+  const conn = useDeviceConn(dev);
   const waiting = connManaged && !isOnline(conn);
   const { t } = useT();
   // 权限模式只有 Claude Code 有；模型、思考强度、上下文用量按工具的能力（caps）显示

@@ -22,6 +22,8 @@
 // docs/FAQ.md 里 macOS 那节的说明：Finder/LaunchAgent 启动本来就没有控制台）。
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
+mod attach;
+mod native_term;
 mod account;
 mod agent_update;
 mod agents;
@@ -36,6 +38,7 @@ mod claude_profiles;
 mod codex_profiles;
 mod clock;
 mod diag;
+mod direct_tls;
 mod docker;
 mod error;
 mod feishu;
@@ -84,6 +87,7 @@ mod ssh;
 mod ssh_transfer;
 mod store;
 mod tips;
+mod termd_client;
 mod tools;
 mod transfer;
 #[cfg(any(windows, target_os = "macos"))]
@@ -173,6 +177,11 @@ enum Cmd {
         #[command(subcommand)]
         action: Option<RtcCmd>,
     },
+    /// 公网 HTTPS 直连：自己申请公网 IP 的证书，浏览器直接打开 https://IP:端口 / Public HTTPS: get a certificate for the public IP and open https://IP:port directly
+    Https {
+        #[command(subcommand)]
+        action: Option<HttpsCmd>,
+    },
     /// 登录看看账户（在手机或任意浏览器上批准）/ Sign in (approve from your phone or any browser)
     Login {
         /// 安装密钥（网页“电脑”页生成，LLK- 开头），不用到浏览器里批准 / Install key (LLK-…, made on the Devices page); no browser approval needed
@@ -203,6 +212,17 @@ enum Cmd {
         /// 在主机上运行的命令（放在 -- 之后）/ Command to run on the host (after --)
         #[arg(last = true)]
         command: Vec<String>,
+    },
+    /// 在当前终端窗口里接上一个终端会话（行首按 ~. 断开，会话继续运行）；不填则列出全部 / Attach to a terminal session here (type ~. at line start to detach)
+    Attach {
+        /// 终端名称或 id / Terminal name or id
+        target: Option<String>,
+        /// 会话在同一账户的另一台电脑上：那台电脑的设备 id（经本机看看转过去，target 要写会话 id）/ The session is on another computer (device id)
+        #[arg(long)]
+        device: Option<String>,
+        /// 本地预测回显：auto（往返慢时开）、on、off / Local echo prediction
+        #[arg(long, default_value = "auto")]
+        predict: attach::PredictMode,
     },
     /// ssh 的 ProxyCommand：经跳板机连接时由看看自己连上跳板机（内部使用）/ ProxyCommand for jump hosts (internal)
     #[command(hide = true)]
@@ -267,12 +287,26 @@ enum RtcCmd {
     Ipv6 { addr: String },
     /// 使用 IPv6 / Use IPv6
     Ipv6Enabled { state: OnOff },
+    /// 直连自检：从外面能不能打进端口段、NAT 类型（会访问主服务、中转和 cip.cc、ip.me 等服务）；退出码 0 = 可以直连 / Direct-connect self-check: whether the port range is reachable from outside and the NAT type (asks the server, relays and sites like cip.cc, ip.me); exit code 0 = direct works
+    Check,
     /// 检测这台电脑的公网地址（会访问中转和 cip.cc、ip.me 等服务）/ Detect public addresses (asks the relay and sites like cip.cc, ip.me)
     Detect {
         /// 把检测到的地址保存下来 / Save the detected addresses
         #[arg(long)]
         apply: bool,
     },
+}
+
+#[derive(Subcommand)]
+enum HttpsCmd {
+    /// 开启（没填公网 IPv4 时先自动检测并填上）/ Turn on (detects and fills in the public IPv4 if it isn't set)
+    On {
+        /// 等证书申请完再返回（最多 2 分钟）/ Wait until the certificate is issued (up to 2 minutes)
+        #[arg(long)]
+        wait: bool,
+    },
+    /// 关闭 / Turn off
+    Off,
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -346,6 +380,7 @@ fn main() -> Result<()> {
         }
         Some(Cmd::Access { action }) => rt.block_on(cli_access(&cli.home, cli_listen, action)),
         Some(Cmd::Rtc { action }) => rt.block_on(cli_rtc(&cli.home, cli_listen, action)),
+        Some(Cmd::Https { action }) => rt.block_on(cli_https(&cli.home, cli_listen, action)),
         Some(Cmd::Login { key }) => rt.block_on(cli_login(&cli.home, cli_listen, key)),
         Some(Cmd::Logout { force }) => {
             let v = rt.block_on(call(&cli.home, cli_listen, "POST", "/api/auth/logout", Some(json!({ "force": force }))))?;
@@ -426,6 +461,23 @@ fn main() -> Result<()> {
             println!("{}", dir.display());
             Ok(())
         }
+        Some(Cmd::Attach { target, device, predict }) => rt.block_on(async {
+            if let Some(device) = device {
+                let target = target.context("--device 要带会话 id / --device needs a session id")?;
+                let addr = endpoint(&cli.home, cli_listen)?;
+                std::process::exit(attach::run_remote(addr, &device, &target, predict).await?)
+            }
+            let list = call(&cli.home, cli_listen, "GET", "/api/instances", None).await?;
+            let list = if list.is_array() { list } else { list["items"].clone() };
+            let Some(target) = target else {
+                attach::print_list(&list);
+                return Ok(());
+            };
+            let addr = endpoint(&cli.home, cli_listen)?;
+            let mux = Paths::discover(cli.home.clone()).ok().and_then(|p| p.mux);
+            let code = attach::run(addr, &list, &target, mux, predict).await?;
+            std::process::exit(code)
+        }),
         Some(Cmd::SshProxy { jump, host, port }) => {
             let paths = Paths::discover(cli.home)?;
             let store = Store::open(&paths.db())?;
@@ -664,12 +716,14 @@ async fn run(home: Option<PathBuf>, listen: Option<SocketAddr>, server: Option<S
     };
     let relay_addr = relay.local_addr()?;
     rtc::net::set_current(rtc::net::NetConfig::load(&store));
+    rtc::nat::load(&store);
     rtc::outbound::load_direct_only(&store);
     let access = gateway::access::AccessConfig::load(&store);
     // 首次运行时生成的访问码要存下来，否则每次启动都不一样。
     access.save(&store)?;
     let _ = std::fs::remove_file(paths.home.join("local-token")); // 旧版本的本机访问口令，已不再使用
     let app = Arc::new(Inner {
+        direct: direct_tls::Direct::new(store.clone(), ui_addr.port()),
         account: account.clone(),
         instances: instances.clone(),
         updater: updater.clone(),
@@ -731,6 +785,8 @@ async fn run(home: Option<PathBuf>, listen: Option<SocketAddr>, server: Option<S
         tokio::spawn(agent_update::run(store.clone(), instances.clone(), chat.clone())),
         tokio::spawn(pricing::run(paths.home.clone())),
         tokio::spawn(rtc::net::resolve_loop()),
+        tokio::spawn(rtc::nat::startup(account.clone(), store.clone())),
+        tokio::spawn(app.direct.clone().run(account.clone())),
         tokio::spawn({
             usage_stats::preload(&paths.home);
             usage_stats::run(paths.home.clone())
@@ -752,7 +808,7 @@ async fn run(home: Option<PathBuf>, listen: Option<SocketAddr>, server: Option<S
             })
         },
     ];
-    let local = tokio::spawn(gateway::serve(ui, gateway::local_app(app.clone()), shutdown.clone()));
+    let local = tokio::spawn(gateway::serve_console(ui, gateway::local_app(app.clone()), app.direct.clone(), shutdown.clone()));
     // 插件清单说要随看看起来的（例如上次退出时浏览器还开着）：网关起来以后再起，插件一起来就能调宿主接口
     tokio::spawn({
         let plugins = app.plugins.clone();
@@ -1053,6 +1109,17 @@ async fn cli_rtc(home: &Option<PathBuf>, listen: SocketAddr, action: Option<RtcC
         Some(RtcCmd::Ipv4 { addr }) => Some(NetUpdate { public_v4: Some(off_or(addr)), ..Default::default() }),
         Some(RtcCmd::Ipv6 { addr }) => Some(NetUpdate { public_v6: Some(off_or(addr)), ..Default::default() }),
         Some(RtcCmd::Ipv6Enabled { state }) => Some(NetUpdate { ipv6: Some(matches!(state, OnOff::On)), ..Default::default() }),
+        Some(RtcCmd::Check) => {
+            let d = call(home, listen, "POST", "/api/rtc/net/detect", Some(json!({})))
+                .await
+                .map_err(|e| if not_running(&e) { anyhow::anyhow!("客户端没在运行，先启动看看 / The client isn't running; start Looklook first") } else { e })?;
+            print_nat(&d["nat"]);
+            // 退出码 0 = 可以直连（open），方便安装脚本检查（服务端 docs/08 §7）
+            if d["nat"]["verdict"].as_str() != Some("open") {
+                std::process::exit(2);
+            }
+            return Ok(());
+        }
         Some(RtcCmd::Detect { apply }) => {
             let d = match call(home, listen, "POST", "/api/rtc/net/detect", Some(json!({}))).await {
                 Ok(v) => v,
@@ -1060,6 +1127,9 @@ async fn cli_rtc(home: &Option<PathBuf>, listen: SocketAddr, action: Option<RtcC
                 Err(e) => return Err(e),
             };
             print_detected(&d);
+            if !d["nat"].is_null() {
+                print_nat(&d["nat"]);
+            }
             if !apply {
                 if d["suggest_v4"].is_string() || d["suggest_v6"].is_string() {
                     println!("加 --apply 保存 / Add --apply to save");
@@ -1095,6 +1165,88 @@ async fn cli_rtc(home: &Option<PathBuf>, listen: SocketAddr, action: Option<RtcC
     };
     print_rtc(&v);
     Ok(())
+}
+
+/// `looklook https`（服务端 docs/09 §7）：开发机安装脚本 `--direct` 也用它。
+async fn cli_https(home: &Option<PathBuf>, listen: SocketAddr, action: Option<HttpsCmd>) -> Result<()> {
+    let wait = match action {
+        None => false,
+        Some(HttpsCmd::Off) => {
+            call(home, listen, "PUT", "/api/public-https", Some(json!({ "enabled": false }))).await?;
+            println!("公网 HTTPS 直连已关闭 / Public HTTPS is off");
+            return Ok(());
+        }
+        Some(HttpsCmd::On { wait }) => {
+            let net = call(home, listen, "GET", "/api/rtc/net", None).await?;
+            if net["public_v4"].as_str().unwrap_or("").is_empty() {
+                // 用户明确要开：检测到就填上（设置页里只提示、不自动填）
+                let d = call(home, listen, "POST", "/api/rtc/net/detect", Some(json!({}))).await?;
+                match d["suggest_v4"].as_str() {
+                    Some(ip) => {
+                        call(home, listen, "PUT", "/api/rtc/net", Some(json!({ "public_v4": ip }))).await?;
+                        println!("检测到公网 IPv4 / Detected public IPv4: {ip}");
+                    }
+                    None => println!("没检测到公网 IPv4，用 looklook rtc ipv4 <地址> 填写 / No public IPv4 detected; set it with looklook rtc ipv4 <addr>"),
+                }
+            }
+            call(home, listen, "PUT", "/api/public-https", Some(json!({ "enabled": true }))).await?;
+            wait
+        }
+    };
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    let v = loop {
+        let v = call(home, listen, "GET", "/api/public-https", None).await?;
+        let phase = v["status"]["phase"].as_str().unwrap_or("");
+        let failed_once = v["status"]["error"].is_string();
+        if !wait || phase == "ok" || phase == "off" || phase == "no_ip" || failed_once || std::time::Instant::now() > deadline {
+            break v;
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    };
+    print_https(&v);
+    Ok(())
+}
+
+fn print_https(v: &Value) {
+    let st = &v["status"];
+    let s = |k: &str| st[k].as_str().unwrap_or("");
+    let port = v["port"].as_u64().unwrap_or(0);
+    if v["enabled"] != json!(true) {
+        println!("公网 HTTPS 直连：关闭 / Public HTTPS: off（looklook https on）");
+        return;
+    }
+    match s("phase") {
+        "ok" => {
+            println!("公网 HTTPS 直连 / Public HTTPS: {}/", s("url"));
+            if let Some(t) = st["not_after"].as_i64().and_then(|t| time::OffsetDateTime::from_unix_timestamp(t).ok()) {
+                println!("证书到期 / Certificate expires: {}（自动续期 / renewed automatically）", t.format(&time::format_description::well_known::Rfc3339).unwrap_or_default());
+            }
+            if !s("reach").is_empty() && s("reach") != "ok" && s("reach") != "unknown" {
+                println!("⚠ 看看服务器从外面打不开（{}），请在安全组里放行 TCP {port} / Not reachable from outside; allow TCP {port}", s("reach"));
+            }
+        }
+        "no_ip" => println!("公网 HTTPS 直连：还不知道公网 IPv4，用 looklook rtc ipv4 <地址> 填写 / Public IPv4 unknown; set it with looklook rtc ipv4 <addr>"),
+        "working" => println!("公网 HTTPS 直连：正在申请证书 / Requesting a certificate…"),
+        _ => println!("公网 HTTPS 直连：申请证书失败 / Requesting a certificate failed"),
+    }
+    if !s("error").is_empty() {
+        println!("  原因 / Reason: {}{}", s("error"), if s("detail").is_empty() { String::new() } else { format!("（{}）", s("detail")) });
+        if matches!(s("error"), "port_busy" | "no_privilege") {
+            println!("  80、443 不能用时，在 nginx 里转发验证路径 / If 80 and 443 aren't available, forward the validation path in nginx:");
+            println!("    location /.well-known/acme-challenge/ {{ proxy_pass http://127.0.0.1:{port}; }}");
+        }
+    }
+    if v["code_ok"] == json!(true) {
+        if v["logged_in"] != json!(true) {
+            println!("访问码 / Access code: {}", v["code"].as_str().unwrap_or(""));
+        }
+    } else {
+        println!("⚠ 访问码不到 12 位，不能用于公网打开：looklook access code new / The access code is too short for internet use: looklook access code new");
+    }
+    println!("安全组 / 防火墙放行 TCP 80（证书）和 TCP {port}（管理台）/ Allow TCP 80 (certificates) and TCP {port} (console) in the firewall");
+    if let Some(ip) = st["ip"].as_str() {
+        println!("Clash 加速 / To use your proxy: - IP-CIDR,{ip}/32,<节点 / proxy>,no-resolve   # 放在 GEOIP,CN,DIRECT 之前 / before GEOIP,CN,DIRECT");
+    }
 }
 
 fn print_rtc(v: &Value) {
@@ -1137,6 +1289,72 @@ fn print_detected(d: &Value) {
     }
     let s = |k: &str| d[k].as_str().unwrap_or("-").to_string();
     println!("建议 / Suggested: IPv4 {}, IPv6 {}", s("suggest_v4"), s("suggest_v6"));
+}
+
+/// NAT 类型检测的结论（docs/08 §5）。
+fn print_nat(r: &Value) {
+    let s = |k: &str| r[k].as_str().unwrap_or("");
+    let verdict = match s("verdict") {
+        "open" => "可以直连：从外面能打进这台电脑的端口段，任何网络下的手机、浏览器都能直接连到它
+                   Direct: the port range is reachable from outside, so phones and browsers on any network can connect directly",
+        "partial" => "部分放行：端口段只有一部分能从外面打进来，把整段 UDP 都放行 / 转发
+                      Partly open: only part of the port range is reachable from outside; open or forward the whole UDP range",
+        "wrong_addr" if s("why") == "blocked" => "填的公网地址打不进来：和出口一致，但端口段没放行或转发没生效
+                                                 The public address you set can't be reached: it matches the exit, but the port range isn't open or forwarded",
+        "punch" => "多数能直连：多数网络能打洞直连，对方在严格 NAT 后面时走中转。想全部直连：放行端口段或做端口转发
+                    Mostly direct: hole punching works from most networks; peers behind strict NAT go through the relay. For direct everywhere, open or forward the port range",
+        "relay_only" => "只能中转：这台电脑所在的网络是对称 NAT，打不了洞，连接会经中转
+                         Relay only: this network uses symmetric NAT, so hole punching fails and connections go through the relay",
+        "proxy" => "测不准：代理软件（TUN 模式）在接管 UDP，让中转的 STUN 地址和端口段直连后再测
+                    Can't tell: a proxy (TUN mode) is taking over UDP; let the relays' STUN addresses and the port range bypass it, then check again",
+        "wrong_addr" if s("why") == "unresolved" => "填的公网地址（域名）还没解析出来 / The public address (domain) hasn't resolved yet",
+        "wrong_addr" => "填的公网 IPv4 和实际出口不一致：多半是运营商 NAT，或者 IP 变了，填了也连不进来
+                         The public IPv4 you set differs from the actual exit address: likely carrier-grade NAT or a changed IP, so it can't be reached",
+        _ => match s("why") {
+            "not_logged_in" => "测不了：登录后才能检测 / Can't check: log in first",
+            "one_relay" => "测不了：需要两台不同 IP 的中转 / Can't check: needs two relays with different IPs",
+            _ => "测不了：中转的 STUN 没有回应（UDP 3478 被拦？）/ Can't check: the relays' STUN didn't answer (UDP 3478 blocked?)",
+        },
+    };
+    println!("NAT: {verdict}");
+    let port = r["local_port"].as_u64().unwrap_or(0);
+    let range = if r["in_range"].as_bool() == Some(true) { "端口段内 / in range" } else { "端口段全被占用，随机端口 / range busy, random port" };
+    println!("  本地端口 / Local port: {port}（{range}）");
+    match s("a") {
+        "both" | "one" | "none" => {
+            let target = s("a_target");
+            for p in r["ports"].as_array().into_iter().flatten() {
+                let ok = if p["open"].as_bool() == Some(true) { "通 / open" } else { "不通 / closed" };
+                println!("  从外面 / From outside → {target}:{}  {ok}", p["port"].as_u64().unwrap_or(0));
+            }
+        }
+        _ => {
+            let why = match s("a_why") {
+                "ports_busy" => "端口段里没有空闲端口 / no free port in the range",
+                "no_target" => "没填公网地址，也没测出公网出口 / no public address set or found",
+                "unsupported" => "主服务不支持 / the server doesn't support it yet",
+                "limited" => "每小时最多 6 次，稍后再测 / at most 6 per hour, try later",
+                "not_logged_in" => "没登录 / not logged in",
+                _ => "请求主服务失败 / request to the server failed",
+            };
+            println!("  从外面打进来 / Reachable from outside: 没测 / not checked（{why}）");
+        }
+    }
+    if let Some(ip) = r["suggest"].as_str() {
+        println!("  检测到可以直连，可以填入公网 IPv4 / Direct works; you can set the public IPv4: {ip}（looklook rtc detect --apply）");
+    }
+    for m in r["mappings"].as_array().into_iter().flatten() {
+        let relay = m["relay"].as_str().unwrap_or("-");
+        match m["mapped"].as_str() {
+            Some(a) => println!("  {relay:<12} → {a}"),
+            None => println!("  {relay:<12} -（{}）", m["error"].as_str().unwrap_or("-")),
+        }
+    }
+    if let (Some(e), Some(p)) = (r["exit"].as_str(), r["public_v4"].as_str()) {
+        if e != p {
+            println!("  出口 / Exit {e} ≠ 填的 / set {p}");
+        }
+    }
 }
 
 /// `looklook restart`：让正在运行的客户端重启（和更新后的重启一样，由系统服务或它自己拉起新进程），等新进程起来。

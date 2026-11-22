@@ -110,6 +110,8 @@ pub enum Peer {
     Lan,
     /// 白名单（已允许）
     Listed,
+    /// 公网来源经 HTTPS 直连（docs/09 §4.3）：必须有直连 Cookie（平台票据或至少 12 位的访问码换来的）
+    Public,
     /// 不允许
     Denied,
 }

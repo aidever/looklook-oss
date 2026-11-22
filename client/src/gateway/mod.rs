@@ -21,8 +21,10 @@ mod notify;
 pub mod assistant;
 pub mod mcp;
 pub mod plugins;
-mod proxy;
+pub(crate) mod proxy;
 pub mod remote;
+pub(crate) mod term_zstd;
+mod termd_ws;
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, RwLock};
@@ -97,6 +99,8 @@ pub struct Inner {
     pub notify: Arc<crate::notify::Notifier>,
     /// 插件（src/plugins.rs）
     pub plugins: Arc<crate::plugins::Plugins>,
+    /// 公网 HTTPS 直连（src/direct_tls.rs）
+    pub direct: Arc<crate::direct_tls::Direct>,
 }
 
 impl Inner {
@@ -199,9 +203,20 @@ async fn security_headers(req: Request, next: Next) -> Response {
 
 /// 直接入口：按来源 IP 放行，检查 Host，需要时检查访问码。
 pub async fn local_guard(State(app): State<App>, mut req: Request, next: Next) -> Response {
+    use looklook_protocol::direct as dp;
     // 没有连接信息只会出现在测试里，按本机处理。
     let conn = req.extensions().get::<ConnectInfo<Conn>>().map(|c| c.0);
     let peer_ip = conn.map(|c| c.remote.ip().to_canonical()).unwrap_or(IpAddr::from([127, 0, 0, 1]));
+    let tls = conn.is_some_and(|c| c.tls);
+    // 免认证的几个路径（docs/09 §8）：ACME http-01 验证（只回应当前待验证的 token，用户的 nginx 转发进来时来源是本机）、
+    // 自检（固定内容）
+    let path = req.uri().path();
+    if req.method() == Method::GET && path.starts_with(dp::ACME_CHALLENGE_PREFIX) {
+        return app.direct.challenge(path);
+    }
+    if req.method() == Method::GET && path == dp::PING_PATH && tls {
+        return ([(header::CACHE_CONTROL, "no-store")], dp::PING_BODY).into_response();
+    }
     // 连接两端是同一个 IP，或者是启动时指定也当作本机的来源（Docker 里运行时宿主机经网关连进来）
     let same_host = conn.and_then(|c| c.local).is_some_and(|l| l.ip().to_canonical() == peer_ip) || access::local_from(peer_ip);
     let cfg = app.access();
@@ -209,6 +224,11 @@ pub async fn local_guard(State(app): State<App>, mut req: Request, next: Next) -
     // 白名单域名的 IP 可能刚变（DDNS）：重新解析一次再判断
     if peer == access::Peer::Denied && app.resolved.refresh_if_stale(&cfg).await {
         peer = access::classify(peer_ip, &cfg, same_host, &app.resolved.ips(&cfg));
+    }
+    // 公网 HTTPS 直连（docs/09 §4.3）：开着、有证书、这条连接是 HTTPS 时，其余公网来源算 Public（必须认证）；
+    // 明文 HTTP 上的仍然拒绝
+    if peer == access::Peer::Denied && tls && app.direct.active() {
+        peer = access::Peer::Public;
     }
     if !host_name(req.headers()).is_some_and(|n| access::host_allowed(n, cfg.open_host().as_ref())) {
         if peer == access::Peer::Denied {
@@ -218,6 +238,20 @@ pub async fn local_guard(State(app): State<App>, mut req: Request, next: Next) -
     }
     if peer == access::Peer::Denied {
         return assets::denied_page(&peer_ip.to_string());
+    }
+    if tls && req.uri().path() == dp::CLIENT_PATH {
+        return direct_entry(&app, peer_ip, req).await;
+    }
+    if peer == access::Peer::Public && !app.direct.cookie_ok(cookie(req.headers(), crate::direct_tls::COOKIE), &cfg, &app.account) {
+        if req.uri().path() == access::FORM_PATH && req.method() == Method::POST {
+            return submit_public_code(&app, &cfg, peer_ip, req).await;
+        }
+        if req.uri().path().starts_with("/api/") {
+            return LocalError::new("ACCESS_CODE_REQUIRED").into_response();
+        }
+        let next_path = req.uri().path_and_query().map(|p| p.as_str()).unwrap_or("/");
+        let short = (!crate::direct_tls::public_code_ok(&cfg)).then_some("short");
+        return assets::code_page(next_path, short);
     }
     if peer.needs_code(&cfg) && !cookie(req.headers(), access::COOKIE).is_some_and(|v| ct_eq(v, &cfg.cookie_value())) {
         if req.uri().path() == access::FORM_PATH && req.method() == Method::POST {
@@ -256,6 +290,41 @@ async fn submit_code(app: &App, cfg: &access::AccessConfig, ip: IpAddr, req: Req
     r
 }
 
+/// 公网来源提交访问码（docs/09 §4.3）：至少 12 位，按 IP 与全局限制失败次数，对了发 `ll_direct`。
+async fn submit_public_code(app: &App, cfg: &access::AccessConfig, ip: IpAddr, req: Request) -> Response {
+    use axum::extract::FromRequest;
+    let form = axum::Form::<std::collections::HashMap<String, String>>::from_request(req, &()).await.map(|f| f.0).unwrap_or_default();
+    let field = |k: &str| form.get(k).map(String::as_str).unwrap_or("");
+    let next = Some(field("next")).filter(|n| n.starts_with('/') && !n.starts_with("//") && !n.starts_with("/\\")).unwrap_or("/");
+    match app.direct.submit_code(cfg, &app.limiter, ip, field("code"), next) {
+        Ok(r) => r,
+        Err(e) => assets::code_page(next, Some(e)),
+    }
+}
+
+/// `/__looklook/direct`（docs/09 §5）：GET 返回页面；POST 提交平台签的票据（`{"grant": "..."}`）。
+async fn direct_entry(app: &App, ip: IpAddr, req: Request) -> Response {
+    if req.method() == Method::GET {
+        return crate::direct_tls::grant_page();
+    }
+    if req.method() != Method::POST {
+        return StatusCode::METHOD_NOT_ALLOWED.into_response();
+    }
+    let host = req.headers().get(header::HOST).and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+    let origin = format!("https://{host}");
+    // 只接受本页面自己发的请求
+    if req.headers().get(header::ORIGIN).and_then(|v| v.to_str().ok()).is_some_and(|o| !o.eq_ignore_ascii_case(&origin)) {
+        return LocalError::new("CSRF_FAILED").into_response();
+    }
+    let Ok(body) = axum::body::to_bytes(req.into_body(), 16 * 1024).await else { return StatusCode::PAYLOAD_TOO_LARGE.into_response() };
+    #[derive(serde::Deserialize)]
+    struct Body {
+        grant: String,
+    }
+    let Ok(b) = serde_json::from_slice::<Body>(&body) else { return StatusCode::BAD_REQUEST.into_response() };
+    app.direct.accept_grant(&app.account, ip, &origin, &b.grant)
+}
+
 /// 远程入口：验证会话凭证与网关令牌；隧道请求直接转发。
 async fn relay_entry(app: App, inner: Router, mut req: Request) -> Response {
     let header = |h: &HeaderMap, name: &str| h.get(name).and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
@@ -287,19 +356,15 @@ async fn relay_entry(app: App, inner: Router, mut req: Request) -> Response {
     }
 }
 
-/// 终端：`/i/{id}/…` → 对应 ttyd。
+/// 终端：`/i/{id}/…` → 对应 ttyd 或 looklook-termd。
 async fn terminal(State(app): State<App>, req: Request) -> Response {
     let access = req.extensions().get::<Access>().cloned().unwrap_or(Access::Local);
     let id = req.uri().path().trim_start_matches("/i/").split('/').next().unwrap_or("").to_string();
-    let Some((port, auth)) = app.instances.upstream(&id) else {
+    let Some(endpoint) = app.instances.endpoint(&id).await else {
         return assets::message_page(StatusCode::SERVICE_UNAVAILABLE, "not_running");
     };
     if proxy::is_websocket(req.headers()) && !origin_matches(req.headers(), &access) {
         return (StatusCode::FORBIDDEN, "origin").into_response();
-    }
-    // Windows：ttyd 只接入会话，连上之前先确保会话在（见 Instances::command_for）
-    if proxy::is_websocket(req.headers()) {
-        app.instances.ensure_attachable(&id).await;
     }
     // 手机上本地翻看、选择文字用的回滚区（src-term/touch.js）。跟终端页同一个地址下，本机、中转、WebRTC 都能取到。
     if req.method() == Method::GET && req.uri().path() == format!("/i/{id}/ll-history") {
@@ -313,14 +378,42 @@ async fn terminal(State(app): State<App>, req: Request) -> Response {
         };
     }
     let index = req.method() == Method::GET && req.uri().path() == format!("/i/{id}/");
-    if let Some(page) = index.then(assets::term_page).flatten() {
-        return page;
+    if index {
+        let boot = matches!(endpoint, crate::instances::InstanceEndpoint::Termd { .. }).then(|| termd_ws::term_boot_tag(&app, &id));
+        if let Some(page) = assets::term_page(boot.as_deref()) {
+            return page;
+        }
     }
-    // 终端里按键、粘贴记成用户输入（会话列表按它排，见 Instances::note_input）
-    let insts = app.instances.clone();
-    let on_input: input_tap::OnInput = std::sync::Arc::new(move || insts.note_input(&id));
-    let opts = proxy::Opts { auth: Some(auth), host: None, inject: index.then_some(proxy::TERM_TAGS), rewrite_location: None, terminal: true, on_input: Some(on_input), keep: None };
-    proxy::forward(&app.http, req, port, opts).await
+
+    match endpoint {
+        crate::instances::InstanceEndpoint::Termd { session_id } => {
+            let p = req.uri().path();
+            if p == format!("/i/{id}/token") && req.method() == Method::GET {
+                return ([(header::CACHE_CONTROL, "no-store")], axum::Json(serde_json::json!({ "token": "" }))).into_response();
+            }
+            if p == format!("/i/{id}/ws") && proxy::is_websocket(req.headers()) {
+                return termd_ws::serve_legacy_ws(app, id, session_id, req).await;
+            }
+            if p == format!("/i/{id}/term") && proxy::is_websocket(req.headers()) {
+                return termd_ws::serve_term_ws(app, id, session_id, req).await;
+            }
+            if p == format!("/i/{id}/term-history") {
+                return termd_ws::serve_term_history(app, id, session_id, req).await;
+            }
+            assets::message_page(StatusCode::NOT_FOUND, "not_found")
+        }
+        crate::instances::InstanceEndpoint::Ttyd { port, auth } => {
+            // Windows：ttyd 只接入会话，连上之前先确保会话在（见 Instances::command_for）
+            if proxy::is_websocket(req.headers()) {
+                app.instances.ensure_attachable(&id).await;
+            }
+            // 终端里按键、粘贴记成用户输入（会话列表按它排，见 Instances::note_input）
+            let insts = app.instances.clone();
+            let on_input: input_tap::OnInput = std::sync::Arc::new(move || insts.note_input(&id));
+            let opts = proxy::Opts { auth: Some(auth), host: None, inject: index.then_some(proxy::TERM_TAGS), rewrite_location: None, terminal: true, on_input: Some(on_input), keep: None };
+            proxy::forward(&app.http, req, port, opts).await
+        }
+    }
 }
 
 /// 写请求与 WebSocket 的来源检查：`Origin` 必须是当前站点本身。
@@ -330,9 +423,10 @@ pub fn origin_matches(h: &HeaderMap, access: &Access) -> bool {
         return true;
     };
     match access {
+        // 同一个端口同时提供 HTTP 和 HTTPS（docs/09 §4.2），两个源都是这台电脑自己的页面
         Access::Local => {
             let host = h.get(header::HOST).and_then(|v| v.to_str().ok()).unwrap_or("");
-            origin.eq_ignore_ascii_case(&format!("http://{host}"))
+            origin.eq_ignore_ascii_case(&format!("http://{host}")) || origin.eq_ignore_ascii_case(&format!("https://{host}"))
         }
         // 平台转发的主机名不带端口（开发环境的非标准端口会出现在 Origin 里），只比较协议与主机名。
         Access::Remote { host, proto } => origin
@@ -379,6 +473,8 @@ pub(crate) fn ct_eq(a: &str, b: &str) -> bool {
 pub struct Conn {
     pub remote: SocketAddr,
     pub local: Option<SocketAddr>,
+    /// 这条连接是 HTTPS（公网直连，docs/09）
+    pub tls: bool,
 }
 
 impl axum::extract::connect_info::Connected<axum::serve::IncomingStream<'_, tokio::net::TcpListener>> for Conn {
@@ -386,7 +482,7 @@ impl axum::extract::connect_info::Connected<axum::serve::IncomingStream<'_, toki
         // 每个新连接调用一次，顺便关掉 Nagle：终端按键与回显都是小包，不能攒着等确认
         // （macOS / Windows 的回环上能多等几十到两百毫秒）。
         let _ = s.io().set_nodelay(true);
-        Conn { remote: *s.remote_addr(), local: s.io().local_addr().ok() }
+        Conn { remote: *s.remote_addr(), local: s.io().local_addr().ok(), tls: false }
     }
 }
 
@@ -395,6 +491,66 @@ pub async fn serve(listener: tokio::net::TcpListener, app: axum::Router, shutdow
     let r = axum::serve(listener, app.into_make_service_with_connect_info::<Conn>()).with_graceful_shutdown(async move { shutdown.cancelled().await }).await;
     if let Err(e) = r {
         tracing::error!(error = %e, "网关退出");
+    }
+}
+
+/// 管理台入口（docs/09 §4.2）：同一个端口同时提供 HTTP 和 HTTPS。每条连接先看第一个字节，`0x16`（TLS ClientHello）
+/// 就做 TLS 握手（证书由 [`crate::direct_tls`] 热替换），其余按明文 HTTP 处理。没有证书时 TLS 握手失败，和以前一样只有 HTTP。
+pub async fn serve_console(listener: tokio::net::TcpListener, app: axum::Router, direct: Arc<crate::direct_tls::Direct>, shutdown: tokio_util::sync::CancellationToken) {
+    let acceptor = tokio_rustls::TlsAcceptor::from(direct.tls_config());
+    loop {
+        let (stream, remote) = tokio::select! {
+            r = listener.accept() => match r {
+                Ok(x) => x,
+                Err(e) => {
+                    // 文件描述符用完之类：歇一下再接
+                    tracing::debug!(error = %e, "管理台 accept 失败");
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    continue;
+                }
+            },
+            _ = shutdown.cancelled() => break,
+        };
+        let _ = stream.set_nodelay(true);
+        let local = stream.local_addr().ok();
+        let (app, acceptor, shutdown) = (app.clone(), acceptor.clone(), shutdown.clone());
+        tokio::spawn(async move {
+            let mut first = [0u8; 1];
+            // 浏览器预连接的 socket 可能过一会儿才发请求
+            let tls = match tokio::time::timeout(std::time::Duration::from_secs(60), stream.peek(&mut first)).await {
+                Ok(Ok(1)) => first[0] == 0x16,
+                _ => return,
+            };
+            let conn = Conn { remote, local, tls };
+            if tls {
+                let Ok(Ok(s)) = tokio::time::timeout(std::time::Duration::from_secs(15), acceptor.accept(stream)).await else { return };
+                serve_conn(s, conn, app, shutdown).await;
+            } else {
+                serve_conn(stream, conn, app, shutdown).await;
+            }
+        });
+    }
+}
+
+async fn serve_conn<S>(io: S, conn: Conn, app: axum::Router, shutdown: tokio_util::sync::CancellationToken)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+    use tower::ServiceExt;
+    let svc = hyper::service::service_fn(move |mut req: hyper::Request<hyper::body::Incoming>| {
+        req.extensions_mut().insert(ConnectInfo(conn));
+        app.clone().oneshot(req.map(axum::body::Body::new))
+    });
+    let builder = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new());
+    let c = builder.serve_connection_with_upgrades(TokioIo::new(io), svc);
+    tokio::pin!(c);
+    tokio::select! {
+        _ = c.as_mut() => {}
+        _ = shutdown.cancelled() => {
+            c.as_mut().graceful_shutdown();
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), c).await;
+        }
     }
 }
 

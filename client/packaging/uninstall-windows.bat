@@ -14,7 +14,7 @@ exit /b 0
 #PS-BEGIN
 # 卸载看看客户端（保留数据：%APPDATA%\looklook）。按 UTF-8（无 BOM）+ CRLF 保存，见 install.bat 开头的说明。
 $ErrorActionPreference = 'SilentlyContinue'
-Get-Process looklook, looklook-term, looklook-mux, ttyd | Stop-Process -Force
+Get-Process looklook, looklook-term, looklook-mux, looklook-termd, ttyd | Stop-Process -Force
 # 会话保持程序叫 psmux.exe：只结束看看安装目录里的，不碰用户自己装的 psmux
 $app = Join-Path $env:LOCALAPPDATA 'Looklook'
 Get-Process psmux | Where-Object { $_.Path -and $_.Path.StartsWith($app, [StringComparison]::OrdinalIgnoreCase) } | Stop-Process -Force

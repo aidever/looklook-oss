@@ -483,7 +483,11 @@
     "scope": "以下是这台电脑的设置：",
     "language_hint": "只改这个浏览器或 App。",
     "details": "版本详情、服务器、源代码",
-    "platform": "平台"
+    "platform": "平台",
+    "termd": "终端会话引擎",
+    "termd_off": "经典（ttyd + tmux）",
+    "termd_on": "新版（looklook-termd）",
+    "termd_hint": "新建终端用看看自己的终端引擎（默认开启）；关掉后新建的终端回到 tmux。已有的终端不受影响。"
   },
   "account": {
     "days_left": "还剩 {{n}} 天",
@@ -823,6 +827,7 @@
     "connecting": "连接中…",
     "reconnecting": "重连中…",
     "unreachable": "连不上",
+    "unreachable_strip": "「{{name}}」暂时连不上",
     "retry": "重试",
     "unreachable_note": "这台电脑在线，但这个浏览器连不上它。",
     "last_seen": "最后在线",
@@ -2714,6 +2719,8 @@
     "sub": "AI 在干活、在等你、刚做完的会话都在这里。"
   },
   "sess": {
+    "old_term": "旧终端",
+    "old_term_hint": "旧终端：还跑在 tmux 上；新建的终端用新的终端引擎",
     "new": "新会话",
     "undo": "撤销",
     "quick_done": "已新建“{{name}}”",
@@ -3001,6 +3008,7 @@
     "e2e": "端到端，电脑签名已校验",
     "latency": "延迟",
     "loss": "丢包率",
+    "all_devices": "所有电脑",
     "remote_note": "先尝试直连那台电脑，连不上时经线路中转；中转只能看到加密后的数据。"
   },
   "hist": {
@@ -3102,15 +3110,26 @@
     "lan_hint": "同一个局域网里，数据不出你的网络。",
     "p2p_hint": "经公网直接连到那台电脑，不经过中转。",
     "relay_hint": "直连没打通，经线路中转（端到端加密，中转看不到内容）。慢的话可以在设置里换线路。",
+    "reach": {
+      "relay_only": "那台电脑所在网络的 NAT 是对称型（每个目标换一个端口），打不了洞，只能中转。",
+      "wrong_addr": "那台电脑填的公网地址从外面连不进去（和实际出口对不上，或端口段没放行）。",
+      "partial": "那台电脑的端口段只有一部分能从公网连进来。",
+      "proxy": "那台电脑的 UDP 走了代理（如 Clash TUN），对外的地址不是它自己的，直连打不通。",
+      "see_settings": "去那台电脑上的看看设置里（直连）看看。"
+    },
     "none_hint": "还没连，用到时才连。",
     "direct_only": "连接方式",
     "direct_only_label": "只直连（不经中转）",
     "direct_only_fell_back": "直连没连通，已改走中转。",
+    "direct_only_fell_back_p2p": "只直连没连通，改按平常方式连上了（仍然没有经过中转）。",
     "direct_only_hint": "想让这台电脑的流量走 Clash 等代理时打开：不用中转，直接连它的公网地址，代理软件里按这台电脑的 IP 写走代理的规则就会生效（代理节点要支持 UDP）。连不上会自动改走中转。只影响这个浏览器 / 这台电脑，切换后会重新连接。",
     "direct_only_nudge": "开着 Clash 等代理、想让连这台电脑的流量走代理？",
     "direct_only_enable": "开启「只直连」",
     "direct_only_nudge_elsewhere": "在别的浏览器或电脑上连它时，可以在连接详情里开启「只直连」，让流量按这台电脑的 IP 走代理。",
-    "direct_only_nudge_off": "不再提示"
+    "direct_only_nudge_off": "不再提示",
+    "reconnect": "重新连接",
+    "reconnecting_now": "正在重连…",
+    "try_direct": "重试直连"
   },
   "pull": {
     "pull": "下拉刷新",
@@ -3149,7 +3168,7 @@
     "public_v6_nic": "网卡上已有公网 IPv6（自动使用，一般不用填）：{{ips}}",
     "not_set": "未填",
     "detect": "检测",
-    "detect_hint": "检测会让这台电脑访问中转的 STUN 和 cip.cc、ip.me、ipw.cn、ipify、ident.me，查到的地址只填进输入框（填了域名的不覆盖），点保存才生效。开着代理或 VPN 时查到的可能是它们的地址。",
+    "detect_hint": "检测会让这台电脑访问中转的 STUN 和 cip.cc、ip.me、ipw.cn、ipify、ident.me，查到的地址只填进输入框（填了域名的不覆盖），点保存才生效；同时请主服务往端口段首尾两个端口发几个 UDP 包、检测 NAT 类型，看从外面能不能直连，结论显示在上面。开着代理或 VPN 时查到的可能是它们的地址。",
     "source_relay": "中转 STUN",
     "probe_failed": "没查到（{{why}}）",
     "probe_disagree": "各来源结果不一致，可能经过了代理或 VPN，请自己确认。",
@@ -3157,7 +3176,43 @@
     "ipv6_hint": "关掉后只用 IPv4，IPv6 网络不稳定时可以试试。",
     "firewall": "直连需要在防火墙、云服务器安全组上放行 UDP {{begin}}–{{end}}（IPv4 和 IPv6 都要）；路由器端口转发时外部端口要和内部端口相同。",
     "more": "有公网 IP？填上地址、放行端口，远程更快",
-    "intro_full": "这台电脑有公网地址（只支持完全锥形 NAT）并放行了下面的端口时，手机网络、公司网络也能直连。改了只对之后新建的连接生效。"
+    "intro_full": "这台电脑有公网地址（只支持完全锥形 NAT）并放行了下面的端口时，手机网络、公司网络也能直连。改了只对之后新建的连接生效。",
+    "nat": {
+      "punch": "网络类型：多数能直连",
+      "punch_hint": "这台电脑所在的网络能打洞，多数网络下的手机、浏览器能直连；对方也在严格的 NAT 后面时会走中转。想全部直连：有公网 IP 时在防火墙、安全组上放行下面的端口段，或在路由器上做端口转发。",
+      "relay_only": "网络类型：只能中转",
+      "relay_only_hint": "这台电脑所在的网络是对称 NAT（常见于公司网络、手机热点、部分运营商），打不了洞，远程连接会经中转。有公网 IP 时放行端口段并填上公网地址就能直连。",
+      "proxy": "网络类型：测不准，代理软件在接管",
+      "proxy_hint": "代理软件（TUN 模式或 fake-ip）在接管这台电脑的 UDP，检测到的是代理的出口。在代理规则里让中转的 STUN 地址和下面的端口段直连后再检测。想用自己的加速线路，规则要加在看的那一端（手机、浏览器所在的电脑），这台电脑保持直连。",
+      "wrong_addr_mismatch": "填的公网 IPv4 连不进来",
+      "wrong_addr_mismatch_hint": "填的是 {{ip}}，但这台电脑实际的出口是 {{exit}}。多半是运营商 NAT（家宽常见，在路由器上做端口转发也没用），或者公网 IP 变了。可以清掉公网 IPv4，或者改填 DDNS 域名。",
+      "wrong_addr_unresolved": "填的公网地址（域名）还没解析出来",
+      "wrong_addr_unresolved_hint": "解析出来之前不会用它直连。检查域名是否写对、DDNS 是否在更新。",
+      "unknown_not_logged_in": "网络类型：登录后才能检测",
+      "unknown_one_relay": "网络类型：测不了（需要两台不同 IP 的中转）",
+      "unknown_no_reply": "网络类型：测不了，中转的 STUN 没有回应",
+      "unknown_no_reply_hint": "这台电脑到中转的 UDP 3478 可能被防火墙或代理拦了，远程连接会改经 TCP 走中转。",
+      "local_port": "本地端口",
+      "random_port": "端口段全被占用，用的随机端口",
+      "open": "网络类型：可以直连",
+      "open_hint": "从外面能打进这台电脑的端口段（首尾两个端口都收到了主服务发来的包），任何网络下的手机、浏览器都能直接连到它。",
+      "partial": "网络类型：端口段只放行了一部分",
+      "partial_hint": "端口段首尾两个端口只有一个能从外面打进来。在防火墙、安全组或路由器端口转发里把整段 UDP {{begin}}–{{end}} 都放行。",
+      "wrong_addr_blocked": "填的公网 IPv4 打不进来",
+      "wrong_addr_blocked_hint": "填的 {{ip}} 和这台电脑的出口一致，但从外面打不进端口段：防火墙、安全组没放行 UDP {{begin}}–{{end}}，或路由器的端口转发没生效。",
+      "suggest": "检测到可以直连：填入 {{ip}}",
+      "suggest_hint": "这台电脑有公网 IP 且端口段已放行，填上公网 IPv4 后连接会优先直接连它。",
+      "from_outside": "从外面",
+      "open_port": "通",
+      "closed_port": "不通",
+      "a_skipped": "没测从外面能不能打进来",
+      "a_why_ports_busy": "端口段里没有空闲端口",
+      "a_why_no_target": "没填公网地址，也没测出公网出口",
+      "a_why_unsupported": "主服务还不支持",
+      "a_why_limited": "每小时最多测 6 次，稍后再测",
+      "a_why_not_logged_in": "没登录",
+      "a_why_error": "请求主服务失败"
+    }
   },
   "addp": {
     "title": "添加项目",
@@ -4060,15 +4115,21 @@
   },
   "rlink": {
     "resuming": "正在恢复连接…",
+    "resuming_name": "正在恢复「{{name}}」的连接…",
     "reconnecting": "连接断开了，正在重连… {{s}} 秒",
+    "reconnecting_name": "「{{name}}」连接断开了，正在重连… {{s}} 秒",
     "slow": "暂时连不上你的电脑，还在重连 · {{s}} 秒",
+    "slow_name": "暂时连不上「{{name}}」，还在重连 · {{s}} 秒",
     "net": "你的网络断了，恢复后自动重连",
     "device_offline": "「{{name}}」离线了，上线后自动连回",
     "computer": "电脑",
     "connecting": "正在连接你的电脑…",
     "connecting_name": "正在连接「{{name}}」…",
+    "failed": "暂时连不上你的电脑",
+    "failed_name": "暂时连不上「{{name}}」",
     "retry": "重试",
     "back": "已重新连接",
+    "back_name": "「{{name}}」已重新连接",
     "dropped_one": "刚才有 {{count}} 个按键没有发出（当时还没连上），请看清画面后重新输入",
     "dropped_other": "刚才有 {{count}} 个按键没有发出（当时还没连上），请看清画面后重新输入",
     "send_wait": "连上后可发送",
@@ -4625,5 +4686,60 @@
     "step_download": "正在下载…",
     "step_verify": "正在校验签名…",
     "step_install": "正在安装…"
+  },
+  "public_https": {
+    "title": "公网 HTTPS 直连",
+    "intro": "有固定公网 IP 的电脑（云主机、开发机）可以直接用浏览器打开 https://IP:端口，不经过看看的中转。想加速时，在 Clash 里给这个 IP 加一条规则走自己的线路。",
+    "enable": "开启公网 HTTPS 直连",
+    "enable_hint": "这台电脑自己向 Let's Encrypt 申请公网 IP 的证书（约 6 天一张，自动续期），管理台端口同时提供 HTTPS。公网打开必须登录看看后点“直接打开”，或者输入访问码。",
+    "remote_only": "公网 HTTPS 直连只能在这台电脑上、局域网或已经直连时设置；经看看网站远程打开时不能修改。",
+    "confirm_title": "把管理台开放到公网？",
+    "confirm_body": "开启后，任何人都能访问 https://<公网IP>:{{port}}，但必须有你的访问码或经看看网站登录才能进入。这等于把一个终端放在公网上，请保管好访问码。\n\n证书由 Let's Encrypt 签发，开启即表示同意它的订户协议：{{tos}}",
+    "confirm_ok": "开启",
+    "no_ip": "还不知道这台电脑的公网 IPv4：请在上面“直连”里填写（可以点“检测”），填好后会自动申请证书。",
+    "working": "正在为 {{ip}} 申请证书…（申请时会临时用一下 TCP 80 或 443 端口）",
+    "url": "在任何网络下都可以打开：",
+    "cert_until": "证书到期",
+    "renew_at": "下次续期",
+    "next_try": "下次重试",
+    "method": {
+      "http01": "经 80 端口验证",
+      "tls_alpn01": "经 443 端口验证",
+      "forward": "经你的 Web 服务器转发验证"
+    },
+    "unreachable": "看看服务器从外面打不开这个地址（{{why}}）。请在安全组 / 防火墙里放行 TCP {{port}}。",
+    "code_short": "这台电脑的访问码不到 12 位，不能用于公网打开。请在“访问控制”里换一个新的访问码。",
+    "code_login": "没登录看看时，公网打开要输入访问码：{{code}}",
+    "firewall": "在云服务器的安全组 / 防火墙里放行 TCP 80（申请、续期证书时用）和 TCP {{port}}（管理台）。",
+    "clash": "想走自己的加速线路：在 Clash 的规则里加这一行，放在 GEOIP,CN,DIRECT 之前（“加速节点”换成你的节点或策略组名）：",
+    "clash_node": "加速节点",
+    "forward_hint": "80 和 443 都被这台电脑上的其他程序（nginx、Caddy、Docker 等）占用了。在你的 Web 服务器里把验证路径转发给看看就行，只转发这一个路径，不影响原来的网站，配一次以后续期都自动生效：",
+    "privilege_hint": "以普通用户运行时绑不了 80 / 443。可以以 root 安装看看，或者用下面任意一条命令（更新看看后第一条要重新执行）：",
+    "logins": "最近的公网登录",
+    "via": {
+      "code": "访问码",
+      "grant": "看看网站"
+    },
+    "err": {
+      "no_privilege": "没有权限使用 80 / 443 端口，申请不了证书。",
+      "port_busy": "80 和 443 都被占用，也没有检测到验证路径的转发。",
+      "unreachable": "从外面连不到这台电脑的 80（或 443）端口，请检查安全组 / 防火墙。",
+      "rate_limited": "Let's Encrypt 暂时不给这个 IP 签发证书（次数限制），稍后会自动重试。",
+      "acme": "Let's Encrypt 拒绝了申请。",
+      "network": "连不上 Let's Encrypt。",
+      "expired": "证书已过期，HTTPS 已停用，正在重新申请。",
+      "other": "申请证书失败（{{code}}）。"
+    }
+  },
+  "native": {
+    "menu": "用本机终端打开",
+    "open_in": "用 {{name}} 打开",
+    "opened": "已在 {{name}} 中打开",
+    "opened_body": "会话在那个窗口里，关掉窗口不影响会话。",
+    "here": "改在这里打开",
+    "again": "再开一个窗口",
+    "setting": "电脑上打开终端用",
+    "setting_hint": "选了本机终端后，在这台电脑上点开会话会直接弹出那个终端的窗口；滚动、搜索、选字都用那个终端自己的。",
+    "builtin": "看看内置"
   }
 }

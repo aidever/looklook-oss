@@ -10,7 +10,7 @@ import { lazy, Suspense, useEffect, useMemo, useRef, useState, useSyncExternalSt
 import { useTranslation } from 'react-i18next';
 
 import { deviceApi, fetchRaw, plainLinksWork, rtcMode, saveViaFrame, selectedDevice, terminalDevice } from '../shared/api.js';
-import { connManaged, isOnline, useConn } from '../shared/conn.js';
+import { connManaged, isOnline, useDeviceConn } from '../shared/conn.js';
 import { errorText } from '../shared/i18n.js';
 import ImageViewer from '../shared/ImageViewer.jsx';
 import Markdown, { isMarkdown } from '../shared/Markdown.jsx';
@@ -1131,7 +1131,7 @@ export default function FileBrowser({ id, active = true, onInsert, insertTo = 't
   const [previewW, setPreviewW] = useState(() => readStore(WIDTH_KEY, 460));
   const [deep, setDeep] = useState(false); // 搜索含子文件夹
   const [chatPick, setChatPick] = useState(null); // 发给对话：要填的文字
-  const conn = useConn();
+  const conn = useDeviceConn(device ?? selectedDevice());
   const offline = connManaged && !isOnline(conn);
   const clipNow = useClip();
   const fav = useFavs(device);

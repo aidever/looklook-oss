@@ -311,12 +311,18 @@ impl Outbound {
             }
             out
         };
+        // 各台电脑自己测的网络类型（docs/08 的 reach）：取缓存的设备列表，正在刷新（锁着）就不带
+        let reach: HashMap<String, String> = match self.devices.try_lock() {
+            Ok(g) => g.as_ref().map(|(_, d)| d.items.iter().filter_map(|x| Some((x.id.clone(), x.reach.clone()?))).collect()).unwrap_or_default(),
+            Err(_) => HashMap::new(),
+        };
+        let reach = &reach;
         let measured = futures_util::future::join_all(links.into_iter().map(|(dev, l)| async move {
             let path = l.path();
             let loss = lock(&l.probe).loss();
-            let (direct, fell_back) = (direct_only(&dev), l.direct_fallback);
+            let (direct, fell_back, reach) = (direct_only(&dev), l.direct_fallback, reach.get(&dev).cloned());
             let rtt = l.rtt().await;
-            (dev, json!({ "kind": path.as_ref().map(|p| p.kind), "local": path.as_ref().map(|p| &p.local), "remote": path.as_ref().map(|p| &p.remote), "rtt_ms": rtt.map(|d| d.as_millis() as u64), "loss": loss, "direct_only": direct, "direct_fallback": fell_back }))
+            (dev, json!({ "kind": path.as_ref().map(|p| p.kind), "local": path.as_ref().map(|p| &p.local), "remote": path.as_ref().map(|p| &p.remote), "rtt_ms": rtt.map(|d| d.as_millis() as u64), "loss": loss, "direct_only": direct, "direct_fallback": fell_back, "reach": reach }))
         }))
         .await;
         measured.into_iter().collect()
@@ -995,5 +1001,119 @@ mod loopback {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         assert_eq!(terms.count(), 0);
+    }
+
+    /// WebRTC DataChannel + 断线续传（resume）+ 重连在 tty-zstd 压缩下的端到端验证：
+    /// - 经 DataChannel 握手协商 `tty-zstd`；
+    /// - 断线期间压缩输出进 Outbox，续接后从断点重发，同一 zstd 流式解码器连续解出原文；
+    /// - 新开连接后两端同步重建压缩/解压上下文。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn terminal_zstd_crosses_rtc_and_resumes() {
+        use std::collections::VecDeque;
+        use std::io::Read;
+
+        #[derive(Default)]
+        struct BufReaderQueue(VecDeque<u8>);
+        impl Read for BufReaderQueue {
+            fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+                if self.0.is_empty() {
+                    return Err(std::io::Error::new(std::io::ErrorKind::WouldBlock, "empty"));
+                }
+                let n = out.len().min(self.0.len());
+                for slot in &mut out[..n] {
+                    *slot = self.0.pop_front().unwrap();
+                }
+                Ok(n)
+            }
+        }
+        fn decode_one(dec: &mut zstd::stream::read::Decoder<'_, std::io::BufReader<BufReaderQueue>>, frame: &[u8], expected: &[u8]) {
+            assert_eq!(frame.first(), Some(&b'0'), "expected OUTPUT prefix");
+            dec.get_mut().get_mut().0.extend(&frame[1..]);
+            let mut out = Vec::with_capacity(expected.len());
+            let mut tmp = [0u8; 4096];
+            while out.len() < expected.len() {
+                let n = dec.read(&mut tmp).expect("zstd chunk should be flushed completely");
+                assert!(n > 0);
+                out.extend_from_slice(&tmp[..n]);
+            }
+            assert_eq!(out, expected);
+        }
+
+        // 本机模拟 ttyd（只认 `tty`，回显收到的二进制消息）
+        let ttyd_app = axum::Router::new().route("/i/abc/ws", get(echo_ws));
+        let ttyd_l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ttyd_port = ttyd_l.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(ttyd_l, ttyd_app).await.unwrap() });
+
+        let http_client = crate::gateway::proxy::client();
+        let router = axum::Router::new().route(
+            "/i/abc/ws",
+            get(move |req: Request| {
+                let http_client = http_client.clone();
+                async move {
+                    let opts = crate::gateway::proxy::Opts {
+                        auth: None,
+                        host: None,
+                        inject: None,
+                        rewrite_location: None,
+                        terminal: true,
+                        on_input: None,
+                        keep: None,
+                    };
+                    crate::gateway::proxy::forward_inner(&http_client, req, ttyd_port, opts, true).await
+                }
+            }),
+        );
+
+        let terms: Arc<crate::rtc::resume::Terms> = Default::default();
+        let first = pair_with(router.clone(), terms.clone()).await;
+        let mut ch = first.channel("w").unwrap();
+        ch.opened(OPEN_LIMIT).await.unwrap();
+        ch.send(&frame::ctl(&json!({ "t": "ws", "p": "/i/abc/ws", "proto": ["tty-zstd", "tty"], "resume": true }))).unwrap();
+        let open = ctl_frame(&mut ch).await;
+        assert_eq!(open["t"], "open");
+        assert_eq!(open["proto"], crate::gateway::term_zstd::SUBPROTOCOL);
+        let key = open["resume"].as_str().expect("resume key").to_string();
+
+        let mut dec = zstd::stream::read::Decoder::new(BufReaderQueue::default()).unwrap();
+        // 第 1 条消息（rx = 0 -> 1）
+        ch.send(&frame::data(false, false, b"0first-chunk-before-drop\r\n")).unwrap();
+        let got1 = data_frame(&mut ch).await;
+        decode_one(&mut dec, &got1, b"first-chunk-before-drop\r\n");
+
+        // 第 2 条消息发出后还没收完就断线，应留在 Outbox 中
+        ch.send(&frame::data(false, false, b"0second-chunk-during-drop\r\n")).unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        drop(ch);
+        first.closed.cancel();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(terms.count(), 1, "parked");
+
+        // 新建 PeerConnection 续接（rx = 1）：同一解码器继续解出第 2 条与续接后的第 3 条
+        let second = pair_with(router.clone(), terms.clone()).await;
+        let mut ch = second.channel("w").unwrap();
+        ch.opened(OPEN_LIMIT).await.unwrap();
+        ch.send(&frame::ctl(&json!({ "t": "resume", "k": key, "rx": 1 }))).unwrap();
+        assert_eq!(ctl_frame(&mut ch).await, json!({ "t": "resumed", "rx": 2 }));
+        let got2 = data_frame(&mut ch).await;
+        decode_one(&mut dec, &got2, b"second-chunk-during-drop\r\n");
+
+        ch.send(&frame::data(false, false, b"0third-chunk-after-resume\r\n")).unwrap();
+        let got3 = data_frame(&mut ch).await;
+        decode_one(&mut dec, &got3, b"third-chunk-after-resume\r\n");
+
+        ch.send(&frame::ctl(&json!({ "t": "close" }))).unwrap();
+
+        // 彻底重连（新建 WS）：服务端重建压缩上下文，客户端用全新的解码器正常解码
+        let mut ch2 = second.channel("w").unwrap();
+        ch2.opened(OPEN_LIMIT).await.unwrap();
+        ch2.send(&frame::ctl(&json!({ "t": "ws", "p": "/i/abc/ws", "proto": ["tty-zstd", "tty"], "resume": false }))).unwrap();
+        let open2 = ctl_frame(&mut ch2).await;
+        assert_eq!(open2["proto"], crate::gateway::term_zstd::SUBPROTOCOL);
+        let mut dec2 = zstd::stream::read::Decoder::new(BufReaderQueue::default()).unwrap();
+        ch2.send(&frame::data(false, false, b"0fresh-context-after-reconnect\r\n")).unwrap();
+        let got_fresh = data_frame(&mut ch2).await;
+        decode_one(&mut dec2, &got_fresh, b"fresh-context-after-reconnect\r\n");
+        ch2.send(&frame::ctl(&json!({ "t": "close" }))).unwrap();
     }
 }

@@ -5,7 +5,8 @@ import { useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 
 import { clearSnapshot } from './snapshot.js';
-import { connManaged, retryNow, useConn } from './conn.js';
+import { connManaged, deviceConn, retryNow, useConn, useFocusedDevice } from './conn.js';
+import { deviceName, useDevices } from './devices.jsx';
 
 /** 断开（重连中）多久以后才显示：心跳确认、并行建连一般 2 秒内就好了。 */
 const SHOW_DROP_AFTER = 2000;
@@ -28,25 +29,36 @@ function useNow(active) {
 
 export default function ConnStatus() {
   const { t } = useTranslation();
-  const s = useConn();
+  const devices = useDevices();
+  const focused = useFocusedDevice();
+  const allConn = useConn();
+  const targetDev = focused || devices.selected || allConn.device?.id || null;
+  const s = deviceConn(allConn, targetDev);
   const busy = ['connecting', 'boot', 'resuming', 'reconnecting'].includes(s.phase);
   const now = useNow(busy);
   // 轻提示分两档：info（已重新连接）2 秒自己走；warn（按键没发出去）要用户看到，停 10 秒、文字完整折行、带 ×。
   // 点提示任意处都能关。计时只跟着提示本身走——之前跟着连接状态 s 走，心跳一更新 s 就把计时清掉了，提示一直不消失。
   const [toast, setToast] = useState(null);
-  const prev = useRef(s);
+  const prev = useRef({ dev: targetDev, s });
+  const devObj = targetDev ? devices.byId(targetDev) : null;
+  const name = (devObj ? deviceName(t, devObj) : null) || s.device?.name;
   useEffect(() => {
     const p = prev.current;
-    prev.current = s;
-    if (s.phase === 'auth') clearSnapshot();
-    if (s.dropped > p.dropped) {
-      const n = s.dropped - p.dropped;
-      setToast((old) => ({ level: 'warn', n: n + (old?.level === 'warn' ? old.n : 0), id: Date.now() }));
-    } else if (s.phase === 'online' && p.phase !== 'online' && ['resuming', 'reconnecting'].includes(p.phase) && Date.now() - p.since >= TOAST_AFTER) {
-      // 已重新连接不盖掉还没看完的“按键没发出”
-      setToast((old) => (old?.level === 'warn' ? old : { level: 'info', id: Date.now() }));
+    if (p.dev !== targetDev) {
+      prev.current = { dev: targetDev, s };
+      return;
     }
-  }, [s]);
+    const ps = p.s;
+    prev.current = { dev: targetDev, s };
+    if (allConn.phase === 'auth') clearSnapshot();
+    if (s.dropped > ps.dropped) {
+      const n = s.dropped - ps.dropped;
+      setToast((old) => ({ level: 'warn', n: n + (old?.level === 'warn' ? old.n : 0), id: Date.now() }));
+    } else if (s.phase === 'online' && ps.phase !== 'online' && ['resuming', 'reconnecting', 'failed', 'offline'].includes(ps.phase) && Date.now() - ps.since >= TOAST_AFTER) {
+      // 已重新连接不盖掉还没看完的“按键没发出”
+      setToast((old) => (old?.level === 'warn' ? old : { level: 'info', name: devices.multi ? name : null, id: Date.now() }));
+    }
+  }, [allConn.phase, targetDev, s, devices.multi, name]);
   useEffect(() => {
     if (!toast) return undefined;
     const id = setTimeout(() => setToast(null), toast.level === 'warn' ? 10000 : 2000);
@@ -55,16 +67,22 @@ export default function ConnStatus() {
   if (!connManaged) return null;
 
   const age = now - (s.since || now);
-  const name = s.device?.name;
+  const labelName = devices.multi ? name : null;
   let text = '';
   let slow = false;
-  if (s.phase === 'resuming') text = t('rlink.resuming');
-  else if (s.phase === 'reconnecting' && age >= SHOW_DROP_AFTER) {
+  if (s.phase === 'resuming') text = labelName ? t('rlink.resuming_name', { name: labelName }) : t('rlink.resuming');
+  else if (s.phase === 'offline') {
+    text = t('rlink.device_offline', { name: name || t('rlink.computer') });
+  } else if (s.phase === 'failed') {
+    slow = true;
+    text = s.cause === 'net' ? t('rlink.net') : labelName ? t('rlink.failed_name', { name: labelName }) : t('rlink.failed');
+  } else if (s.phase === 'reconnecting' && age >= SHOW_DROP_AFTER) {
     slow = age >= SLOW_AFTER;
     const secs = Math.round(age / 1000);
     if (s.cause === 'net') text = t('rlink.net');
     else if (s.cause === 'device_offline') text = t('rlink.device_offline', { name: name || t('rlink.computer') });
-    else text = slow ? t('rlink.slow', { s: secs }) : t('rlink.reconnecting', { s: secs });
+    else if (slow) text = labelName ? t('rlink.slow_name', { name: labelName, s: secs }) : t('rlink.slow', { s: secs });
+    else text = labelName ? t('rlink.reconnecting_name', { name: labelName, s: secs }) : t('rlink.reconnecting', { s: secs });
   } else if ((s.phase === 'connecting' || s.phase === 'boot') && age >= SHOW_CONNECT_AFTER) {
     slow = age >= SLOW_AFTER / 2;
     text = name ? t('rlink.connecting_name', { name }) : t('rlink.connecting');
@@ -87,14 +105,14 @@ export default function ConnStatus() {
           </span>
           <span className="conn-text">{text}</span>
           {slow && (
-            <button type="button" onClick={() => retryNow()}>
+            <button type="button" onClick={() => retryNow(targetDev)}>
               {t('rlink.retry')}
             </button>
           )}
         </>
       ) : (
         <>
-          <span className="conn-text">{warn ? t('rlink.dropped', { count: toast.n }) : t('rlink.back')}</span>
+          <span className="conn-text">{warn ? t('rlink.dropped', { count: toast.n }) : toast.name ? t('rlink.back_name', { name: toast.name }) : t('rlink.back')}</span>
           {warn && (
             <button type="button" className="conn-x" aria-label={t('action.close')} onClick={() => setToast(null)}>
               ×

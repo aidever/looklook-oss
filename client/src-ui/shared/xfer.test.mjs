@@ -148,12 +148,13 @@ test('UploadStore: batch callback and cancel', async () => {
 });
 
 // ---------- term-inject.js ----------
-function loadInject({ files = true, touch = false } = {}) {
+function loadInject({ files = true, touch = false, protocol = 'tty' } = {}) {
   const posted = [];
   const listeners = {};
   class FakeWS {
     constructor(url) {
       this.url = url;
+      this.protocol = protocol;
       this.l = {};
       FakeWS.last = this;
     }
@@ -194,8 +195,18 @@ function loadInject({ files = true, touch = false } = {}) {
   vm.createContext(ctx);
   vm.runInContext(readFileSync(new URL('../../src/term-inject.js', import.meta.url), 'utf8'), ctx);
   const ws = new win.WebSocket('ws://x/i/abc/ws');
-  return { ws: FakeWS.last ?? ws, posted, listeners };
+  return { ws: FakeWS.last ?? ws, win, posted, listeners };
 }
+
+test('term-inject: tty-zstd ignores raw compressed ws frames and detects banners via __llWatchOutput', () => {
+  const { ws, win, posted } = loadInject({ protocol: 'tty-zstd' });
+  // 原始 WS 消息在 tty-zstd 下是压缩字节，不直接扫描
+  ws.emit('rz waiting to receive.**B0100000023be50\r\n');
+  assert.deepEqual(posted, []);
+  // 前端解压后把原文字节交给 __llWatchOutput，正常触发检测
+  win.__llWatchOutput(new TextEncoder().encode('rz waiting to receive.**B0100000023be50\r\n'));
+  assert.deepEqual(JSON.parse(JSON.stringify(posted)), [{ type: 'looklook:transfer', kind: 'rz' }]);
+});
 
 test('term-inject: detects rz/sz banners once, across chunk boundaries', () => {
   const { ws, posted } = loadInject();

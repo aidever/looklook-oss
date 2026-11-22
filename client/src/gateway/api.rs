@@ -15,7 +15,7 @@ use super::access::{self, Peer};
 use super::{origin_matches, Access, App, CLIENT_HEADER};
 use crate::account::VERSION;
 use crate::error::LocalError;
-use crate::instances::{log_tail, Backend, Input, Instances};
+use crate::instances::{log_tail, Input, Instances};
 use crate::settings::Settings;
 use crate::ssh_transfer as xfer;
 use crate::tools;
@@ -80,6 +80,9 @@ pub fn routes(app: App) -> Router<App> {
         .route("/instances/{id}/opened", post(instance_opened))
         .route("/instances/{id}", get(get_instance).patch(update_instance).delete(delete_instance))
         .route("/instances/{id}/start", post(start_instance))
+        // 用这台电脑上装的终端打开会话（native_term.rs，设计稿 §8）
+        .route("/native-terminals", get(native_terminals))
+        .route("/native-open", post(open_native))
         .route("/instances/{id}/stop", post(stop_instance))
         .route("/instances/{id}/restart", post(restart_instance))
         .route("/instances/{id}/logs", get(instance_logs))
@@ -274,6 +277,7 @@ pub fn routes(app: App) -> Router<App> {
         .route("/history/{agent}/{id}", get(history_preview))
         .route("/device/name", put(put_device_name))
         .route("/access", get(get_access).put(put_access))
+        .route("/public-https", get(get_public_https).put(put_public_https))
         .route("/mcp", get(get_mcp).put(put_mcp))
         .route("/mcp/install", post(mcp_install))
         .route("/mcp/uninstall", post(mcp_uninstall))
@@ -578,6 +582,58 @@ async fn platform_web(State(app): State<App>, Path(rest): Path<String>, req: Req
 
 // ---------------- 终端 ----------------
 
+/// 识别到的终端；管理台不是在这台电脑上打开时为空（窗口会弹在这台电脑上，人不在跟前没用）
+async fn native_terminals(State(app): State<App>, peer: Option<Extension<Peer>>) -> Json<Value> {
+    let here = peer.is_some_and(|Extension(p)| p == Peer::Local);
+    let items = if here { tokio::task::spawn_blocking(crate::native_term::detect).await.unwrap_or_default() } else { Vec::new() };
+    let default = Settings::load(&app.store).native_terminal;
+    let default = items.iter().any(|t| t.id == default).then_some(default);
+    Json(json!({ "items": items, "default": default }))
+}
+
+#[derive(Deserialize)]
+struct OpenNativeReq {
+    /// 会话 id
+    id: String,
+    /// 会话在同一账户的另一台电脑上：那台电脑的设备 id（不填或是本机 = 这台电脑上的会话）
+    device: Option<String>,
+    /// 不填用设置里的默认终端
+    terminal: Option<String>,
+}
+
+/// 用这台电脑上的终端打开会话。路径里不带会话 id，`gateway::to_peer` 不会把它转给别的电脑：
+/// 窗口总是弹在这台电脑上，会话在别的电脑上时窗口里的 `looklook attach --device` 再经本机主进程连过去。
+async fn open_native(State(app): State<App>, peer: Option<Extension<Peer>>, Json(req): Json<OpenNativeReq>) -> R<Json<Value>> {
+    // 窗口弹在这台电脑上：只给在这台电脑跟前的人（局域网里的别的设备也不行）
+    if !peer.is_some_and(|Extension(p)| p == Peer::Local) {
+        return Err(LocalError::new("NATIVE_TERM_HERE_ONLY"));
+    }
+    let plain = |s: &str| !s.is_empty() && s.len() <= 128 && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+    let id = req.id;
+    if !plain(&id) {
+        return Err(LocalError::invalid("id", "invalid"));
+    }
+    let own = app.account.session().map(|s| s.device_id);
+    let device = req.device.filter(|d| !d.is_empty() && Some(d) != own.as_ref());
+    match &device {
+        Some(d) if !plain(d) => return Err(LocalError::invalid("device", "invalid")),
+        // 别的电脑上的会话在不在跑由那台电脑说了算（attach 连不上会在窗口里说）
+        Some(_) => {}
+        None => {
+            if app.instances.endpoint(&id).await.is_none() {
+                return Err(LocalError::new("NOT_RUNNING"));
+            }
+        }
+    }
+    let term = req.terminal.filter(|t| !t.is_empty()).unwrap_or_else(|| Settings::load(&app.store).native_terminal);
+    let home = app.paths.home.clone();
+    tokio::task::spawn_blocking(move || crate::native_term::open(&term, &home, &id, device.as_deref()))
+        .await
+        .map_err(anyhow::Error::from)?
+        .map_err(|e| LocalError::new("NATIVE_TERM_FAILED").with("error", e.to_string()))?;
+    Ok(Json(json!({ "ok": true })))
+}
+
 async fn list_instances(State(app): State<App>) -> R<Json<Value>> {
     let items: Vec<Value> = app.instances.list().await?.into_iter().map(|v| with_chat(&app, v)).collect();
     Ok(Json(json!({ "items": items })))
@@ -705,9 +761,10 @@ fn page_key(id: &str) -> String {
 
 fn require_persistent(app: &App) -> R<()> {
     // 直接运行模式下命令只在有人打开终端时运行，网页界面没法常驻
-    match app.instances.backend {
-        Backend::Direct => Err(LocalError::new("DSH_NEEDS_PERSISTENT")),
-        Backend::Tmux(_) => Ok(()),
+    if app.instances.is_persistent() {
+        Ok(())
+    } else {
+        Err(LocalError::new("DSH_NEEDS_PERSISTENT"))
     }
 }
 
@@ -2375,7 +2432,7 @@ async fn list_history(State(app): State<App>, Query(q): Query<crate::history::Qu
         c.instance_id = open.get(&c.id).cloned();
     }
     let marks = app.store.get::<HistoryMarks>(HISTORY_MARKS_KEY).ok().flatten().unwrap_or_default();
-    Ok(Json(json!({ "items": items, "marks": marks, "persistent": matches!(app.instances.backend, Backend::Tmux(_)) })))
+    Ok(Json(json!({ "items": items, "marks": marks, "persistent": app.instances.is_persistent() })))
 }
 
 /// 正开在看看会话里的对话：对话号 → 会话 ID。每个会话只算它**现在**在的那一个：对话界面记下的当前会话号
@@ -2430,7 +2487,7 @@ async fn history_folders(State(app): State<App>, Query(q): Query<FoldersQuery>) 
     for c in items.iter_mut().flat_map(|f| f.items.iter_mut()) {
         c.instance_id = open.get(&c.id).cloned();
     }
-    Ok(Json(json!({ "items": items, "persistent": matches!(app.instances.backend, Backend::Tmux(_)) })))
+    Ok(Json(json!({ "items": items, "persistent": app.instances.is_persistent() })))
 }
 
 /// 以前的对话上的标记（收藏、隐藏），存在这台电脑上：`工具:会话号` → 标记。
@@ -2666,6 +2723,42 @@ async fn put_access(State(app): State<App>, Extension(access): Extension<Access>
         app.resolved.refresh(&app.access()).await;
     }
     Ok(Json(access_view(&app, peer.map(|p| p.0))))
+}
+
+// ---------------- 公网 HTTPS 直连（服务端 docs/09） ----------------
+
+fn public_https_view(app: &App) -> Value {
+    let st = app.direct.status();
+    let cfg = app.access();
+    json!({
+        "enabled": app.direct.config().enabled,
+        "status": st,
+        "logins": app.direct.logins(),
+        "port": app.ui_addr.port(),
+        "tos_url": crate::direct_tls::TOS_URL,
+        // 访问码不到 12 位不能用于公网（没登录时只能用访问码打开）
+        "code_ok": crate::direct_tls::public_code_ok(&cfg),
+        "code": cfg.code,
+        "logged_in": app.account.session().is_some(),
+        "public_v4": crate::rtc::net::current().public_v4,
+    })
+}
+
+/// 和访问控制一样，只能直接访问（本机、局域网、白名单、公网直连）时查看和修改。
+async fn get_public_https(State(app): State<App>, Extension(access): Extension<Access>) -> R<Json<Value>> {
+    require_local(&access)?;
+    Ok(Json(public_https_view(&app)))
+}
+
+#[derive(Deserialize)]
+struct PublicHttpsReq {
+    enabled: bool,
+}
+
+async fn put_public_https(State(app): State<App>, Extension(access): Extension<Access>, Json(req): Json<PublicHttpsReq>) -> R<Json<Value>> {
+    require_local(&access)?;
+    app.direct.set_enabled(req.enabled)?;
+    Ok(Json(public_https_view(&app)))
 }
 
 // ---------------- AI 助手接入（MCP） ----------------

@@ -2,11 +2,12 @@
 // 绿 = 局域网直连，蓝 = 公网直连，黄 = 中转，灰 = 还没连（不会为了显示它去建连接）。
 // 网页（WebRTC）由启动页的 PeerConnection 统计给出（server-web/rtc/boot.js 的 __llrtc.paths）；
 // 本机 App 连其他电脑由客户端给出（GET /api/rtc/paths，src/rtc/outbound.rs）。本机自己不走 WebRTC，只写“本机”。
-import { useEffect, useRef, useState } from 'react';
+import { RefreshCw } from 'lucide-react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 
 import { localApi, rtcMode } from './api.js';
-import { connManaged, isOnline, useConn } from './conn.js';
+import { connManaged, isOnline, reconnectDevice, useConn, useDeviceConn } from './conn.js';
 
 const POLL_MS = 10_000;
 let data = {};
@@ -24,11 +25,13 @@ async function load() {
   subs.forEach((f) => f());
 }
 
+export const refreshPaths = load;
+
 function tick() {
   if (document.visibilityState === 'visible') load();
 }
 
-/** 订阅路径数据：有人在看时每 10 秒刷新一次，页面在后台时不刷新。 */
+/** 订阅路径数据：有人在看时每 10 秒刷新一次，页面在后台时不刷新。按每台电脑自己的连接状态决定是否置空延迟（互不影响）。 */
 export function usePaths() {
   const [, setN] = useState(0);
   useEffect(() => {
@@ -47,16 +50,29 @@ export function usePaths() {
       }
     };
   }, []);
-  // 连接还没确认（切回前台、重连中）：往返时间是旧的，不显示（“—”），免得以为连着（docs/REMOTE_UX_2026-11-07.md §5.2）
   const conn = useConn();
-  if (connManaged && !isOnline(conn)) return Object.fromEntries(Object.entries(data).map(([k, v]) => [k, { ...v, rtt_ms: null, loss: null }]));
+  if (!connManaged) return data;
+  if (conn.links) {
+    return Object.fromEntries(
+      Object.entries(data).map(([k, v]) => {
+        const ph = conn.links[k]?.phase;
+        const ok = !ph || ph === 'online' || ph === 'idle';
+        return [k, ok ? v : { ...v, rtt_ms: null, loss: null }];
+      }),
+    );
+  }
+  if (!isOnline(conn)) return Object.fromEntries(Object.entries(data).map(([k, v]) => [k, { ...v, rtt_ms: null, loss: null }]));
   return data;
 }
 
 /** 一台电脑的路径：`{kind, rtt_ms, loss, local, remote}`；没连着为 null。`loss` 是 0–1 的丢包率，对端是旧版或样本还少时为 null。 */
 export function usePath(device) {
   const all = usePaths();
-  return (device && all[device]) || null;
+  const conn = useDeviceConn(device);
+  const p = (device && all[device]) || null;
+  if (!p) return null;
+  if (connManaged && !isOnline(conn)) return { ...p, rtt_ms: null, loss: null };
+  return p;
 }
 
 /** 丢包率的文字（“2%”）；没有数据为 null。 */
@@ -102,7 +118,7 @@ async function directOnlyGet(device) {
   return directOnlyList.includes(device);
 }
 
-function DirectOnlyRow({ device, fellBack }) {
+function DirectOnlyRow({ device, fellBack, kind }) {
   const { t } = useTranslation();
   const [on, setOn] = useState(null);
   const [busy, setBusy] = useState(false);
@@ -120,9 +136,12 @@ function DirectOnlyRow({ device, fellBack }) {
     const v = e.target.checked;
     setBusy(true);
     try {
-      // 网页：启动页记下后整页重连；本机 App：断开到这台电脑的连接，下个请求按新设置连
-      if (rtcMode) window.top.__llrtc.setDirectOnly(device, v);
-      else {
+      // 网页：只重连这台电脑（不重载整页，不影响其他电脑）；本机 App：断开到这台电脑的连接，下个请求按新设置连
+      if (rtcMode) {
+        window.top.__llrtc.setDirectOnly(device, v);
+        setOn(v);
+        setTimeout(() => load(), 1500);
+      } else {
         directOnlyList = (await localApi.put('/rtc/direct-only', { device, on: v }))?.items ?? null;
         setOn(v);
         load();
@@ -141,7 +160,7 @@ function DirectOnlyRow({ device, fellBack }) {
         </label>
         {on && fellBack && (
           <span className="small" style={{ display: 'block', color: 'var(--warn)' }}>
-            {t('path.direct_only_fell_back')}
+            {t(kind === 'p2p' || kind === 'lan' ? 'path.direct_only_fell_back_p2p' : 'path.direct_only_fell_back')}
           </span>
         )}
         <span className="muted small" style={{ display: 'block' }}>
@@ -211,8 +230,32 @@ export function DirectOnlyNudge({ device }) {
   );
 }
 
+// 走中转时，按那台电脑自己测的网络类型（docs/08 的 reach）说一句为什么没直连；其余档位不说
+const RELAY_REACH = new Set(['relay_only', 'wrong_addr', 'partial', 'proxy']);
+
+function ReconnectButton({ device, isRelay }) {
+  const { t } = useTranslation();
+  const [busy, setBusy] = useState(false);
+  if (!rtcMode || !device || typeof window.top.__llrtc?.reconnect !== 'function') return null;
+  const onClick = async () => {
+    setBusy(true);
+    try {
+      await reconnectDevice(device);
+      await load();
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <button type="button" className="btn btn-plain btn-sm conn-reconnect-btn" disabled={busy} onClick={onClick}>
+      <RefreshCw size={12} className={busy ? 'spin' : undefined} aria-hidden="true" />
+      <span>{busy ? t('path.reconnecting_now') : t(isRelay ? 'path.try_direct' : 'path.reconnect')}</span>
+    </button>
+  );
+}
+
 /** 连接的详情（放在 `dl.kv` 里）：延迟、丢包率、连接方式（带一句说明）、两端地址。`ms` 不给时用路径自己的往返时间。
- * `device`：给了就加“只直连”开关。 */
+ * `device`：给了就加“只直连”开关与单设备重连按钮。 */
 export function PathRows({ p, ms = p?.rtt_ms ?? null, device = null }) {
   const { t } = useTranslation();
   return (
@@ -225,11 +268,21 @@ export function PathRows({ p, ms = p?.rtt_ms ?? null, device = null }) {
         <>
           <dt>{t('path.label')}</dt>
           <dd>
-            <span className={`dot path-${p.kind}`} aria-hidden="true" style={{ display: 'inline-block', width: 7, height: 7, marginRight: 6 }} />
-            {t(`path.${p.kind}`)}
+            <div className="conn-path-head">
+              <span>
+                <span className={`dot path-${p.kind}`} aria-hidden="true" style={{ display: 'inline-block', width: 7, height: 7, marginRight: 6 }} />
+                {t(`path.${p.kind}`)}
+              </span>
+              <ReconnectButton device={device} isRelay={p.kind === 'relay'} />
+            </div>
             <span className="muted small" style={{ display: 'block' }}>
               {t(`path.${p.kind}_hint`)}
             </span>
+            {p.kind === 'relay' && RELAY_REACH.has(p.reach) && (
+              <span className="small" style={{ display: 'block', color: 'var(--warn)' }}>
+                {t(`path.reach.${p.reach}`)} {t('path.reach.see_settings')}
+              </span>
+            )}
             {(p.local || p.remote) && (
               <span className="muted small mono" style={{ display: 'block', wordBreak: 'break-all' }}>
                 {p.local} ⟷ {p.remote}
@@ -238,7 +291,7 @@ export function PathRows({ p, ms = p?.rtt_ms ?? null, device = null }) {
           </dd>
         </>
       )}
-      {device && <DirectOnlyRow device={device} fellBack={Boolean(p?.direct_fallback)} />}
+      {device && <DirectOnlyRow device={device} fellBack={Boolean(p?.direct_fallback)} kind={p?.kind} />}
     </>
   );
 }
@@ -294,6 +347,13 @@ let linkTimer = 0;
 let linkUsers = 0;
 const linkSubs = new Set();
 
+function mapPhaseToState(phase) {
+  if (phase === 'failed' || phase === 'offline') return 'failed';
+  if (phase === 'connecting' || phase === 'boot') return 'connecting';
+  if (phase === 'checking' || phase === 'resuming' || phase === 'reconnecting') return 'reconnecting';
+  return 'online';
+}
+
 function loadLinks() {
   if (document.visibilityState !== 'visible') return;
   let next = {};
@@ -307,11 +367,12 @@ function loadLinks() {
   linkSubs.forEach((f) => f());
 }
 
-/** 订阅各台电脑的连接状态：`{设备 id: {s, reason, path}}`，有人在看时每 2 秒刷新。 */
+/** 订阅各台电脑的连接状态：`{设备 id: {s, reason, path}}`；新版启动页实时推送，旧版启动页每 2 秒轮询。 */
 export function useLinks() {
   const [, setN] = useState(0);
+  const conn = useConn();
   useEffect(() => {
-    if (!rtcMode) return undefined;
+    if (!rtcMode || conn.links) return undefined;
     const f = () => setN((n) => n + 1);
     linkSubs.add(f);
     if (linkUsers++ === 0) {
@@ -322,7 +383,17 @@ export function useLinks() {
       linkSubs.delete(f);
       if (--linkUsers === 0) clearInterval(linkTimer);
     };
-  }, []);
+  }, [Boolean(conn.links)]);
+  const mapped = useMemo(() => {
+    if (!conn.links) return null;
+    const out = {};
+    for (const [id, l] of Object.entries(conn.links)) {
+      out[id] = { s: mapPhaseToState(l.phase), reason: l.reason || '', path: l.path || '' };
+    }
+    return out;
+  }, [conn.links]);
+  if (!rtcMode) return links;
+  if (mapped) return mapped;
   return links;
 }
 

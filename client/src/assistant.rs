@@ -1505,7 +1505,7 @@ mod tests {
 
     fn paths() -> (tempfile::TempDir, Paths) {
         let d = tempfile::tempdir().unwrap();
-        let p = Paths { home: d.path().to_path_buf(), ttyd: None, mux: None, fonts: None, trzsz: None };
+        let p = Paths { home: d.path().to_path_buf(), ttyd: None, mux: None, termd: None, fonts: None, trzsz: None };
         (d, p)
     }
 

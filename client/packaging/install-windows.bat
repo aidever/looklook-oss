@@ -57,6 +57,14 @@ try {
     Rename-Item -Force $legacy 'looklook-mux.exe.old' -ErrorAction SilentlyContinue
   }
   Copy-Item -Force (Join-Path $src 'psmux.exe') $app
+  $termdSrc = Join-Path $src 'looklook-termd.exe'
+  if (Test-Path $termdSrc) {
+    $termdOld = Join-Path $app 'looklook-termd.exe'
+    if (Test-Path $termdOld) {
+      Rename-Item -Force $termdOld ('looklook-termd.exe.old' + (Get-Random)) -ErrorAction SilentlyContinue
+    }
+    Copy-Item -Force $termdSrc $app
+  }
   Get-ChildItem $app -Filter '*.exe.old*' -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
   foreach ($item in 'looklook.exe', 'looklook-term.exe', 'trz.exe', 'tsz.exe', 'fonts', 'LICENSES', 'uninstall.bat') {
     $p = Join-Path $src $item

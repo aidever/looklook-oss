@@ -49,9 +49,12 @@ cp -R "$SRC/fonts" "$SRC/LICENSES" "$PREFIX/"
 for f in looklook looklook-term; do
   cp "$SRC/$f" "$PREFIX/$f.new" && chmod 0755 "$PREFIX/$f.new" && mv -f "$PREFIX/$f.new" "$PREFIX/$f"
 done
-# 会话保持程序（looklook-mux）可能正被后台任务使用：不能直接覆盖运行中的文件（Text file busy），先写临时文件再改名替换，
-# 正在运行的旧进程不受影响，任务继续运行。
+# 会话保持程序（looklook-mux / looklook-termd）可能正被后台任务使用：不能直接覆盖运行中的文件（Text file busy），先写临时文件再改名替换，
+# 正在运行的旧进程不受影响，任务继续运行（looklook-termd 会在新版本启动时通过 SCM_RIGHTS 无缝接管）。
 cp "$SRC/looklook-mux" "$PREFIX/looklook-mux.new" && chmod 0755 "$PREFIX/looklook-mux.new" && mv -f "$PREFIX/looklook-mux.new" "$PREFIX/looklook-mux"
+if [ -f "$SRC/looklook-termd" ]; then
+  cp "$SRC/looklook-termd" "$PREFIX/looklook-termd.new" && chmod 0755 "$PREFIX/looklook-termd.new" && mv -f "$PREFIX/looklook-termd.new" "$PREFIX/looklook-termd"
+fi
 # trz / tsz 可能正在运行：删掉再复制（不覆盖运行中的文件）
 rm -rf "$PREFIX/trzsz" && { cp -R "$SRC/trzsz" "$PREFIX/" 2>/dev/null || true; }
 cp "$SRC/uninstall.sh" "$PREFIX/uninstall.sh" 2>/dev/null || true

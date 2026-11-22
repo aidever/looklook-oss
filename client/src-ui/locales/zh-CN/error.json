@@ -362,5 +362,8 @@
   "PLUGIN_BUSY": "插件正在安装，请稍等",
   "PLUGIN_INSTALL": "插件没装上：{{detail}}",
   "PLUGIN_START": "插件没能启动：{{detail}}",
-  "PLUGIN_UNSUPPORTED": "这台电脑的系统还不支持插件"
+  "PLUGIN_UNSUPPORTED": "这台电脑的系统还不支持插件",
+  "NATIVE_TERM_HERE_ONLY": "只能在这台电脑上用本机终端打开",
+  "NATIVE_TERM_FAILED": "没能打开终端：{{error}}",
+  "NOT_RUNNING": "终端没有在运行"
 }

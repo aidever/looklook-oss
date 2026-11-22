@@ -8,7 +8,8 @@ import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 
 import { useStatus } from '../App.jsx';
-import { api, rtcMode, selectedDevice, terminalDevice } from '../shared/api.js';
+import { api, isLocalDevice, rtcMode, selectedDevice, terminalDevice } from '../shared/api.js';
+import { setFocusedDevice } from '../shared/conn.js';
 import { CHAT_LAUNCHES } from '../shared/chat.js';
 import { lossLevel, lossText, PathRows, usePaths, usePop } from '../shared/paths.jsx';
 import { termFit, termFocus, termOffline, termPaste, termSrc, useFocusWhenReady, useRefitOnReturn, useTermConn, useTermTheme } from '../shared/termFrame.js';
@@ -35,6 +36,7 @@ import { APP_CHROME, termTheme, termVars } from '../shared/termTheme.js';
 import { useOpenedPing, useSeenPing } from '../shared/board.js';
 import { RunButton } from '../shared/RunActions.jsx';
 import { TipPop, useTip } from '../shared/tips.jsx';
+import { autoOpened, openNative, useNativeTerms } from '../shared/nativeTerm.js';
 
 /** 终端页面加载期间的提示：跳动的小点 + 一句人话；等得久了给出刷新按钮。 */
 function TermConnecting({ onRetry }) {
@@ -374,6 +376,42 @@ function PaneNotice({ title, body, children }) {
 }
 
 /**
+ * 本机终端（设计稿 §8）：识别到的终端、默认用哪个，打开时出错弹提示。
+ * `auto`：设了默认终端时，会话一显示就用它打开（这一页里每个会话只自动打开一次），面板里显示“已在 X 中打开”。
+ */
+function useNative(id, inst, running, auto) {
+  const { t } = useTranslation();
+  const toast = useToast();
+  const native = useNativeTerms();
+  // 别的电脑上的会话要跑在 termd 上（窗口里的 looklook attach 只会接 termd；这台电脑上的 tmux 会话它会直接接 tmux）
+  const ok = native.items.length > 0 && (Boolean(inst?.termd) || isLocalDevice(terminalDevice(id)));
+  const [here, setHere] = useState(false);
+  const def = ok && !here ? native.items.find((x) => x.id === native.default) : null;
+  const open = (terminal) => openNative(id, terminal).catch((e) => toast(errorText(t, e), 'error'));
+  useEffect(() => {
+    if (!auto || !running || !def || autoOpened.has(id)) return;
+    autoOpened.add(id);
+    open(def.id);
+  }, [auto, running, def?.id, id]);
+  const items = ok ? native.items.map((x) => ({ icon: SquareTerminal, label: t('native.open_in', { name: x.name }), onClick: () => open(x.id) })) : [];
+  return { items, def, open, here: () => setHere(true) };
+}
+
+function NativeOpened({ name, onHere, onAgain }) {
+  const { t } = useTranslation();
+  return (
+    <PaneNotice title={t('native.opened', { name })} body={t('native.opened_body')}>
+      <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', justifyContent: 'center' }}>
+        <Button onClick={onHere}>{t('native.here')}</Button>
+        <Button variant="plain" icon={SquareTerminal} onClick={onAgain}>
+          {t('native.again')}
+        </Button>
+      </div>
+    </PaneNotice>
+  );
+}
+
+/**
  * 会话页右边的一个会话：上面一条细的工具栏（类型、名称、电脑和项目、连接方式、标签、刷新、传文件、最大化、全屏、新窗口、更多），下面是终端。
  * 不是当前标签时只是隐藏（iframe 不卸载、会话保持连接），切回来时让终端重新适配大小并聚焦。
  * 最大化：铺满整个浏览器窗口（盖住侧栏和标签栏），但不进系统全屏；双击工具栏空白处也能切换。
@@ -460,6 +498,7 @@ export function TermPane({ id, inst, active, missing, offline = false, onStart, 
   const toggleFull = () => (document.fullscreenElement ? document.exitFullscreen?.() : wrap.current?.requestFullscreen?.())?.catch?.(() => {});
   const toggleMax = () => setMax((m) => !m);
   const iconBtn = 'btn btn-plain btn-icon';
+  const native = useNative(id, inst, running, active);
   let body;
   if (missing) {
     body = <PaneNotice title={t('term.missing_title')} body={t('sess.missing_body')} />;
@@ -492,6 +531,8 @@ export function TermPane({ id, inst, active, missing, offline = false, onStart, 
         </Button>
       </PaneNotice>
     );
+  } else if (native.def) {
+    body = <NativeOpened name={native.def.name} onHere={native.here} onAgain={() => native.open(native.def.id)} />;
   } else {
     body = (
       <>
@@ -570,6 +611,7 @@ export function TermPane({ id, inst, active, missing, offline = false, onStart, 
         <button type="button" className={iconBtn} onClick={() => window.open(`/t/${id}`, '_blank', 'noopener')} aria-label={t('instance.new_window')} title={t('instance.new_window')}>
           <ExternalLink size={16} />
         </button>
+        {running && native.items.length > 0 && <PopMenu items={native.items} className={iconBtn} icon={SquareTerminal} label={t('native.menu')} />}
         {menu}
       </header>
       <div className="term-frame">
@@ -608,6 +650,10 @@ export function TermPane({ id, inst, active, missing, offline = false, onStart, 
 
 /** 手机上整页打开的会话。网页类型（DSH，地址带 ?web）打开它的网页（WebPane.jsx）。 */
 export default function TerminalView({ id }) {
+  useEffect(() => {
+    setFocusedDevice(terminalDevice(id) ?? selectedDevice());
+    return () => setFocusedDevice(null);
+  }, [id]);
   if (new URLSearchParams(window.location.search).has('web')) return <WebPageLoader id={id} />;
   return <TermPage id={id} />;
 }
@@ -710,6 +756,7 @@ function TermPage({ id }) {
   };
   const toggleFull = () => (document.fullscreenElement ? document.exitFullscreen() : document.documentElement.requestFullscreen?.())?.catch?.(() => {});
   const newWindow = () => window.open(`/t/${id}`, '_blank', 'noopener');
+  const nativePage = useNative(id, inst, live, false);
 
   let body;
   if (!inst && transient) {
@@ -791,6 +838,7 @@ function TermPage({ id }) {
     tab === 'chat' && chat && { icon: Share2, label: t('share.menu'), onClick: () => window.dispatchEvent(new Event(`ll-chat-share:${id}`)) },
     { icon: full ? Minimize2 : Maximize2, label: t(full ? 'term.exit_full' : 'term.full'), onClick: toggleFull },
     { icon: ExternalLink, label: t('instance.new_window'), onClick: newWindow },
+    ...(live ? nativePage.items : []),
     touch && wakeLockSupported && { icon: awake ? SunDim : Sun, label: t(awake ? 'term.wake_off' : 'term.wake_on'), onClick: () => setWakeLock(!awake) },
   ];
   return (

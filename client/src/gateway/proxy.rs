@@ -73,8 +73,14 @@ fn strip_hop_by_hop(h: &mut HeaderMap) {
     }
 }
 
-pub async fn forward(client: &HttpClient, mut req: Request, port: u16, opts: Opts) -> Response {
+pub async fn forward(client: &HttpClient, req: Request, port: u16, opts: Opts) -> Response {
+    forward_inner(client, req, port, opts, super::term_zstd::enabled()).await
+}
+
+pub(crate) async fn forward_inner(client: &HttpClient, mut req: Request, port: u16, opts: Opts, zstd_enabled: bool) -> Response {
     let ws = is_websocket(req.headers());
+    let offers_zstd = ws && opts.terminal && super::term_zstd::client_offers_zstd(req.headers());
+    let want_zstd = offers_zstd && zstd_enabled;
     let client_upgrade = ws.then(|| hyper::upgrade::on(&mut req));
     let (mut parts, body) = req.into_parts();
     let pq = parts.uri.path_and_query().map(|p| p.as_str().to_string()).unwrap_or_else(|| "/".into());
@@ -90,6 +96,14 @@ pub async fn forward(client: &HttpClient, mut req: Request, port: u16, opts: Opt
     if ws {
         h.insert(header::CONNECTION, HeaderValue::from_static("upgrade"));
         h.insert(header::UPGRADE, HeaderValue::from_static("websocket"));
+        if want_zstd {
+            // 本机 ttyd 只认 `tty` 子协议；zstd 已经压缩输出，不再协商 permessage-deflate（避免二次压缩）
+            super::term_zstd::strip_zstd_subprotocol(h, true);
+            h.remove(header::SEC_WEBSOCKET_EXTENSIONS);
+        } else if offers_zstd {
+            // 关闭压缩时也把 tty-zstd 去掉，避免上游 ttyd 见到未知子协议，保留客户端附带的 tty 回退
+            super::term_zstd::strip_zstd_subprotocol(h, false);
+        }
     }
     if let Some(a) = &opts.auth {
         if let Ok(v) = HeaderValue::from_str(a) {
@@ -117,6 +131,17 @@ pub async fn forward(client: &HttpClient, mut req: Request, port: u16, opts: Opt
     };
 
     if ws && resp.status() == StatusCode::SWITCHING_PROTOCOLS {
+        // 上游 ttyd 接受 `tty` 且客户端声明支持 `tty-zstd` 时开启输出流式 zstd 压缩
+        let zstd_on = want_zstd
+            && resp
+                .headers()
+                .get(header::SEC_WEBSOCKET_PROTOCOL)
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|p| p.trim().eq_ignore_ascii_case("tty"));
+        if zstd_on {
+            resp.headers_mut().insert(header::SEC_WEBSOCKET_PROTOCOL, HeaderValue::from_static(super::term_zstd::SUBPROTOCOL));
+            resp.headers_mut().remove(header::SEC_WEBSOCKET_EXTENSIONS);
+        }
         // 谈好了 permessage-deflate：浏览器发来的消息是压缩的，看输入要先解压（见 input_tap.rs）
         let ext = resp.headers().get(header::SEC_WEBSOCKET_EXTENSIONS).and_then(|v| v.to_str().ok()).unwrap_or("").to_ascii_lowercase();
         let deflate = ext.contains("permessage-deflate").then(|| ext.contains("client_no_context_takeover"));
@@ -129,6 +154,9 @@ pub async fn forward(client: &HttpClient, mut req: Request, port: u16, opts: Opt
             let _guard = guard;
             let _keep = keep;
             match tokio::try_join!(client_upgrade, server_upgrade) {
+                Ok((c, s)) if zstd_on => {
+                    super::term_zstd::bridge(TokioIo::new(c), TokioIo::new(s), on_input).await;
+                }
                 Ok((c, s)) => match on_input {
                     Some(on) => {
                         let _ = tokio::io::copy_bidirectional(&mut super::input_tap::Tap::new(TokioIo::new(c), on, deflate), &mut TokioIo::new(s)).await;

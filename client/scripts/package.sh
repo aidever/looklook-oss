@@ -4,7 +4,7 @@
 #   scripts/package.sh                       全部平台
 #   scripts/package.sh linux-x86_64 ...      指定平台：linux-x86_64 linux-aarch64 darwin-aarch64 windows-x86_64
 #
-# 安装包内容（顶层目录 looklook/）：looklook 可执行文件、trzsz/（trz、tsz；Windows 上是顶层的 trz.exe、tsz.exe）、ttyd 1.7.7（改名为 looklook-term）、会话保持程序（tmux 改名为 looklook-mux；Windows 上的 psmux 保留原名 psmux.exe，见 src/paths.rs 的 MUX_EXE）、终端字体、许可证、安装脚本。
+# 安装包内容（顶层目录 looklook/）：looklook 可执行文件、trzsz/（trz、tsz；Windows 上是顶层的 trz.exe、tsz.exe）、ttyd 1.7.7（改名为 looklook-term）、会话保持程序（tmux 改名为 looklook-mux；Windows 上的 psmux 保留原名 psmux.exe，见 src/paths.rs 的 MUX_EXE）、自研持久终端守护进程（looklook-termd）、终端字体、许可证、安装脚本。
 # Linux 包可直接用看看网页“下载”页的一行命令安装：curl -fsSL <地址> | tar -xz && ./looklook/install.sh
 #
 # Windows / macOS 另外生成桌面应用安装程序（Tauri，见 src/desktop.rs 与 tauri.conf.json），给普通用户双击安装：
@@ -119,10 +119,11 @@ mac_sign() { # mac_sign <文件> <标识>
   local who=${LOOKLOOK_MACOS_SIGN_IDENTITY:--}
   codesign --force --sign "$who" --identifier "$2" --timestamp=none "$1"
 }
-mac_sign_helpers() { # mac_sign_helpers <stage 目录>：随包的终端服务、会话保持程序、trz / tsz
+mac_sign_helpers() { # mac_sign_helpers <stage 目录>：随包的终端服务、会话保持程序、looklook-termd、trz / tsz
   local f
   mac_sign "$1/looklook-term" "$MAC_ID.term"
   mac_sign "$1/looklook-mux" "$MAC_ID.mux"
+  [[ -f "$1/looklook-termd" ]] && mac_sign "$1/looklook-termd" "$MAC_ID.termd"
   for f in "$1"/trzsz/*; do [[ -f $f && -x $f ]] && mac_sign "$f" "$MAC_ID.$(basename "$f")"; done
   return 0
 }
@@ -196,8 +197,8 @@ for t in "$@"; do
   [[ -n $triple ]] || { echo "未知平台：$t" >&2; exit 2; }
   echo "=== ${t}（${triple}）" >&2
   # 随包的 ttyd 改名为 looklook-term（与 src/paths.rs 的 TERM_EXE 一致）；vendor/ 里保留原名
-  exe=looklook; ttyd=ttyd; term=looklook-term; mux=mux; muxout=looklook-mux
-  [[ $t == windows-* ]] && { exe=looklook.exe; ttyd=ttyd.exe; term=looklook-term.exe; mux=psmux.exe; muxout=psmux.exe; }
+  exe=looklook; ttyd=ttyd; term=looklook-term; mux=mux; muxout=looklook-mux; termd=looklook-termd
+  [[ $t == windows-* ]] && { exe=looklook.exe; ttyd=ttyd.exe; term=looklook-term.exe; mux=psmux.exe; muxout=psmux.exe; termd=looklook-termd.exe; }
   stage=$DIST/stage/$t/looklook
   mkdir -p "$stage"
   cp "vendor/$t/$ttyd" "$stage/$term"
@@ -213,7 +214,14 @@ for t in "$@"; do
     darwin-*) cp packaging/install-macos.sh "$stage/install.sh"; cp packaging/uninstall-macos.sh "$stage/uninstall.sh" ;;
     windows-*) bat packaging/install-windows.bat "$stage/install.bat"; bat packaging/uninstall-windows.bat "$stage/uninstall.bat" ;;
   esac
-  chmod 0755 "$stage/$term" "$stage/$muxout" "$stage"/*.sh 2>/dev/null || true
+  # 先编译随包持久终端守护进程 looklook-termd，确保签名、desktop(Tauri resources) 和安装包都包含它
+  case $t in
+    darwin-*) cargo build --release --locked --target "$triple" -p termd --bin looklook-termd ;;
+    *) cargo zigbuild --release --locked --target "$triple" -p termd --bin looklook-termd ;;
+  esac
+  cp "target/$triple/release/$termd" "$stage/$termd"
+  pack_upx "$t" "$stage/$termd"
+  chmod 0755 "$stage/$term" "$stage/$muxout" "$stage/$termd" "$stage"/*.sh 2>/dev/null || true
   if [[ $t == darwin-* ]]; then
     [[ -n ${LOOKLOOK_MACOS_SIGN_IDENTITY:-} ]] || echo "  （没有设置 LOOKLOOK_MACOS_SIGN_IDENTITY：ad-hoc 签名，升级后 macOS 会重新询问文件夹访问权限）" >&2
     # 先签随包程序，Tauri 打进 .app 的就是签好的；.app 本身由 Tauri 用同一张证书签（APPLE_SIGNING_IDENTITY）

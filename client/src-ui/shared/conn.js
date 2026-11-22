@@ -6,11 +6,14 @@ import { useEffect, useState } from 'react';
 
 import { rtcMode } from './api.js';
 
-const ONLINE = { phase: 'online', since: 0, lastOk: 0, hiddenFor: 0, cause: '', reason: '', device: null, others: [], dropped: 0 };
+const ONLINE = { phase: 'online', since: 0, lastOk: 0, hiddenFor: 0, cause: '', reason: '', device: null, others: [], dropped: 0, links: null, def: null };
 
 let current = ONLINE;
 let started = false;
 const listeners = new Set();
+
+let focusedDevice = null;
+const focusListeners = new Set();
 
 function top() {
   try {
@@ -45,6 +48,24 @@ export function claimConn(snapshot) {
   }
 }
 
+/** 当前聚焦中的电脑（当前打开会话或页面对应的电脑），供顶栏状态胶囊与连接胶囊优先跟踪。 */
+export function setFocusedDevice(dev) {
+  const next = dev || null;
+  if (focusedDevice === next) return;
+  focusedDevice = next;
+  focusListeners.forEach((f) => f(focusedDevice));
+}
+
+export function useFocusedDevice() {
+  const [dev, set] = useState(focusedDevice);
+  useEffect(() => {
+    focusListeners.add(set);
+    set(focusedDevice);
+    return () => focusListeners.delete(set);
+  }, []);
+  return dev;
+}
+
 /** 当前的连接状态（不在远程模式时永远是 online）。 */
 export function connState() {
   start();
@@ -61,6 +82,33 @@ export function useConn() {
     return () => listeners.delete(set);
   }, []);
   return s;
+}
+
+/** 从快照里取出某台电脑的独立连接状态；旧版启动页或 Android 壳无 `links` 时退回全局状态。 */
+export function deviceConn(snapshot, devId) {
+  if (!connManaged) return ONLINE;
+  const s = snapshot || current;
+  if (devId && s.links) {
+    const l = s.links[devId];
+    if (!l) {
+      return { ...ONLINE, device: s.device?.id === devId ? s.device : { id: devId }, others: s.others, def: s.def };
+    }
+    return {
+      ...ONLINE,
+      ...l,
+      phase: l.phase === 'idle' ? 'online' : l.phase,
+      device: s.device?.id === devId ? s.device : { id: devId },
+      others: s.others,
+      def: s.def,
+    };
+  }
+  return s;
+}
+
+/** 订阅某台电脑的独立连接状态（互相隔离，一台断开不影响另一台）。 */
+export function useDeviceConn(devId) {
+  const s = useConn();
+  return deviceConn(s, devId);
 }
 
 /** 连着（远程时以启动页为准；本机、局域网永远算连着）。 */
@@ -82,10 +130,18 @@ export function refreshAll() {
   window.location.reload();
 }
 
-/** 远程时让启动页不等退避马上重连（不重载管理台）。 */
-export function retryNow() {
+/** 远程时让启动页对指定电脑不等退避马上重连（不重载管理台、不影响其他电脑）。 */
+export function retryNow(devId) {
   const t = top();
-  const dev = current.device?.id;
+  const dev = devId || focusedDevice || current.device?.id;
   if (dev && typeof t?.retry === 'function') return t.retry(dev);
   return refreshAll();
+}
+
+/** 远程时对单台电脑重建 WebRTC 连接（例如从“中转”重连尝试升级为局域网/公网直连），不重载页面、不影响其他电脑。 */
+export function reconnectDevice(devId) {
+  const t = top();
+  const dev = devId || focusedDevice || current.device?.id;
+  if (dev && typeof t?.reconnect === 'function') return t.reconnect(dev);
+  return retryNow(dev);
 }

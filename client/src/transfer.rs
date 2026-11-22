@@ -995,7 +995,7 @@ mod tests {
     }
 
     fn paths(home: &Path) -> Paths {
-        Paths { home: home.to_path_buf(), ttyd: None, mux: None, fonts: None, trzsz: None }
+        Paths { home: home.to_path_buf(), ttyd: None, mux: None, termd: None, fonts: None, trzsz: None }
     }
 
     #[test]

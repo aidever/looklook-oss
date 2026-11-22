@@ -494,7 +494,7 @@ mod tests {
     #[test]
     fn index_memory_journal_and_logs() {
         let d = tempfile::tempdir().unwrap();
-        let p = Paths { home: d.path().to_path_buf(), ttyd: None, mux: None, fonts: None, trzsz: None };
+        let p = Paths { home: d.path().to_path_buf(), ttyd: None, mux: None, termd: None, fonts: None, trzsz: None };
         let store = crate::store::Store::open(&d.path().join("s.db")).unwrap();
         let o = crate::assistant_memory::save(&p, crate::assistant_memory::Save { kind: Some(crate::assistant_memory::Kind::Project), title: "shop 支付回调".into(), text: "签名用 RSA，回调地址 /api/pay/notify".into(), project: Some("/w/shop".into()), allow_new: true, ..Default::default() }, &[]).unwrap();
         crate::assistant_memory::journal(&p, "派活 · 修支付回调 · 用户说回调没到");

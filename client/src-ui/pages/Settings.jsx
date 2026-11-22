@@ -14,6 +14,7 @@ import { LocalOnlyToggle, useDevices } from '../shared/devices.jsx';
 import { api } from '../shared/api.js';
 import AccessCard from './Access.jsx';
 import DirectCard from './DirectConnect.jsx';
+import PublicHttpsCard from './PublicHttps.jsx';
 import { AttachmentsCard } from '../shared/Attachments.jsx';
 import { MacFoldersCard } from '../shared/MacFolders.jsx';
 import { MOVED_TO_AI } from './Ai.jsx';
@@ -27,6 +28,7 @@ import { shouldRemind, UpdateCheck } from '../shared/Update.jsx';
 import { Button, Card, ErrorNote, Seg, useAction, useLoad, useToast } from '../shared/ui.jsx';
 import { useTips } from '../shared/tips.jsx';
 import { SyncCard, SyncLabel } from '../shared/SettingsSync.jsx';
+import { refreshNativeTerms, useNativeTerms } from '../shared/nativeTerm.js';
 
 // 开源仓库（客户端 AGPL-3.0-or-later）
 
@@ -68,8 +70,9 @@ function sectionOf(hash) {
 }
 
 // 自动保存的设置项（配色在终端页里换，自动更新、附件保留天数在各自的卡片里单独保存）
-const KEYS = ['font', 'font_size', 'default_workdir', 'default_shell', 'device_name', 'default_full_access', 'idle_stop_days'];
-const differs = (a, b) => (k) => String(a[k] ?? '') !== String(b[k] ?? '');
+const KEYS = ['font', 'font_size', 'default_workdir', 'default_shell', 'device_name', 'default_full_access', 'idle_stop_days', 'termd', 'native_terminal'];
+const norm = (v, k) => (k === 'termd' ? String(Boolean(v?.[k])) : String(v?.[k] ?? ''));
+const differs = (a, b) => (k) => norm(a, k) !== norm(b, k);
 const same = (a, b) => !KEYS.some(differs(a, b));
 
 /** 改动停下 600 毫秒后保存；离开页面时把没保存的立即发出去。 */
@@ -81,7 +84,13 @@ function useAutoSave(status, reload) {
   latest.current = { s, status };
 
   // 只发改了的项：其余的（包括别的电脑刚同步过来的）由后端沿用现在的值
-  const body = (v) => Object.fromEntries(KEYS.filter(differs(v, saved.current)).map((k) => [k, k === 'font_size' || k === 'idle_stop_days' ? Number(v[k]) : v[k]]));
+  const body = (v) =>
+    Object.fromEntries(
+      KEYS.filter(differs(v, saved.current)).map((k) => [
+        k,
+        k === 'font_size' || k === 'idle_stop_days' ? Number(v[k]) : k === 'termd' ? Boolean(v[k]) : v[k],
+      ]),
+    );
 
   // 没有未保存的改动时跟着最新状态走（比如别的电脑同步来了新字号）
   useEffect(() => {
@@ -185,6 +194,9 @@ export default function Settings() {
   const [s, setS, saveState] = useAutoSave(status, reload);
   const [shells] = useLoad(() => api.get('/shells'));
   const caps = status.capabilities;
+  const native = useNativeTerms();
+  // 本机终端只对这台电脑上的会话有用：管理台在这台电脑上打开、看的是这台电脑的设置时才显示
+  const nativeHere = native.items.length > 0 && (!devices.multi || devices.selected === devices.def);
   useTerminalFonts(caps.fonts);
   const set = (k) => (v) => setS({ ...s, [k]: v });
   const section = sectionOf(hash);
@@ -258,6 +270,41 @@ export default function Settings() {
               ]}
             />
           </Row>
+          {nativeHere && (
+            <div className="field">
+              <span className="field-label">{t('native.setting')}</span>
+              <div className="chips" role="group" aria-label={t('native.setting')}>
+                {[{ id: '', name: t('native.builtin') }, ...native.items].map((x) => (
+                  <button
+                    key={x.id}
+                    type="button"
+                    className="chip"
+                    aria-pressed={(s.native_terminal || '') === x.id}
+                    onClick={() => {
+                      set('native_terminal')(x.id);
+                      setTimeout(refreshNativeTerms, 1500);
+                    }}
+                  >
+                    {x.name}
+                  </button>
+                ))}
+              </div>
+              <span className="field-hint">{t('native.setting_hint')}</span>
+            </div>
+          )}
+          {caps.termd && (
+            <Row label={t('settings.termd')} hint={t('settings.termd_hint')}>
+              <Seg
+                value={Boolean(s.termd)}
+                label={t('settings.termd')}
+                onChange={set('termd')}
+                options={[
+                  [false, t('settings.termd_off')],
+                  [true, t('settings.termd_on')],
+                ]}
+              />
+            </Row>
+          )}
         </Card>
       </>
     ),
@@ -272,6 +319,9 @@ export default function Settings() {
         <DirectCard />
         <div id="access" className="anchor">
           <AccessCard />
+        </div>
+        <div id="public-https" className="anchor">
+          <PublicHttpsCard />
         </div>
       </>
     ),

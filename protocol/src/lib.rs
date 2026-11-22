@@ -3,6 +3,7 @@
 //! 签名规范串、错误码、DTO、网关令牌、会话凭证与用户名规则在这里只有一份实现，
 //! 客户端和平台都依赖本 crate，保证两端一致。
 
+pub mod direct;
 pub mod dto;
 pub mod edge_auth;
 pub mod error_code;

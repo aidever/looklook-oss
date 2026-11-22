@@ -831,7 +831,8 @@ function DraftForm() {
               <MoreHorizontal size={16} aria-hidden="true" />
             </button>
             </div>
-            <button type="submit" className={`draft-go ${empty || sendLabel !== t('sess.start') ? 'wide' : ''}`} disabled={busy || installing || Boolean(blocked)} aria-label={sendLabel} title={blocked ?? t('sess.start_hint')}>
+            {/* 按下时不让输入框失焦：不然手机上键盘先收起、输入框（跟着 --kb 抬着）往下掉，按钮挪走，这一下点不中，得再点一次 */}
+            <button type="submit" onPointerDown={(e) => e.preventDefault()} onMouseDown={(e) => e.preventDefault()} className={`draft-go ${empty || sendLabel !== t('sess.start') ? 'wide' : ''}`} disabled={busy || installing || Boolean(blocked)} aria-label={sendLabel} title={blocked ?? t('sess.start_hint')}>
               {busy || installing ? <Spinner size={16} /> : empty || missing(launch) ? sendLabel : <ArrowUp size={18} />}
             </button>
           </div>

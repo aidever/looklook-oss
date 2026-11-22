@@ -1,7 +1,9 @@
 // 设置 → 网络与访问 → 直连：远程打开这台电脑时 WebRTC 用的传输端口范围、公网 IPv4 / IPv6（服务端 docs/07）。
 // 公网地址也可以填域名（DDNS），客户端定时解析，保存后在输入框下显示当前解析结果。
 // 端口范围和地址一起点保存；IPv6 开关点一下就保存。改了只对新建的连接生效；远程打开时也能改（改错了还有中转）。
-// “检测”由这台电脑去问中转的 STUN 和 cip.cc、ip.me 等服务，结果只填进输入框，不自动保存。
+// “检测”由这台电脑去问中转的 STUN 和 cip.cc、ip.me 等服务，结果只填进输入框，不自动保存；
+// 同时做直连自检（服务端 docs/08：从外面打端口段、NAT 类型），结论显示在卡片顶部（客户端启动后、改了设置后也会自动测一次）；
+// 没填公网地址但从外面能打进来时给一个“填入”，点了才保存。
 import { Search } from 'lucide-react';
 import { useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
@@ -10,7 +12,7 @@ import { api, rtcMode } from '../shared/api.js';
 import { useDevices } from '../shared/devices.jsx';
 import { DirectOnlyNudge } from '../shared/paths.jsx';
 import { More } from '../shared/page.jsx';
-import { Button, Card, ErrorNote, Field, Note, Skeleton, Switch, useAction, useToast } from '../shared/ui.jsx';
+import { Button, Card, ErrorNote, Field, FoldNote, Note, Skeleton, Switch, Time, useAction, useToast } from '../shared/ui.jsx';
 
 /** 填的是域名（有字母、没有冒号）：检测不覆盖它。 */
 const isName = (s) => /[a-z]/i.test(s) && !s.includes(':');
@@ -32,6 +34,71 @@ function Probes({ items }) {
       ))}
       {ips.some((ip) => ip !== ips[0]) && <span className="direct-probe-warn">{t('direct.probe_disagree')}</span>}
     </span>
+  );
+}
+
+const NAT_KIND = { open: 'ok', punch: 'ok', partial: 'warn', relay_only: 'warn', wrong_addr: 'warn', proxy: 'warn' };
+
+/** 直连自检的结论：一行档位，点开看从外面打端口段的结果、每台中转看到的映射地址。
+ * 没填公网地址、从外面能打进来（云主机）时下面加一行“填入”，点了才保存（`onFill`）。 */
+function NatResult({ r, ports, filled, onFill }) {
+  const { t } = useTranslation();
+  if (!r) return null;
+  const key = r.verdict === 'unknown' || r.verdict === 'wrong_addr' ? `${r.verdict}_${r.why}` : r.verdict;
+  const vars = { exit: r.exit, ip: r.public_v4, begin: ports[0], end: ports[1] };
+  return (
+    <>
+    <FoldNote
+      kind={NAT_KIND[r.verdict] ?? 'info'}
+      summary={
+        <>
+          {t(`direct.nat.${key}`, { ...vars, defaultValue: t('direct.nat.unknown_no_reply') })} <span className="muted small">· <Time value={new Date(r.at * 1000).toISOString()} only="relative" /></span>
+        </>
+      }
+    >
+      <p className="small">{t(`direct.nat.${key}_hint`, { ...vars, defaultValue: '' })}</p>
+      <span className="field-hint direct-probes">
+        {(r.ports ?? []).map((p) => (
+          <span key={p.port} className="direct-probe">
+            <span>{t('direct.nat.from_outside')}</span>
+            <span className="mono">
+              {r.a_target}:{p.port} · {t(p.open ? 'direct.nat.open_port' : 'direct.nat.closed_port')}
+            </span>
+          </span>
+        ))}
+        {(!r.a || r.a === 'skipped') && (
+          <span className="direct-probe">
+            <span>{t('direct.nat.from_outside')}</span>
+            <span>
+              {t('direct.nat.a_skipped')}
+              {r.a_why ? ` · ${t(`direct.nat.a_why_${r.a_why}`, { defaultValue: r.a_why })}` : ''}
+            </span>
+          </span>
+        )}
+        <span className="direct-probe">
+          <span>{t('direct.nat.local_port')}</span>
+          <span className="mono">
+            {r.local_port || '—'}
+            {!r.in_range && r.local_port ? ` · ${t('direct.nat.random_port')}` : ''}
+          </span>
+        </span>
+        {r.mappings.map((m) => (
+          <span key={m.relay} className="direct-probe">
+            <span>{m.relay}</span>
+            <span className="mono">{m.mapped || t('direct.probe_failed', { why: m.error })}</span>
+          </span>
+        ))}
+      </span>
+    </FoldNote>
+    {r.suggest && !filled && (
+      <span className="field-hint" style={{ display: 'block' }}>
+        <button type="button" className="link-button" onClick={() => onFill(r.suggest)}>
+          {t('direct.nat.suggest', { ip: r.suggest })}
+        </button>{' '}
+        {t('direct.nat.suggest_hint')}
+      </span>
+    )}
+    </>
   );
 }
 
@@ -81,12 +148,14 @@ export default function DirectCard() {
     const r = await detect.run(() => api.post('/rtc/net/detect', {}));
     if (!r) return;
     setDetected(r);
+    if (r.nat) setData((d) => ({ ...d, nat: r.nat }));
     const pick = (cur, ip) => (isName(cur) ? cur : ip || cur);
     setF((cur) => ({ ...cur, public_v4: pick(cur.public_v4, r.suggest_v4), public_v6: pick(cur.public_v6, r.suggest_v6) }));
   };
 
   return (
     <Card title={t('direct.title')} sub={t('direct.intro')}>
+      <NatResult r={data.nat} ports={[data.port_begin, data.port_end]} filled={Boolean(data.public_v4)} onFill={(ip) => save({ public_v4: ip })} />
       {/* 大多数网络不用设：表单收起来；已经填过（公网地址、改过端口）就展开 */}
       <More summary={t('direct.more')} open={configured}>
       <p className="muted small">{t('direct.intro_full')}</p>

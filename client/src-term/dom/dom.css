@@ -1,0 +1,178 @@
+/* 手机 DOM 渲染（src-term/dom/view.js）。--cw 格宽、--lh 行高（整数像素）由脚本量出来 */
+.lld {
+  position: absolute;
+  inset: 0;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch;
+  background: var(--bg);
+  color: var(--fg);
+  font-variant-ligatures: none;
+  font-kerning: none;
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
+  -webkit-user-select: text;
+  user-select: text;
+  -webkit-tap-highlight-color: transparent;
+  outline: none;
+  /* 在最下面时新内容把回滚区往上推；翻看中插到上面的行不让内容跳 */
+  overflow-anchor: auto;
+}
+
+.lld ::selection {
+  background: var(--sel);
+}
+
+.lld-pad {
+  padding: 5px;
+  min-height: calc(100% - 10px);
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+}
+
+.lld .r {
+  height: var(--lh);
+  line-height: var(--lh);
+  white-space: pre;
+  overflow: hidden;
+}
+
+/* 非 ASCII 的格子：定宽盒子，字体里的字多宽都不影响后面的列 */
+.lld .w1,
+.lld .w2 {
+  display: inline-block;
+  font-style: inherit;
+  text-align: center;
+  vertical-align: top;
+  overflow: visible;
+  height: var(--lh);
+}
+.lld .w1 {
+  width: var(--cw);
+}
+.lld .w2 {
+  width: calc(var(--cw) * 2);
+}
+
+.lld .lk {
+  text-decoration-line: underline;
+  text-decoration-style: dotted;
+  cursor: pointer;
+}
+
+/* 回滚区按块排版：屏幕外的块不排版、不画 */
+.lld-hist .b {
+  content-visibility: auto;
+  contain-intrinsic-size: auto calc(var(--lh) * 64);
+}
+
+/* 备用屏幕、程序开了鼠标：回滚区不是程序的内容，藏起来；滑动交给程序 */
+.lld.alt .lld-hist,
+.lld.app .lld-hist {
+  display: none;
+}
+.lld.app {
+  touch-action: pinch-zoom;
+  overflow-anchor: none;
+}
+
+.lld-live {
+  position: relative;
+  flex: none;
+}
+
+.lld-cur {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: var(--cw);
+  height: var(--lh);
+  pointer-events: none;
+  will-change: transform;
+}
+/* 本地预测回显：还没被 termd 确认的字，带一条淡下划线 */
+.lld-pred > span {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: var(--cw);
+  height: var(--lh);
+  background: var(--bg);
+  color: var(--fg);
+  text-decoration: underline;
+  text-decoration-color: color-mix(in srgb, var(--fg) 45%, transparent);
+  text-underline-offset: 2px;
+  pointer-events: none;
+  white-space: pre;
+}
+.lld-cur.block {
+  background: var(--cursor);
+  opacity: 0.55;
+}
+.lld-cur.hollow {
+  box-shadow: inset 0 0 0 1px var(--cursor);
+}
+.lld-cur.bar {
+  width: 2px;
+  background: var(--cursor);
+}
+.lld-cur.underline {
+  top: calc(var(--lh) - 2px);
+  height: 2px;
+  background: var(--cursor);
+}
+.lld-cur.blink {
+  animation: lld-blink 1.06s step-end infinite;
+}
+@keyframes lld-blink {
+  50% {
+    opacity: 0;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .lld-cur.blink {
+    animation: none;
+  }
+}
+
+/* 输入框：看不见，跟着光标走（输入法候选框的位置）。16px 字号：iOS 聚焦时不自动放大页面 */
+.lld-ta {
+  position: fixed;
+  left: 0;
+  top: 0;
+  width: 1px;
+  height: 1em;
+  padding: 0;
+  border: 0;
+  margin: 0;
+  opacity: 0;
+  resize: none;
+  overflow: hidden;
+  font-size: 16px;
+  color: transparent;
+  background: transparent;
+  caret-color: transparent;
+  z-index: -1;
+}
+
+.lld-bottom {
+  position: absolute;
+  right: 14px;
+  bottom: 14px;
+  width: 38px;
+  height: 38px;
+  border-radius: 50%;
+  border: 0;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  background: rgba(60, 64, 90, 0.85);
+  color: #fff;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+  z-index: 6;
+}
+.lld-bottom.on {
+  display: flex;
+}

@@ -319,7 +319,7 @@ fn linked(home: &Path) -> Option<PathBuf> {
 
 /// 程序所在的安装目录（资源和主程序同目录时）的内容：复制成版本目录用。
 fn package_items(exe_dir: &Path) -> Vec<PathBuf> {
-    const ITEMS: [&str; 8] = ["looklook", "looklook-term", "looklook-mux", "trzsz", "fonts", "LICENSES", "stop.sh", "uninstall.sh"];
+    const ITEMS: [&str; 9] = ["looklook", "looklook-term", "looklook-mux", "looklook-termd", "trzsz", "fonts", "LICENSES", "stop.sh", "uninstall.sh"];
     ITEMS.iter().map(|n| exe_dir.join(n)).filter(|p| p.exists()).collect()
 }
 
@@ -679,5 +679,17 @@ mod tests {
         assert!(in_use(exe.parent().unwrap()));
         let tmp = tempfile::tempdir().unwrap();
         assert!(!in_use(tmp.path()));
+    }
+
+    #[test]
+    fn package_items_includes_termd() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("looklook"), "a").unwrap();
+        std::fs::write(tmp.path().join("looklook-termd"), "b").unwrap();
+        let names: Vec<String> = package_items(tmp.path())
+            .into_iter()
+            .filter_map(|p| p.file_name().and_then(|n| n.to_str()).map(str::to_string))
+            .collect();
+        assert_eq!(names, vec!["looklook", "looklook-termd"]);
     }
 }

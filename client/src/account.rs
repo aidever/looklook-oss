@@ -310,6 +310,20 @@ impl Account {
         Some(r)
     }
 
+    /// 公网 HTTPS 直连的自检（服务端 docs/09 §6）：请主服务从外面访问这台电脑。没登录时为 None。
+    pub async fn direct_check(&self, req: &looklook_protocol::direct::CheckRequest) -> Option<PResult<looklook_protocol::direct::CheckResponse>> {
+        let (s, key) = self.creds()?;
+        let signer = Signer { device: &s.device_id, key_id: &s.key_id, key: &key };
+        Some(self.platform().call("POST", looklook_protocol::direct::CLIENT_CHECK_PATH, signer, Some(req)).await)
+    }
+
+    /// 端口可达检测（服务端 docs/08 §3）：请主服务往这几个端口发 UDP 包。没登录为 None。
+    pub async fn rtc_reach(&self, req: &looklook_protocol::rtc::ReachRequest) -> Option<PResult<serde_json::Value>> {
+        let (s, key) = self.creds()?;
+        let signer = Signer { device: &s.device_id, key_id: &s.key_id, key: &key };
+        Some(self.platform().call("POST", looklook_protocol::rtc::CLIENT_REACH_PATH, signer, Some(req)).await)
+    }
+
     fn creds(&self) -> Option<(Session, SigningKey)> {
         Some((lock(&self.session).clone()?, lock(&self.key).clone()?))
     }
@@ -697,6 +711,8 @@ impl Account {
             uptime_seconds: Some(self.started.elapsed().as_secs() as i64),
             // 每次都带全量终端列表，作为单独上报失败时的兜底；读不到本机列表时不更新（None）
             terminals: self.terminal_ids().ok(),
+            direct: crate::direct_tls::advertised(),
+            rtc_reach: crate::rtc::nat::reported(),
         }
     }
 
@@ -1195,7 +1211,7 @@ mod tests {
     fn account(dir: &std::path::Path, server: &str) -> Arc<Account> {
         let store = Arc::new(Store::memory().unwrap());
         store.set(KV_SERVER, &ServerConfig { url: server.into(), pinned_keys: [("p1".to_string(), b64(platform_key().verifying_key().as_bytes()))].into() }).unwrap();
-        let paths = Paths { home: dir.to_path_buf(), ttyd: None, mux: None, fonts: None, trzsz: None };
+        let paths = Paths { home: dir.to_path_buf(), ttyd: None, mux: None, termd: None, fonts: None, trzsz: None };
         let a = Account::new(store, paths, "https://looklook.test", "").unwrap();
         a.clock.set(NOW);
         a.set_for_test(
@@ -1323,7 +1339,7 @@ mod tests {
             let target = target.clone();
             async move {
                 let path = uri.path().to_string();
-                let dev = |id: &str, t: &[&str]| RemoteDevice { id: id.into(), name: id.into(), os: "linux".into(), online: true, last_seen_ms: 0, terminals: t.iter().map(|s| s.to_string()).collect(), keys: Vec::new() };
+                let dev = |id: &str, t: &[&str]| RemoteDevice { id: id.into(), name: id.into(), os: "linux".into(), online: true, last_seen_ms: 0, terminals: t.iter().map(|s| s.to_string()).collect(), keys: Vec::new(), direct: None, reach: None };
                 let (status, out) = if path.ends_with("/rtc/devices") {
                     let d = RemoteDevices { items: vec![dev("dev1", &[]), dev("devb", &["tb1"])], default: Some("dev1".into()), max: 7, ice_servers: vec![] };
                     (StatusCode::OK, serde_json::to_vec(&d).unwrap())
@@ -1427,7 +1443,7 @@ mod tests {
     async fn report_terminals_skipped_when_logged_out() {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(Store::memory().unwrap());
-        let paths = Paths { home: dir.path().to_path_buf(), ttyd: None, mux: None, fonts: None, trzsz: None };
+        let paths = Paths { home: dir.path().to_path_buf(), ttyd: None, mux: None, termd: None, fonts: None, trzsz: None };
         let a = Account::new(store, paths, "http://127.0.0.1:9", "").unwrap();
         a.report_terminals().await.unwrap();
     }

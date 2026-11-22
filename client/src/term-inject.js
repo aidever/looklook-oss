@@ -169,9 +169,18 @@
     var b;
     try { b = window.top !== window && window.top.__llrtc; } catch (e) { b = null; }
     if (!b || typeof b.subscribe !== 'function') return;
+    var paramDev = null;
+    try { paramDev = new URLSearchParams(location.search).get('__lldev'); } catch (e) {}
     var off = b.subscribe(function (st) {
       var was = rtcDown();
-      rtcPhase = st && st.phase || 'online';
+      var myDev = paramDev || (typeof b.deviceOf === 'function' ? b.deviceOf(location.pathname) : null);
+      if (st && st.links && myDev) {
+        var lk = st.links[myDev];
+        var ph = (lk && lk.phase) || 'online';
+        rtcPhase = ph === 'idle' ? 'online' : ph;
+      } else {
+        rtcPhase = st && st.phase || 'online';
+      }
       renderStrip();
       // 远程连回来了：终端自己断着的话，现在该显示自己的提示（或者马上重连）
       if (was && !rtcDown() && lostAt) { kick(); renderBanner(); }
@@ -323,7 +332,10 @@
     if (bridge) { Native.prototype = RtcSocket.prototype; ['CONNECTING', 'OPEN', 'CLOSING', 'CLOSED'].forEach(function (k) { Native[k] = RtcSocket[k]; }); }
     function Wrapped(url, protocols) {
       var ws = protocols === undefined ? new Native(url) : new Native(url, protocols);
-      if (/\/ws(\?|$)/.test(String(url))) {
+      // /ws：ttyd 的协议（xterm.js 前端）；/term：termd 的 looklook-term.v1（手机 DOM 渲染，src-term/dom/）。
+      // 连接状态提示、重连退避两种都要；下面改写收发内容的只对 /ws（/term 的消息是二进制编码，不是 '0' + 文字）。
+      var legacy = /\/ws(\?|$)/.test(String(url));
+      if (legacy || /\/term(\?|$)/.test(String(url))) {
         if (!everOpen) showConnecting();
         ws.addEventListener('open', onOpen);
         ws.addEventListener('close', function (e) {
@@ -331,13 +343,15 @@
           if (!clean) scheduleRetry();
           showLost(clean);
         });
+      }
+      if (legacy) {
         // ttyd 收到 error 就不再自动重连，只显示“Press ⏎ to Reconnect”：断线一律由它照常重连，节奏由上面的退避控制
         var add = ws.addEventListener;
         ws.addEventListener = function (type) {
           if (type === 'error') return;
           return add.apply(ws, arguments);
         };
-        ws.addEventListener('message', function (e) { if (e.data instanceof ArrayBuffer) watchTransfer(e.data); });
+        ws.addEventListener('message', function (e) { if (ws.protocol !== 'tty-zstd' && e.data instanceof ArrayBuffer) watchTransfer(e.data); });
         transferTail = '';
         socket = ws;
         var nativeSend = ws.send;
@@ -374,11 +388,10 @@
   var TAIL = 40, QUIET = 15000;
   var transferTail = '', lastSeen = {};
   var latin1 = null;
-  function watchTransfer(buf) {
-    var bytes = new Uint8Array(buf);
-    if (bytes[0] !== 0x30 || bytes.length < 2) return;
+  function watchOutputBytes(bytes) {
+    if (!bytes || !bytes.length) return;
     try { latin1 = latin1 || new TextDecoder('latin1'); } catch (e) { return; }
-    var text = transferTail + latin1.decode(bytes.subarray(1));
+    var text = transferTail + latin1.decode(bytes);
     var fresh = transferTail.length;
     transferTail = text.slice(-TAIL);
     var now = Date.now();
@@ -392,6 +405,12 @@
       if (!quiet) toParent({ type: 'looklook:transfer', kind: b.kind });
     });
   }
+  function watchTransfer(buf) {
+    var bytes = new Uint8Array(buf);
+    if (bytes[0] !== 0x30 || bytes.length < 2) return;
+    watchOutputBytes(bytes.subarray(1));
+  }
+  window.__llWatchOutput = watchOutputBytes;
 
   function hasFiles(dt) {
     if (!dt) return false;
@@ -477,16 +496,23 @@
     return Boolean(m && (m[1] & 35) === 35);
   }
 
-  // ttyd 发送输入的格式：'0' + UTF-8 文本。只改单个字符（输入法一次上屏多个字时原样发送）。
-  function withMods(data) {
+  // 键盘打出的一个字符套上按键条的修饰键（用过的“一次性”修饰键随即松开）。只改单个字符（输入法一次上屏多个字时原样返回）。
+  function applyMods(text) {
     var box;
     try { box = !fromKeybar && window.frameElement && window.frameElement.looklookMods; } catch (e) { box = null; }
     var m = box && box.get();
-    if (!m || !(m.ctrl || m.alt || m.shift) || !(data instanceof Uint8Array) || data[0] !== 0x30) return data;
-    var text = new TextDecoder().decode(data.subarray(1));
-    if (Array.from(text).length !== 1) return data;
+    if (!m || !(m.ctrl || m.alt || m.shift) || Array.from(text).length !== 1) return text;
     box.set({ ctrl: m.ctrl === 'lock' ? 'lock' : null, alt: m.alt === 'lock' ? 'lock' : null, shift: m.shift === 'lock' ? 'lock' : null });
-    return new TextEncoder().encode('0' + modChar(text, m));
+    return modChar(text, m);
+  }
+  // 手机 DOM 渲染（src-term/dom/view.js）打字时调用
+  window.__llApplyMods = applyMods;
+  // ttyd 发送输入的格式：'0' + UTF-8 文本
+  function withMods(data) {
+    if (!(data instanceof Uint8Array) || data[0] !== 0x30) return data;
+    var text = new TextDecoder().decode(data.subarray(1));
+    var out = applyMods(text);
+    return out === text ? data : new TextEncoder().encode('0' + out);
   }
 
   function send(term, data) {

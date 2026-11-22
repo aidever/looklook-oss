@@ -204,6 +204,44 @@ pub struct ConnectResponse {
 pub const CLIENT_DEVICES_PATH: &str = "/rtc/devices";
 pub const CLIENT_CONNECT_PATH: &str = "/rtc/connect";
 
+/// 端口可达检测（docs/08 §3）：客户端请主服务往“公网 IPv4:端口”发几个 UDP 包，看能不能从外面打进来。
+/// 设备签名，收 [`ReachRequest`]，立即回 `202`（不等发完）。
+pub const CLIENT_REACH_PATH: &str = "/rtc/reach";
+/// 每个包的开头，后面跟 16 字节 nonce，共 [`REACH_PACKET_LEN`] 字节。
+pub const REACH_MAGIC: &[u8; 8] = b"LLREACH\0";
+pub const REACH_PACKET_LEN: usize = 24;
+/// 每次最多几个目标。
+pub const REACH_MAX_TARGETS: usize = 2;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReachTarget {
+    pub ip: String,
+    pub port: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReachRequest {
+    /// 16 字节，小写 hex
+    pub nonce: String,
+    pub targets: Vec<ReachTarget>,
+}
+
+/// 发出去的包：`LLREACH\0` + nonce。
+pub fn reach_packet(nonce: &[u8; 16]) -> [u8; REACH_PACKET_LEN] {
+    let mut p = [0u8; REACH_PACKET_LEN];
+    p[..8].copy_from_slice(REACH_MAGIC);
+    p[8..].copy_from_slice(nonce);
+    p
+}
+
+/// 解出 hex nonce；不是 32 位 hex 为 None。
+pub fn reach_nonce(hex_str: &str) -> Option<[u8; 16]> {
+    if hex_str.len() != 32 {
+        return None;
+    }
+    hex::decode(hex_str).ok()?.try_into().ok()
+}
+
 /// 主服务 → 发起的客户端：`host`、`origin` 是授权票据里的用户站地址，经通道发的请求以它们为 Host 与 Origin。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClientConnectResponse {
@@ -276,6 +314,19 @@ pub fn grant_hash(token: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reach_wire() {
+        let n = reach_nonce("00112233445566778899aabbccddeeff").unwrap();
+        let p = reach_packet(&n);
+        assert_eq!(&p[..8], b"LLREACH\0");
+        assert_eq!(p[8], 0x00);
+        assert_eq!(p[23], 0xff);
+        assert!(reach_nonce("0011").is_none());
+        assert!(reach_nonce("zz112233445566778899aabbccddeeff").is_none());
+        let r = ReachRequest { nonce: "ab".repeat(16), targets: vec![ReachTarget { ip: "34.168.24.68".into(), port: 50000 }] };
+        assert_eq!(serde_json::to_value(&r).unwrap(), serde_json::json!({ "nonce": "ab".repeat(16), "targets": [{ "ip": "34.168.24.68", "port": 50000 }] }));
+    }
 
     const FP: &str = "AB:CD:EF:01:23:45:67:89:AB:CD:EF:01:23:45:67:89:AB:CD:EF:01:23:45:67:89:AB:CD:EF:01:23:45:67:89";
 

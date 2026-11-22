@@ -399,17 +399,22 @@ uint32_t ice_compute_priority(ice_candidate_type_t type, int family, int compone
 	}
 	p <<= 16;
 
-	switch (family) {
-	case AF_INET:
-		p += 32767;
-		break;
-	case AF_INET6:
-		p += 65535;
-		break;
-	default:
-		break;
+	if (type == ICE_CANDIDATE_TYPE_HOST) {
+		// looklook: preserve host candidate order from udp_get_addrs (private IPv4 before IPv6)
+		p += 65535 - CLAMP(index, 0, 65535);
+	} else {
+		switch (family) {
+		case AF_INET:
+			p += 32767;
+			break;
+		case AF_INET6:
+			p += 65535;
+			break;
+		default:
+			break;
+		}
+		p -= CLAMP(index, 0, 32767);
 	}
-	p -= CLAMP(index, 0, 32767);
 	p <<= 8;
 
 	p += 256 - CLAMP(component, 1, 256);

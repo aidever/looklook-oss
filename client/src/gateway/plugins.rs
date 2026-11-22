@@ -72,11 +72,12 @@ async fn api_proxy(State(app): State<App>, Path((name, _)): Path<(String, String
     forward(&app, &name, req, false).await
 }
 
-async fn page_proxy(State(app): State<App>, Path(name): Path<String>, req: Request) -> Response {
-    forward(&app, &name, req, true).await
+/// `/p/{name}/` 只有一个路径参数，`/p/{name}/{*rest}` 有两个，按名字取 `name`（`Path<String>` 遇到两个参数会直接 500）
+async fn page_proxy(State(app): State<App>, Path(params): Path<std::collections::HashMap<String, String>>, req: Request) -> Response {
+    let name = params.get("name").map(String::as_str).unwrap_or_default();
+    forward(&app, name, req, true).await
 }
 
-/// `/p/{name}/{*rest}` 也走这里：路径参数可能有一个或两个
 async fn forward(app: &App, name: &str, req: Request, page: bool) -> Response {
     if !proto::valid_name(name) {
         return LocalError::not_found().into_response();
@@ -285,5 +286,20 @@ mod tests {
         let req = Request::builder().uri("/api/plugins/demo/x").body(Body::empty()).unwrap();
         let resp = unix::forward(req, &d.path().join("none.sock"), "t", true, false).await;
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    /// `/p/{名}/` 和 `/p/{名}/{*rest}` 都要进到插件转发（以前子路径的 JS、CSS 全 500，插件页白屏）
+    #[tokio::test]
+    async fn page_routes_take_name_with_or_without_rest() {
+        use tower::ServiceExt;
+        let d = tempfile::tempdir().unwrap();
+        let app = crate::ssh_transfer::e2e::app(d.path(), "http://127.0.0.1:1", "dev", ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]));
+        for path in ["/p/demo/", "/p/demo/assets/index.js", "/p/demo/view/a/b.css"] {
+            let mut req = Request::builder().uri(path).body(Body::empty()).unwrap();
+            req.extensions_mut().insert(Access::Local);
+            let resp = super::super::router(app.clone()).oneshot(req).await.unwrap();
+            // 没装这个插件：走到转发里，给出插件提示页，而不是路径参数解析失败的 500
+            assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE, "{path}");
+        }
     }
 }

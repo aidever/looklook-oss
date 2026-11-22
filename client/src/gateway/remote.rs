@@ -126,7 +126,7 @@ mod tests {
 
     fn account(dir: &std::path::Path, revoked: &[&str]) -> Arc<Account> {
         let store = Arc::new(crate::store::Store::memory().unwrap());
-        let paths = crate::paths::Paths { home: dir.to_path_buf(), ttyd: None, mux: None, fonts: None, trzsz: None };
+        let paths = crate::paths::Paths { home: dir.to_path_buf(), ttyd: None, mux: None, termd: None, fonts: None, trzsz: None };
         let keys = format!("p1={}", b64(platform_key().verifying_key().as_bytes()));
         let a = Account::new(store, paths, "https://looklook.test", &keys).unwrap();
         a.clock.set(NOW);

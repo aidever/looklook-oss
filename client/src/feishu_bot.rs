@@ -1639,6 +1639,7 @@ mod tests {
         let ui = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let ui_addr = ui.local_addr().unwrap();
         let app: App = Arc::new(crate::gateway::Inner {
+            direct: crate::direct_tls::Direct::new(store.clone(), ui_addr.port()),
             account: account.clone(),
             instances: instances.clone(),
             updater: crate::updater::Updater::new(store.clone(), paths.clone(), account.clone(), shutdown.clone()),

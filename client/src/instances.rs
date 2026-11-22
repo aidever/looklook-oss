@@ -24,7 +24,9 @@ use crate::error::LocalError;
 use crate::paths::Paths;
 use crate::settings::Settings;
 use crate::store::{InstanceRow, Store};
+use crate::termd_client::TermdClient;
 use crate::util::{now_rfc3339, random_id, random_secret};
+use term_proto::{CaptureMode, CreateSessionReq, SessionInfo};
 
 pub const PORT_RANGE: (u16, u16) = (41000, 41999);
 #[cfg(windows)]
@@ -55,11 +57,15 @@ fn has_chat(launch: &str) -> bool {
 #[derive(Debug, Clone)]
 pub enum Backend {
     Tmux(PathBuf),
+    Termd,
     Direct,
 }
 
 impl Backend {
     pub fn detect(paths: &Paths) -> Self {
+        if std::env::var_os("LOOKLOOK_TERMD_ONLY").is_some() && paths.termd.is_some() {
+            return Backend::Termd;
+        }
         if std::env::var_os("LOOKLOOK_NO_TMUX").is_some() {
             return Backend::Direct;
         }
@@ -76,9 +82,16 @@ impl Backend {
     pub fn name(&self) -> &'static str {
         match self {
             Backend::Tmux(_) => "tmux",
+            Backend::Termd => "termd",
             Backend::Direct => "direct",
         }
     }
+}
+
+/// 网关转发 `/i/{id}/...` 的目标端点（现有 ttyd+tmux / Direct 或自研 `looklook-termd`）。
+pub enum InstanceEndpoint {
+    Ttyd { port: u16, auth: String },
+    Termd { session_id: String },
 }
 
 /// 随包程序能不能跑起来（架构不符、缺文件、被安全软件拦截都会失败）：不能就退回直接运行，而不是让每个终端都启动失败。
@@ -121,6 +134,7 @@ pub struct Instances {
     store: Arc<Store>,
     paths: Paths,
     pub backend: Backend,
+    pub termd: Arc<TermdClient>,
     shell: String,
     procs: Mutex<HashMap<String, Proc>>,
     health: Mutex<HashMap<String, Health>>,
@@ -210,6 +224,8 @@ pub struct View {
     pub row: InstanceRow,
     /// ttyd 正在运行，可以打开
     pub running: bool,
+    /// 跑在 looklook-termd 上（`looklook attach`、用本机终端打开要它；别的电脑上的会话据此决定给不给这个选项）
+    pub termd: bool,
     /// tmux 会话（里面的任务）还在；直接运行模式为 null
     pub task_alive: Option<bool>,
     pub started_at: Option<String>,
@@ -266,6 +282,9 @@ pub struct Opts {
     /// 新建的都是；之前建的（TUI + hooks）保持原样，在编辑里重新打开对话界面后才换
     #[serde(default)]
     pub sdk: bool,
+    /// 该会话是否运行在 `looklook-termd` 上（§4.7 过渡期：开启开关后新建为 true，原有 tmux 会话保持 false）。
+    #[serde(default)]
+    pub termd: bool,
 }
 
 /// 第一句话最长多少个字符（太长的请在会话里粘贴）
@@ -349,8 +368,9 @@ impl Instances {
             let _ = std::fs::create_dir_all(paths.home.join("mux"));
         }
         let backend = Backend::detect(&paths);
-        tracing::info!(backend = backend.name(), ttyd = ?paths.ttyd, mux = ?paths.mux, "终端后端");
-        if matches!(backend, Backend::Tmux(_)) {
+        let termd = Arc::new(TermdClient::new(paths.clone()));
+        tracing::info!(backend = backend.name(), ttyd = ?paths.ttyd, mux = ?paths.mux, termd = ?paths.termd, "终端后端");
+        if matches!(backend, Backend::Tmux(_) | Backend::Termd) || Settings::load(&store).termd {
             enable_codex_chat_once(&store);
         }
         crate::claude_profiles::migrate(&store, &paths.home);
@@ -359,6 +379,7 @@ impl Instances {
             store,
             paths,
             backend,
+            termd,
             shell: crate::shells::login_shell(),
             procs: Mutex::new(HashMap::new()),
             health: Mutex::new(HashMap::new()),
@@ -371,6 +392,41 @@ impl Instances {
             opened: Mutex::new(HashMap::new()),
             inputs: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// 新建会话时是否默认使用 `looklook-termd`。
+    pub fn new_uses_termd(&self) -> bool {
+        matches!(self.backend, Backend::Termd) || (self.termd.available() && Settings::load(&self.store).termd)
+    }
+
+    /// 某个既有实例是否使用 `looklook-termd`（未标记 `opts.termd` 的旧实例继续留在 tmux/Direct 上）。
+    pub fn uses_termd(&self, id: &str) -> bool {
+        matches!(self.backend, Backend::Termd) || self.opts(id).termd
+    }
+
+    /// 当前客户端新建会话是否具备持久会话保持能力（tmux 或已开启 termd）。
+    pub fn is_persistent(&self) -> bool {
+        matches!(self.backend, Backend::Tmux(_) | Backend::Termd) || self.new_uses_termd()
+    }
+
+    fn is_persistent_for(&self, id: &str) -> bool {
+        self.uses_termd(id) || matches!(self.backend, Backend::Tmux(_))
+    }
+
+    pub fn instance_name(&self, id: &str) -> Option<String> {
+        self.store.instance(id).ok().flatten().map(|r| r.name)
+    }
+
+    /// 网关转发 `/i/{id}/…` 的目标（ttyd 或 termd）；实例已停止则返回 None（显示“未启动”）。
+    pub async fn endpoint(&self, id: &str) -> Option<InstanceEndpoint> {
+        if self.uses_termd(id) {
+            let row = self.store.instance(id).ok().flatten()?;
+            if !row.want_running {
+                return None;
+            }
+            return Some(InstanceEndpoint::Termd { session_id: row.id });
+        }
+        self.upstream(id).map(|(port, auth)| InstanceEndpoint::Ttyd { port, auth })
     }
 
     /// 订阅“终端列表变了”（新建、删除）。
@@ -404,7 +460,8 @@ impl Instances {
         let errands = crate::assistant::errands(&self.store);
         rows.retain(|r| !brains.values().any(|b| *b == r.id) && !errands.contains_key(&r.id));
         let sessions = self.tmux_sessions().await;
-        let mut views: Vec<View> = rows.into_iter().map(|r| self.view(r, sessions.as_ref())).collect();
+        let termd = self.termd_sessions_map().await;
+        let mut views: Vec<View> = rows.into_iter().map(|r| self.view_with(r, sessions.as_ref(), &termd)).collect();
         let stale = lock(&self.titles).at.is_none_or(|at| at.elapsed() >= TITLE_TTL);
         if stale {
             let probed = self.probe_all(&views).await;
@@ -420,7 +477,22 @@ impl Instances {
     pub async fn get(&self, id: &str) -> Result<View, LocalError> {
         let row = self.store.instance(id)?.ok_or_else(LocalError::not_found)?;
         let sessions = self.tmux_sessions().await;
-        Ok(self.view(row, sessions.as_ref()))
+        let termd = if self.uses_termd(id) {
+            self.termd_sessions_map().await
+        } else {
+            HashMap::new()
+        };
+        Ok(self.view_with(row, sessions.as_ref(), &termd))
+    }
+
+    async fn termd_sessions_map(&self) -> HashMap<String, SessionInfo> {
+        self.termd
+            .list_sessions_if_running()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|s| (s.id.clone(), s))
+            .collect()
     }
 
     /// 这个会话是不是本机的（`127.0.0.1` 直接处理，不往其他电脑转发）。
@@ -434,11 +506,33 @@ impl Instances {
     }
 
     fn view(&self, row: InstanceRow, sessions: Option<&HashMap<String, (i64, i64)>>) -> View {
-        let running = lock(&self.procs).contains_key(&row.id);
-        let sess = sessions.and_then(|m| m.get(&Self::session_name(&row.id)));
+        self.view_with(row, sessions, &HashMap::new())
+    }
+
+    fn view_with(&self, row: InstanceRow, sessions: Option<&HashMap<String, (i64, i64)>>, termd: &HashMap<String, SessionInfo>) -> View {
         let ts = |s: i64| crate::util::fmt_ms(s * 1000);
         let opts = self.opts(&row.id);
+        let use_termd = matches!(self.backend, Backend::Termd) || opts.termd;
+        let (running, task_alive, started_at, last_activity_at) = if use_termd {
+            let s = termd.get(&row.id);
+            (
+                row.want_running && s.is_some(),
+                Some(s.is_some_and(|x| x.alive)),
+                s.map(|x| crate::util::fmt_ms(x.created_at_ms)),
+                s.map(|x| crate::util::fmt_ms(x.last_output_at_ms)),
+            )
+        } else {
+            let running = lock(&self.procs).contains_key(&row.id);
+            let sess = sessions.and_then(|m| m.get(&Self::session_name(&row.id)));
+            (
+                running,
+                sessions.map(|_| sess.is_some()),
+                sess.map(|(c, _)| ts(*c)),
+                sess.map(|(_, a)| ts(*a)),
+            )
+        };
         let mut v = View {
+            termd: use_termd,
             full_access: opts.full_access,
             root_confirmed: opts.root_confirmed,
             web_port: opts.web_port,
@@ -453,9 +547,9 @@ impl Instances {
             codex_profile: crate::codex_profiles::pinned(&self.store, &row.id),
             container: self.container(&row.id),
             running,
-            task_alive: sessions.map(|_| sess.is_some()),
-            started_at: sess.map(|(c, _)| ts(*c)),
-            last_activity_at: sess.map(|(_, a)| ts(*a)),
+            task_alive,
+            started_at,
+            last_activity_at,
             input_at: self.input_at(&row.id).map(crate::util::fmt_ms),
             error: lock(&self.health).get(&row.id).and_then(|h| h.error.clone()),
             url: format!("/i/{}/", row.id),
@@ -611,21 +705,37 @@ impl Instances {
         dirs
     }
 
-    /// 每个 tmux 会话当前面板：进程号、前台程序、agent 用 OSC 设置的标题（没设置过的、shell 的提示符标题为 None）
+    /// 每个 tmux / termd 会话当前面板：进程号、前台程序、agent 用 OSC 设置的标题（没设置过的、shell 的提示符标题为 None）
     async fn panes(&self) -> HashMap<String, PaneInfo> {
-        let Backend::Tmux(_) = self.backend else { return HashMap::new() };
-        let fmt = "#{session_name}\t#{window_active}#{pane_active}\t#{pane_pid}\t#{pane_current_command}\t#{host}\t#{pane_title}";
-        let Ok(out) = self.tmux(&["list-panes", "-a", "-F", fmt]).await else { return HashMap::new() };
         let mut m = HashMap::new();
-        for l in String::from_utf8_lossy(&out.stdout).lines() {
-            let mut it = l.splitn(6, '\t');
-            let (Some(name), Some(active), Some(pid), Some(cmd), Some(host), Some(title)) = (it.next(), it.next(), it.next(), it.next(), it.next(), it.next()) else { continue };
-            let Ok(pid) = pid.trim().parse::<u32>() else { continue };
-            // 多个窗口、面板时取当前的那个
-            if active != "11" && m.contains_key(name) {
-                continue;
+        if let Backend::Tmux(_) = self.backend {
+            let fmt = "#{session_name}\t#{window_active}#{pane_active}\t#{pane_pid}\t#{pane_current_command}\t#{host}\t#{pane_title}";
+            if let Ok(out) = self.tmux(&["list-panes", "-a", "-F", fmt]).await {
+                for l in String::from_utf8_lossy(&out.stdout).lines() {
+                    let mut it = l.splitn(6, '\t');
+                    let (Some(name), Some(active), Some(pid), Some(cmd), Some(host), Some(title)) = (it.next(), it.next(), it.next(), it.next(), it.next(), it.next()) else { continue };
+                    let Ok(pid) = pid.trim().parse::<u32>() else { continue };
+                    // 多个窗口、面板时取当前的那个
+                    if active != "11" && m.contains_key(name) {
+                        continue;
+                    }
+                    m.insert(name.to_string(), PaneInfo { pid, command: cmd.trim().to_string(), title: clean_pane_title(title, host) });
+                }
             }
-            m.insert(name.to_string(), PaneInfo { pid, command: cmd.trim().to_string(), title: clean_pane_title(title, host) });
+        }
+        if let Some(sessions) = self.termd.list_sessions_if_running().await {
+            let host = crate::util::host_name();
+            for s in sessions.into_iter().filter(|s| s.alive && s.child_pid > 0) {
+                let title = s.title.as_deref().and_then(|t| clean_pane_title(t, &host));
+                m.insert(
+                    Self::session_name(&s.id),
+                    PaneInfo {
+                        pid: s.child_pid,
+                        command: s.fg_process.unwrap_or_default(),
+                        title,
+                    },
+                );
+            }
         }
         m
     }
@@ -778,7 +888,8 @@ impl Instances {
             row.name = default_name(&row.launch, container.as_ref().map_or(&row.workdir, |c| &c.dir), &taken);
         }
         self.validate(&mut row)?;
-        let dsh_web = row.launch == "dsh" && !input.chat_ui.unwrap_or(matches!(self.backend, Backend::Tmux(_)));
+        let persistent_new = self.is_persistent();
+        let dsh_web = row.launch == "dsh" && !input.chat_ui.unwrap_or(persistent_new);
         if dsh_web && self.dsh()?.is_some() {
             return Err(LocalError::new("DSH_EXISTS"));
         }
@@ -798,10 +909,11 @@ impl Instances {
             full_access: input.full_access.unwrap_or(false),
             root_confirmed: input.root_confirmed.unwrap_or(false),
             web_port: input.web_port,
-            // 新建的 Claude Code 终端默认带对话界面（需要会话保持）
-            chat_ui: input.chat_ui.unwrap_or(matches!(self.backend, Backend::Tmux(_))),
+            // 新建的终端默认带对话界面（需要会话保持：tmux 或 termd）
+            chat_ui: input.chat_ui.unwrap_or(persistent_new),
             name_custom,
             sdk: row.launch == "claude",
+            termd: self.new_uses_termd(),
         };
         if container.is_some() {
             // 容器里的 root 不是这台电脑的 root，不用确认；没有对话界面
@@ -830,7 +942,7 @@ impl Instances {
                 return Err(LocalError::invalid("resume", "invalid"));
             }
             // 直接运行模式下命令在每次打开终端时运行，没法只接着一次
-            if !matches!(self.backend, Backend::Tmux(_)) {
+            if !persistent_new {
                 return Err(LocalError::new("RESUME_NEEDS_PERSISTENT"));
             }
         }
@@ -852,8 +964,8 @@ impl Instances {
             }
             lock(&self.first_resume).insert(row.id.clone(), r);
         }
-        // 只有会话保持（tmux）时才在建会话时用上；直接运行模式下忽略
-        if let (Some(p), Backend::Tmux(_)) = (prompt, &self.backend) {
+        // 只有会话保持（tmux / termd）时才在建会话时用上；直接运行模式下忽略
+        if let (Some(p), true) = (prompt, persistent_new) {
             lock(&self.first_prompt).insert(row.id.clone(), p);
         }
         self.bump();
@@ -1037,6 +1149,13 @@ impl Instances {
             let code = if e.kind() == std::io::ErrorKind::PermissionDenied { "WORKDIR_DENIED" } else { "WORKDIR_NOT_FOUND" };
             return Err(LocalError::new(code).with("path", &row.workdir));
         }
+        if self.uses_termd(id) {
+            if create_session || row.auto_start {
+                self.ensure_termd_session(&row, create_session).await?;
+            }
+            self.store.set_want_running(id, true)?;
+            return Ok(());
+        }
         {
             // 会话在这里先建好；Windows 上 ttyd 只负责接入，会话不在时由 ensure_attachable 在打开终端时补建。
             if matches!(self.backend, Backend::Tmux(_)) && create_session {
@@ -1050,16 +1169,20 @@ impl Instances {
         Ok(())
     }
 
-    /// 停止：结束 ttyd，并结束 tmux 会话（其中的任务会被关闭，界面上需要二次确认）。
+    /// 停止：结束 ttyd，并结束 tmux / termd 会话（其中的任务会被关闭，界面上需要二次确认）。
     /// 会话里启动的所有程序（包括忽略 SIGHUP 的、放到后台的）一并结束，见 proctree.rs。
     pub async fn stop(&self, id: &str) -> Result<(), LocalError> {
         let _g = self.op.lock().await;
         self.store.set_want_running(id, false)?;
         let doomed = self.task_processes(id).await;
         crate::proctree::signal(&doomed);
-        self.kill_ttyd(id).await;
-        if let Backend::Tmux(_) = self.backend {
-            let _ = self.tmux(&["kill-session", "-t", &exact(&Self::session_name(id))]).await;
+        if self.uses_termd(id) {
+            let _ = self.termd.stop_session(id).await;
+        } else {
+            self.kill_ttyd(id).await;
+            if let Backend::Tmux(_) = self.backend {
+                let _ = self.tmux(&["kill-session", "-t", &exact(&Self::session_name(id))]).await;
+            }
         }
         let _ = std::fs::remove_file(self.paths.instance_pid(id));
         let _ = self.stopped.send(id.to_string());
@@ -1072,9 +1195,16 @@ impl Instances {
         Ok(())
     }
 
-    /// 终端里运行着的程序：tmux 模式是会话里各面板的进程及其子孙（Linux 上加上带着会话标记、已脱离父子关系的），
+    /// 终端里运行着的程序：tmux / termd 模式是会话里各面板的进程及其子孙（Linux 上加上带着会话标记、已脱离父子关系的），
     /// 直接运行时是 ttyd 的子孙（不含 ttyd 本身，它由 kill_ttyd 结束）。
     async fn task_processes(&self, id: &str) -> crate::proctree::Doomed {
+        if self.uses_termd(id) {
+            let pids = self.termd.pane_pids(id).await;
+            if pids.is_empty() {
+                return Default::default();
+            }
+            return crate::proctree::collect(&pids, None);
+        }
         match self.backend {
             Backend::Tmux(_) => {
                 let target = format!("{}:", exact(&Self::session_name(id)));
@@ -1092,7 +1222,7 @@ impl Instances {
                 };
                 crate::proctree::collect(&pids, marker)
             }
-            Backend::Direct => {
+            Backend::Direct | Backend::Termd => {
                 let Some(ttyd) = lock(&self.procs).get(id).and_then(|p| p.child.id()) else { return Default::default() };
                 let mut d = crate::proctree::collect(&[ttyd], None);
                 // Windows 上没有进程表，靠 `taskkill /T` 从 ttyd 往下结束整棵树
@@ -1104,8 +1234,11 @@ impl Instances {
         }
     }
 
-    /// 会话里各面板的进程号（运行按钮看命令跑完没有）。不是 tmux、会话不在时为空
+    /// 会话里各面板的进程号（运行按钮看命令跑完没有）。不是持久后端、会话不在时为空
     pub async fn pane_pids(&self, id: &str) -> Vec<u32> {
+        if self.uses_termd(id) {
+            return self.termd.pane_pids(id).await;
+        }
         let Backend::Tmux(_) = self.backend else { return vec![] };
         let target = format!("{}:", exact(&Self::session_name(id)));
         match self.tmux(&["list-panes", "-s", "-t", &target, "-F", "#{pane_pid}"]).await {
@@ -1114,8 +1247,8 @@ impl Instances {
         }
     }
 
-    /// 资源看板（metrics.rs）：每个终端的进程树从哪几个进程开始（ttyd、tmux 面板），以及 tmux 服务进程。
-    /// 只问一次 tmux（`list-panes -a`），不逐个终端去问。
+    /// 资源看板（metrics.rs）：每个终端的进程树从哪几个进程开始（ttyd、tmux 面板、termd 子进程），以及 tmux / termd 服务进程。
+    /// 只问一次 tmux / termd，不逐个终端去问。
     pub async fn process_roots(&self) -> crate::metrics::Roots {
         let rows = self.store.instances().unwrap_or_default();
         let mut panes: HashMap<String, Vec<u32>> = HashMap::new();
@@ -1132,16 +1265,29 @@ impl Instances {
                 }
             }
         }
+        let termd_pid = self.termd.daemon_pid().await;
+        let termd_sessions = if termd_pid.is_some() {
+            self.termd_sessions_map().await
+        } else {
+            HashMap::new()
+        };
         let procs = lock(&self.procs);
         let sessions = rows
             .into_iter()
             .map(|r| {
-                let mut roots = panes.remove(&Self::session_name(&r.id)).unwrap_or_default();
-                roots.extend(procs.get(&r.id).and_then(|p| p.child.id()));
+                let mut roots = if matches!(self.backend, Backend::Termd) || self.opts(&r.id).termd {
+                    termd_sessions.get(&r.id).filter(|s| s.child_pid > 0).map(|s| vec![s.child_pid]).unwrap_or_default()
+                } else {
+                    let mut v = panes.remove(&Self::session_name(&r.id)).unwrap_or_default();
+                    v.extend(procs.get(&r.id).and_then(|p| p.child.id()));
+                    v
+                };
+                roots.sort_unstable();
+                roots.dedup();
                 crate::metrics::SessionRoots { id: r.id, name: r.name, launch: r.launch, roots }
             })
             .collect();
-        crate::metrics::Roots { mux, sessions, ..Default::default() }
+        crate::metrics::Roots { mux, termd: termd_pid, sessions, ..Default::default() }
     }
 
     /// 会话停掉的通知（见 `stopped` 字段）
@@ -1255,7 +1401,7 @@ impl Instances {
                 v
             }
             // 直接运行没有会话可以“打”命令进去：认不出的 shell 改用自动选择的 shell 运行命令。
-            Backend::Direct => match typed {
+            Backend::Direct | Backend::Termd => match typed {
                 Some(cmd) => {
                     let auto = crate::shells::resolve("", "")?;
                     auto.run(&self.model_wrap(row, &cmd, auto.family)).unwrap_or_else(|| auto.interactive())
@@ -1397,18 +1543,18 @@ impl Instances {
 
     /// 对话模式的 Codex：对话由看看通过 `codex app-server` 驱动，终端里是同一个工作目录下的普通 shell。
     pub fn codex_app_mode(&self, row: &InstanceRow) -> bool {
-        row.launch == "codex" && self.opts(&row.id).chat_ui && matches!(self.backend, Backend::Tmux(_)) && self.container(&row.id).is_none()
+        row.launch == "codex" && self.opts(&row.id).chat_ui && self.is_persistent_for(&row.id) && self.container(&row.id).is_none()
     }
 
     /// 对话模式的 Antigravity：对话由看看通过 `agy acp` 驱动（chat/agy_chat.rs），终端里是同一个工作目录下的普通 shell。
     pub fn agy_acp_mode(&self, row: &InstanceRow) -> bool {
-        row.launch == "agy" && self.opts(&row.id).chat_ui && matches!(self.backend, Backend::Tmux(_)) && self.container(&row.id).is_none()
+        row.launch == "agy" && self.opts(&row.id).chat_ui && self.is_persistent_for(&row.id) && self.container(&row.id).is_none()
     }
 
     /// 对话模式的 Claude Code 走 stream-json（docs/CLAUDE_SDK.md）：对话由看看起的 `claude -p` 进程驱动，终端里是 shell。
     pub fn claude_sdk_mode(&self, row: &InstanceRow) -> bool {
         let o = self.opts(&row.id);
-        row.launch == "claude" && o.chat_ui && o.sdk && matches!(self.backend, Backend::Tmux(_)) && self.container(&row.id).is_none()
+        row.launch == "claude" && o.chat_ui && o.sdk && self.is_persistent_for(&row.id) && self.container(&row.id).is_none()
     }
 
     /// `--settings` 里要带的账号 `env`（盖过 CC Switch 等写进用户 settings 的服务商，见 claude_profiles::settings_env）。容器里的不加。
@@ -1422,7 +1568,7 @@ impl Instances {
 
     /// 带对话界面的 Claude Code：hooks 配置文件（`--settings` 用；顺便确保它已经写好）。不是这类终端时为 None。
     fn chat_settings(&self, row: &InstanceRow) -> Option<PathBuf> {
-        if row.launch != "claude" || !self.opts(&row.id).chat_ui || !matches!(self.backend, Backend::Tmux(_)) {
+        if row.launch != "claude" || !self.opts(&row.id).chat_ui || !self.is_persistent_for(&row.id) {
             return None;
         }
         let env = self.flag_env(row);
@@ -1484,8 +1630,19 @@ impl Instances {
         v
     }
 
-    /// 终端当前面板：shell 进程号、当前目录、前台命令（文件传输用）。非 tmux 后端或会话不在时返回 None。
+    /// 终端当前面板：shell 进程号、当前目录、前台命令（文件传输用）。非持久后端或会话不在时返回 None。
     pub async fn pane(&self, id: &str) -> Option<Pane> {
+        if self.uses_termd(id) {
+            let p = self.termd.get_pane(id).await?;
+            if !p.alive {
+                return None;
+            }
+            return Some(Pane {
+                pid: p.pid,
+                cwd: p.cwd.unwrap_or_default(),
+                command: p.fg_process.unwrap_or_default(),
+            });
+        }
         let Backend::Tmux(_) = self.backend else { return None };
         let target = format!("{}:", exact(&Self::session_name(id)));
         let out = self.tmux(&["display-message", "-p", "-t", &target, "#{pane_pid}\t#{pane_current_path}\t#{pane_current_command}"]).await.ok()?;
@@ -1535,6 +1692,17 @@ impl Instances {
     /// Windows：浏览器每次连上终端之前确保会话存在，不在就按完整参数新建（ttyd 只负责接入，见 `command_for`）。
     /// 与 tmux 的 `new-session -A` 一样，程序退出后重新打开终端会再运行一次启动命令。
     pub async fn ensure_attachable(&self, id: &str) {
+        if self.uses_termd(id) {
+            let _g = self.op.lock().await;
+            let Ok(Some(row)) = self.store.instance(id) else { return };
+            if !row.want_running {
+                return;
+            }
+            if let Err(e) = self.ensure_termd_session(&row, true).await {
+                tracing::warn!(id, error = ?e, "无法确保 termd 终端会话");
+            }
+            return;
+        }
         if !cfg!(windows) || !matches!(self.backend, Backend::Tmux(_)) {
             return;
         }
@@ -1543,6 +1711,64 @@ impl Instances {
         if let Err(e) = self.ensure_session(&row).await {
             tracing::warn!(id, error = ?e, "无法创建终端会话");
         }
+    }
+
+    async fn ensure_termd_session(&self, row: &InstanceRow, restart_if_exited: bool) -> Result<(), LocalError> {
+        if let Some(p) = self.termd.get_pane(&row.id).await {
+            if p.alive || !restart_if_exited {
+                return Ok(());
+            }
+            let _ = self.termd.stop_session(&row.id).await;
+        } else if row.want_running {
+            tracing::warn!(id = %row.id, launch = %row.launch, "终端的 termd 会话不在了，新建一个");
+        }
+        let prompt = lock(&self.first_prompt).remove(&row.id);
+        let resume = lock(&self.first_resume).remove(&row.id).or_else(|| {
+            let conv = self.store.get::<String>(&idle_resume_key(&row.id)).ok().flatten()?;
+            let _ = self.store.remove(&idle_resume_key(&row.id));
+            Some(Resume { id: conv, fork: false })
+        });
+        let (program, typed) = self.program_with(row, prompt.as_deref(), resume.as_ref())?;
+        let Some((cmd, args)) = program.split_first() else {
+            return Err(LocalError::new("START_FAILED").with("detail", "empty program"));
+        };
+        let (env, env_remove) = self.termd_session_env(row);
+        self.termd
+            .create_session(CreateSessionReq {
+                id: row.id.clone(),
+                cmd: cmd.clone(),
+                args: args.to_vec(),
+                cwd: row.workdir.clone(),
+                env,
+                env_remove,
+                cols: 120,
+                rows: 36,
+            })
+            .await?;
+        if let Some(cmd) = typed {
+            let cmd = self.model_wrap(row, &cmd, crate::shells::Family::Other);
+            tokio::time::sleep(Duration::from_millis(800)).await;
+            let _ = self.termd.send_literal(&row.id, &cmd).await;
+            let _ = self.termd.send_keys(&row.id, &["Enter"]).await;
+        }
+        Ok(())
+    }
+
+    fn termd_session_env(&self, row: &InstanceRow) -> (Vec<(String, String)>, Vec<String>) {
+        let mut env = Vec::new();
+        if let Some(p) = self.paths.session_path().and_then(|p| p.into_string().ok()) {
+            env.push(("PATH".into(), p));
+        }
+        if has_chat(&row.launch) && self.opts(&row.id).chat_ui {
+            env.push((crate::chat::hooks::INSTANCE_ENV.into(), row.id.clone()));
+        }
+        if let Some(lang) = utf8_lang_override() {
+            env.push(("LANG".into(), lang.into()));
+        }
+        env.push(("COLORTERM".into(), "truecolor".into()));
+        let mut env_remove = vec!["TMUX".to_string(), "TMUX_PANE".to_string()];
+        env_remove.extend(OUTER_AGENT_ENV.iter().map(|s| (*s).to_string()));
+        (env, env_remove)
     }
 
     pub(crate) async fn ensure_session(&self, row: &InstanceRow) -> Result<(), LocalError> {
@@ -1601,6 +1827,9 @@ impl Instances {
 
     /// `send-keys`：`keys` 是 tmux 的按键名（`Enter`、`Escape`、`C-j`、`2` …）。
     pub async fn send_keys(&self, id: &str, keys: &[&str]) -> Result<(), LocalError> {
+        if self.uses_termd(id) {
+            return self.termd.send_keys(id, keys).await;
+        }
         let target = format!("{}:", exact(&Self::session_name(id)));
         self.leave_mode(&target).await;
         let mut args = vec!["send-keys", "-t", &target];
@@ -1610,6 +1839,9 @@ impl Instances {
 
     /// 按字面送出文字（不解释按键名）。`--` 不能少：以 `-` 开头的文字会被 tmux 当成选项。
     pub async fn send_literal(&self, id: &str, text: &str) -> Result<(), LocalError> {
+        if self.uses_termd(id) {
+            return self.termd.send_literal(id, text).await;
+        }
         let target = format!("{}:", exact(&Self::session_name(id)));
         self.leave_mode(&target).await;
         self.tmux_ok(&["send-keys", "-t", &target, "-l", "--", text]).await
@@ -1617,6 +1849,9 @@ impl Instances {
 
     /// 以 bracketed paste 粘贴（图片路径用这个，TUI 才会把它变成图片附件；超长文字也用这个）。
     pub async fn paste(&self, id: &str, text: &str) -> Result<(), LocalError> {
+        if self.uses_termd(id) {
+            return self.termd.paste(id, text).await;
+        }
         let buffer = format!("ll_chat_{id}");
         let Backend::Tmux(tmux) = &self.backend else { return Err(LocalError::new("NO_TMUX")) };
         let mut cmd = Command::new(tmux);
@@ -1642,6 +1877,9 @@ impl Instances {
 
     /// 当前可见的屏幕（不含回滚缓冲区），带颜色属性（判断灰色的推荐提示）。会话不在时返回 None。
     pub async fn screen(&self, id: &str) -> Option<String> {
+        if self.uses_termd(id) {
+            return self.termd.capture(id, CaptureMode::ScreenAnsi).await;
+        }
         let Backend::Tmux(_) = self.backend else { return None };
         let target = format!("{}:", exact(&Self::session_name(id)));
         let out = self.tmux(&["capture-pane", "-p", "-e", "-t", &target]).await.ok()?;
@@ -1649,11 +1887,46 @@ impl Instances {
     }
 
     /// 手机终端页本地翻看用（src-term/touch.js）：回滚区最后 `lines` 行（不含屏幕，按面板宽度折行、带颜色），
-    /// 以及面板现在是不是在备用屏幕里、程序有没有开鼠标（这两种情况滑动要交给程序，不能本地翻看）。非 tmux 后端或会话不在时返回 None。
+    /// 以及面板现在是不是在备用屏幕里、程序有没有开鼠标（这两种情况滑动要交给程序，不能本地翻看）。非持久后端或会话不在时返回 None。
     ///
     /// `since`：上次取到时的回滚行数（`size`）、宽度没变时只取这之后新进回滚区的行（`full: false`，接在后面）；
     /// 对不上（清过回滚区、改过宽度、到了 history-limit 开始丢最早的行）就整段重取（`full: true`）。
     pub async fn history(&self, id: &str, lines: usize, since: Option<(usize, usize)>) -> Option<serde_json::Value> {
+        if self.uses_termd(id) {
+            let pane = self.termd.get_pane(id).await?;
+            let width = pane.cols as usize;
+            if let Some((prev_seq, _prev_w)) = since.filter(|&(_, w)| w == width) {
+                if let Some((Some(slice), false)) = self
+                    .termd
+                    .history(id, None, Some(prev_seq as u64), Some(lines as u32), None)
+                    .await
+                {
+                    if slice.start_seq == prev_seq as u64 && slice.next_seq.saturating_sub(prev_seq as u64) <= lines as u64 {
+                        let rendered: Vec<String> = slice.rows.iter().map(|r| r.to_ansi_line()).collect();
+                        return Some(serde_json::json!({
+                            "alt": pane.alt_screen,
+                            "mouse": pane.mouse_active,
+                            "width": width,
+                            "size": slice.next_seq,
+                            "full": false,
+                            "lines": rendered,
+                        }));
+                    }
+                }
+            }
+            let (Some(slice), _) = self.termd.history(id, None, None, None, Some(lines as u32)).await? else {
+                return None;
+            };
+            let rendered: Vec<String> = slice.rows.iter().map(|r| r.to_ansi_line()).collect();
+            return Some(serde_json::json!({
+                "alt": pane.alt_screen,
+                "mouse": pane.mouse_active,
+                "width": width,
+                "size": slice.next_seq,
+                "full": true,
+                "lines": rendered,
+            }));
+        }
         let Backend::Tmux(_) = self.backend else { return None };
         let target = format!("{}:", exact(&Self::session_name(id)));
         let fmt = "#{alternate_on} #{mouse_any_flag} #{history_size} #{pane_width} #{history_limit}";
@@ -1707,22 +1980,34 @@ impl Instances {
         }
     }
 
-    /// 终端里最近的输出（tmux 面板与回滚缓冲区最后约 200 行）。非 tmux 后端或会话不在时返回 None。
+    /// 终端里最近的输出（面板与回滚缓冲区最后约 200 行）。非持久后端或会话不在时返回 None。
     pub async fn recent_output(&self, id: &str) -> Option<String> {
-        self.capture(id, "-200").await
+        self.capture_with_limit(id, "-200", Some(200)).await
     }
 
-    /// “选择文字”看法用：最近约 3000 行输出（折行已接回原来的长行）。非 tmux 后端或会话不在时返回 None。
+    /// “选择文字”看法用：最近约 3000 行输出（折行已接回原来的长行）。非持久后端或会话不在时返回 None。
     pub async fn text(&self, id: &str) -> Option<String> {
-        self.capture(id, "-3000").await
+        self.capture_with_limit(id, "-3000", Some(3000)).await
     }
 
     /// 终端的全部输出（含整个回滚缓冲区）。
     pub async fn full_output(&self, id: &str) -> Option<String> {
-        self.capture(id, "-").await
+        self.capture_with_limit(id, "-", None).await
     }
 
-    async fn capture(&self, id: &str, start: &str) -> Option<String> {
+    async fn capture_with_limit(&self, id: &str, start: &str, tail_lines: Option<usize>) -> Option<String> {
+        if self.uses_termd(id) {
+            let text = self.termd.capture(id, CaptureMode::PlainText { include_scrollback: true }).await?;
+            let trimmed = text.trim_end();
+            return Some(match tail_lines {
+                Some(n) => {
+                    let all: Vec<&str> = trimmed.lines().collect();
+                    let skip = all.len().saturating_sub(n);
+                    all[skip..].join("\n")
+                }
+                None => trimmed.to_string(),
+            });
+        }
         let Backend::Tmux(_) = self.backend else { return None };
         let target = format!("{}:", exact(&Self::session_name(id)));
         let out = self.tmux(&["capture-pane", "-p", "-J", "-S", start, "-t", &target]).await.ok()?;
@@ -1733,17 +2018,22 @@ impl Instances {
         Some(text.trim_end().to_string())
     }
 
-    /// 终端 ID → 会话里最后一次有输出的时间（毫秒，各窗口取最晚）。tmux 有输出就更新 `window_activity`，
-    /// 不用界面开着：飞书里发消息、AI 自己在跑都算。没有 tmux、取不到时为空。
+    /// 终端 ID → 会话里最后一次有输出的时间（毫秒，各窗口取最晚）。有输出就更新，
+    /// 不用界面开着：飞书里发消息、AI 自己在跑都算。
     pub async fn output_activity(&self) -> HashMap<String, i64> {
         let mut out = HashMap::new();
-        let Ok(o) = self.tmux(&["list-windows", "-a", "-F", "#{session_name} #{window_activity}"]).await else { return out };
-        for l in String::from_utf8_lossy(&o.stdout).lines() {
-            let mut it = l.split_whitespace();
-            let (Some(name), Some(Ok(at))) = (it.next(), it.next().map(str::parse::<i64>)) else { continue };
-            let Some(id) = name.strip_prefix("ll_") else { continue };
-            let e = out.entry(id.to_string()).or_insert(0);
-            *e = (*e).max(at * 1000);
+        if let Ok(o) = self.tmux(&["list-windows", "-a", "-F", "#{session_name} #{window_activity}"]).await {
+            for l in String::from_utf8_lossy(&o.stdout).lines() {
+                let mut it = l.split_whitespace();
+                let (Some(name), Some(Ok(at))) = (it.next(), it.next().map(str::parse::<i64>)) else { continue };
+                let Some(id) = name.strip_prefix("ll_") else { continue };
+                let e = out.entry(id.to_string()).or_insert(0);
+                *e = (*e).max(at * 1000);
+            }
+        }
+        for (id, at) in self.termd.output_activity().await {
+            let e = out.entry(id).or_insert(0);
+            *e = (*e).max(at);
         }
         out
     }
@@ -1772,13 +2062,20 @@ impl Instances {
     /// 客户端启动：清理上次遗留的 ttyd；决定哪些实例需要恢复。
     pub async fn recover(&self) {
         let _ = write_tmux_conf(&self.paths.tmux_conf());
+        self.termd.upgrade_if_running().await;
         let sessions = self.tmux_sessions().await;
+        let termd = self.termd_sessions_map().await;
         for row in self.store.instances().unwrap_or_default() {
             kill_stale(&self.paths.instance_pid(&row.id));
             if !row.want_running {
                 continue;
             }
-            if let Some(s) = &sessions {
+            if self.uses_termd(&row.id) {
+                if !termd.contains_key(&row.id) && !row.auto_start {
+                    tracing::warn!(id = %row.id, launch = %row.launch, "启动时终端的 termd 会话已经不在，记成已停止");
+                    let _ = self.store.set_want_running(&row.id, false);
+                }
+            } else if let Some(s) = &sessions {
                 // 电脑重启等原因会话已经不在：除非设置了“开机自动启动”，否则不擅自重新运行命令。
                 if !s.contains_key(&Self::session_name(&row.id)) && !row.auto_start {
                     tracing::warn!(id = %row.id, launch = %row.launch, sessions = s.len(), "启动时终端的 tmux 会话已经不在，记成已停止");
@@ -1788,7 +2085,7 @@ impl Instances {
         }
     }
 
-    /// 后台看护：ttyd 意外退出时重启。本机使用不看账户（未登录、会员到期也照常运行），远程打开由网关把关。
+    /// 后台看护：ttyd 意外退出时重启；termd 会话在 auto_start 且缺失时恢复。
     pub async fn supervise(self: Arc<Self>) {
         let mut orphans = HashSet::new();
         let mut server = None;
@@ -1801,7 +2098,23 @@ impl Instances {
             }
             self.reap();
             let rows = self.store.instances().unwrap_or_default();
+            let termd_live: HashSet<String> = self
+                .termd
+                .list_sessions_if_running()
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .map(|s| s.id)
+                .collect();
             for row in rows.into_iter().filter(|r| r.want_running) {
+                if self.uses_termd(&row.id) {
+                    if row.auto_start && !termd_live.contains(&row.id) {
+                        if let Err(e) = self.resume(&row.id, false).await {
+                            tracing::warn!(id = %row.id, error = ?e.code, "恢复 termd 终端失败");
+                        }
+                    }
+                    continue;
+                }
                 let gave_up = lock(&self.health).get(&row.id).is_some_and(|h| h.quick_exits >= 3);
                 if lock(&self.procs).contains_key(&row.id) || gave_up {
                     continue;
@@ -1865,20 +2178,46 @@ impl Instances {
     /// 删掉的终端在删除时已经结束了会话
     async fn sweep_orphans(&self, before: HashSet<String>) -> HashSet<String> {
         let _g = self.op.lock().await;
-        let (Some(sessions), Ok(rows)) = (self.tmux_sessions().await, self.store.instances()) else { return before };
+        let Ok(rows) = self.store.instances() else { return before };
         let stopped: HashSet<String> = rows.iter().filter(|r| !r.want_running).map(|r| Self::session_name(&r.id)).collect();
-        let now: HashSet<String> = sessions.into_keys().filter(|n| stopped.contains(n)).collect();
-        for name in now.intersection(&before) {
-            let id = &name["ll_".len()..];
-            let doomed = self.task_processes(id).await;
-            crate::proctree::signal(&doomed);
-            let ok = self.tmux(&["kill-session", "-t", &exact(name)]).await.is_ok_and(|o| o.status.success());
-            tracing::info!(session = %name, ok, "结束游离的终端会话");
-            if !doomed.is_empty() {
-                crate::proctree::reap(doomed).await;
+        let mut next_pending = HashSet::new();
+
+        if let Some(sessions) = self.tmux_sessions().await {
+            let now: HashSet<String> = sessions.into_keys().filter(|n| stopped.contains(n)).collect();
+            for name in now.intersection(&before) {
+                let id = &name["ll_".len()..];
+                let doomed = self.task_processes(id).await;
+                crate::proctree::signal(&doomed);
+                let ok = self.tmux(&["kill-session", "-t", &exact(name)]).await.is_ok_and(|o| o.status.success());
+                tracing::info!(session = %name, ok, "结束游离的终端会话");
+                if !doomed.is_empty() {
+                    crate::proctree::reap(doomed).await;
+                }
             }
+            next_pending.extend(now.difference(&before).cloned());
         }
-        now.difference(&before).cloned().collect()
+
+        let stopped_ids: HashSet<String> = rows.iter().filter(|r| !r.want_running && self.uses_termd(&r.id)).map(|r| r.id.clone()).collect();
+        if let Some(termd_list) = self.termd.list_sessions_if_running().await {
+            let now_termd: HashSet<String> = termd_list
+                .into_iter()
+                .filter(|s| stopped_ids.contains(&s.id))
+                .map(|s| format!("termd:{}", s.id))
+                .collect();
+            for key in now_termd.intersection(&before) {
+                let id = &key["termd:".len()..];
+                let doomed = self.task_processes(id).await;
+                crate::proctree::signal(&doomed);
+                let ok = self.termd.stop_session(id).await.unwrap_or(false);
+                tracing::info!(session = %id, ok, "结束游离的 termd 会话");
+                if !doomed.is_empty() {
+                    crate::proctree::reap(doomed).await;
+                }
+            }
+            next_pending.extend(now_termd.difference(&before).cloned());
+        }
+
+        next_pending
     }
 
     /// 回收已退出的 ttyd，记录“刚启动就退出”的次数。
@@ -1912,8 +2251,9 @@ impl Instances {
 
     pub fn capabilities(&self) -> serde_json::Value {
         json!({
-            "backend": self.backend.name(),
-            "persistent": matches!(self.backend, Backend::Tmux(_)),
+            "backend": if self.new_uses_termd() { "termd" } else { self.backend.name() },
+            "persistent": self.is_persistent(),
+            "termd": self.termd.available(),
             "ttyd": self.paths.ttyd.is_some(),
             "fonts": self.paths.fonts.is_some(),
             "os": crate::paths::os_name(),
@@ -2187,17 +2527,25 @@ const OUTER_AGENT_ENV: &[&str] = &[
 
 /// 子进程环境：保证 UTF-8（中文输入输出正常），并去掉外层 tmux、外层 Claude Code 的变量。
 /// tmux 和对话模式直接起的 claude（`chat::claude_sdk`）都用这个，两边的 Claude Code 看到的一样。
-pub(crate) fn apply_env(cmd: &mut Command) {
-    cmd.env_remove("TMUX").env_remove("TMUX_PANE");
-    for k in OUTER_AGENT_ENV {
-        cmd.env_remove(k);
-    }
+fn utf8_lang_override() -> Option<&'static str> {
     let utf8 = ["LC_ALL", "LC_CTYPE", "LANG"]
         .iter()
         .find_map(|k| std::env::var(k).ok().filter(|v| !v.is_empty()))
         .is_some_and(|v| v.to_ascii_lowercase().replace('-', "").contains("utf8"));
     if !utf8 && !cfg!(windows) {
-        cmd.env("LANG", if cfg!(target_os = "macos") { "en_US.UTF-8" } else { "C.UTF-8" });
+        Some(if cfg!(target_os = "macos") { "en_US.UTF-8" } else { "C.UTF-8" })
+    } else {
+        None
+    }
+}
+
+pub(crate) fn apply_env(cmd: &mut Command) {
+    cmd.env_remove("TMUX").env_remove("TMUX_PANE");
+    for k in OUTER_AGENT_ENV {
+        cmd.env_remove(k);
+    }
+    if let Some(lang) = utf8_lang_override() {
+        cmd.env("LANG", lang);
     }
     cmd.env("COLORTERM", "truecolor");
 }
@@ -2622,7 +2970,7 @@ mod tests {
     #[test]
     fn full_access_flags() {
         let mut r = row();
-        let on = Opts { full_access: true, root_confirmed: true, web_port: None, chat_ui: false, name_custom: false, sdk: false };
+        let on = Opts { full_access: true, root_confirmed: true, ..Opts::default() };
         assert_eq!(launch_command_line(&r, Opts::default(), false), None);
         r.launch = "codex".into();
         assert_eq!(launch_command_line(&r, Opts::default(), false).as_deref(), Some("codex"));
@@ -2645,23 +2993,23 @@ mod tests {
     #[test]
     fn opts_validation() {
         let mut r = row();
-        let mut o = Opts { full_access: true, root_confirmed: true, web_port: None, chat_ui: false, name_custom: false, sdk: false };
+        let mut o = Opts { full_access: true, root_confirmed: true, ..Opts::default() };
         Instances::validate_opts(&r, &mut o).unwrap();
         assert!(o == Opts::default(), "shell 终端忽略全部权限选项");
         r.launch = "claude".into();
-        let mut o = Opts { full_access: false, root_confirmed: true, web_port: None, chat_ui: false, name_custom: false, sdk: false };
+        let mut o = Opts { full_access: false, root_confirmed: true, ..Opts::default() };
         Instances::validate_opts(&r, &mut o).unwrap();
         assert!(!o.root_confirmed);
-        let mut o = Opts { full_access: true, root_confirmed: false, web_port: None, chat_ui: false, name_custom: false, sdk: false };
+        let mut o = Opts { full_access: true, root_confirmed: false, ..Opts::default() };
         Instances::validate_opts(&r, &mut o).unwrap();
         assert!(o.root_confirmed, "全部权限就是确认，root 下不用再确认");
         r.launch = "dsh".into();
-        let mut o = Opts { full_access: true, root_confirmed: true, web_port: None, chat_ui: false, name_custom: false, sdk: false };
+        let mut o = Opts { full_access: true, root_confirmed: true, ..Opts::default() };
         assert!(Instances::validate_opts(&r, &mut o).is_err(), "DSH 必须有网页端口");
-        let mut o = Opts { full_access: true, root_confirmed: true, web_port: Some(3080), chat_ui: false, name_custom: false, sdk: false };
+        let mut o = Opts { full_access: true, root_confirmed: true, web_port: Some(3080), ..Opts::default() };
         Instances::validate_opts(&r, &mut o).unwrap();
         assert!(o == Opts { web_port: Some(3080), ..Opts::default() }, "DSH 没有全部权限选项");
-        let mut o = Opts { full_access: true, root_confirmed: false, web_port: Some(3080), chat_ui: true, name_custom: false, sdk: false };
+        let mut o = Opts { full_access: true, root_confirmed: false, web_port: Some(3080), chat_ui: true, ..Opts::default() };
         Instances::validate_opts(&r, &mut o).unwrap();
         assert!(o == Opts { chat_ui: true, ..Opts::default() }, "对话模式的 DSH 不要网页端口");
     }

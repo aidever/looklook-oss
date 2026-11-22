@@ -255,6 +255,11 @@ fn head_len(h: &[u8]) -> Option<usize> {
     Some(2 + ext + mask)
 }
 
+/// 已解帧的 WebSocket 消息负载是不是用户输入（供 term_zstd.rs 和 termd_ws.rs 复用）。
+pub(crate) fn is_user_input_msg(payload: &[u8]) -> bool {
+    is_user_input(&payload[..payload.len().min(PEEK)], payload.len() as u64)
+}
+
 /// ttyd 的一条消息是不是用户输入：`'0'` 开头（INPUT），内容不全是终端自己回的
 fn is_user_input(peek: &[u8], len: u64) -> bool {
     let Some((&b'0', data)) = peek.split_first() else { return false };

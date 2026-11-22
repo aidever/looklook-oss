@@ -1,0 +1,25 @@
+[package]
+name = "term-gpu"
+version = "0.1.0"
+edition = "2021"
+description = "Desktop browser renderer for looklook-term.v1: wgpu (WebGPU, falling back to WebGL2) drawing the termd screen and scrollback (wasm32)"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+term-proto = { path = "../term-proto" }
+term-web = { path = "../term-web" }
+wasm-bindgen = "=0.2.130"
+bytemuck = { version = "1", features = ["derive"] }
+
+# 画图的部分只在浏览器里编（本机跑测试不用编 wgpu）
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen-futures = "=0.4.80"
+js-sys = "=0.3.107"
+web-sys = { version = "=0.3.107", features = ["Document", "Window", "Navigator", "Element", "HtmlElement", "Node", "EventTarget", "HtmlCanvasElement", "CanvasRenderingContext2d", "ImageData", "TextMetrics"] }
+wgpu = { version = "30", default-features = false, features = ["webgpu", "webgl", "wgsl"] }
+
+[dev-dependencies]
+term-core = { path = "../term-core" }

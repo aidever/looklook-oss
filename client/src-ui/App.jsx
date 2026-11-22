@@ -947,6 +947,7 @@ function Shell() {
   const relayState = status?.relay?.state;
   // 状态请求可能交错（定时、切回窗口、操作后各发一次）：只用最后发出的那次的结果，晚回来的旧结果不能盖掉新的
   const reqSeq = useRef(0);
+  const failedDevs = useRef(new Set());
   const reload = useCallback(() => {
     const device = selectedDevice();
     const n = ++reqSeq.current;
@@ -954,6 +955,7 @@ function Shell() {
       .get('/status')
       .then((s) => {
         if (n !== reqSeq.current) return;
+        failedDevs.current.clear();
         setStatus(s);
         setStatusDevice(device);
         setDown(false);
@@ -963,16 +965,24 @@ function Shell() {
       .catch(() => {
         if (n !== reqSeq.current) return;
         const d = devRef.current;
-        if (d?.multi && device && device !== d.def && d.def) {
+        if (d?.multi) {
           // 已经有这台电脑的状态：只是一次没取到（网络抖动），留在这台，下一轮再取
           if (statusDevRef.current === device) return;
-          // 刚切过去就连不上（例如它离线了）：这次先看默认的电脑，不要整页显示“连不上”；
-          // 不改记住的选择，下次打开还是用户选的那台。说一声换了哪台，不悄悄换（docs/REMOTE_UX_2026-11-07.md 决定 3）
-          const from = d.byId(device);
-          const to = d.byId(d.def);
-          if (from && to) toastRef.current?.(i18next.t('devices.fallback', { from: from.name, to: to.name }));
-          d.select(d.def, false);
-          return;
+          // 刚切过去或初始默认这台连不上（含 d.def 本身连不上）：依次退到其他连得上的电脑，不把整个界面锁死在“连不上”
+          if (device) failedDevs.current.add(device);
+          let links = {};
+          try {
+            links = window.top.__llrtc?.links?.() ?? {};
+          } catch {}
+          const cand = d.items
+            .filter((x) => x.online && x.id !== device && !failedDevs.current.has(x.id))
+            .sort((a, b) => ((links[b.id]?.s === 'online' ? 2 : b.id === d.def ? 1 : 0) - (links[a.id]?.s === 'online' ? 2 : a.id === d.def ? 1 : 0)))[0];
+          if (cand) {
+            const from = d.byId(device);
+            if (from) toastRef.current?.(i18next.t('devices.fallback', { from: from.name, to: cand.name }));
+            d.select(cand.id, false);
+            return;
+          }
         }
         setDown(true);
       });
@@ -994,10 +1004,16 @@ function Shell() {
     // 远程通道还在连接或连接失败时刷新得勤一点，好尽快看到“已连接”。
     const id = setInterval(reload, relayState === 'connecting' || relayState === 'failed' ? 3000 : 10000);
     const onFocus = () => reload();
+    const onOnline = () => {
+      failedDevs.current.clear();
+      reload();
+    };
     window.addEventListener('focus', onFocus);
+    window.addEventListener('online', onOnline);
     return () => {
       clearInterval(id);
       window.removeEventListener('focus', onFocus);
+      window.removeEventListener('online', onOnline);
     };
   }, [reload, relayState]);
 
@@ -1005,7 +1021,12 @@ function Shell() {
   if (down && !status) {
     return (
       <>
-        <Unreachable onRetry={reload} />
+        <Unreachable
+          onRetry={() => {
+            failedDevs.current.clear();
+            reload();
+          }}
+        />
         <PullRefresh />
         <ConnStatus />
       </>

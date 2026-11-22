@@ -274,6 +274,23 @@ fn cand_type_at<'a>(sdp: &'a str, addr: &str) -> Option<&'a str> {
     })
 }
 
+/// 对端经 SDP 里没有的地址连过来（prflx）时的类型：地址是两边 SDP 里某个中继候选的 IP（同一台 TURN 服务器，
+/// 只是端口不同：对端后来又分配了中继、或经 TCP 用 TURN）就算中继，不然包是从中转发来的却会被当成公网直连。
+fn prflx_type(ip: &str, remote_sdp: &str, local_sdp: &str) -> &'static str {
+    let relay = |sdp: &str| {
+        sdp.lines().filter(|l| l.starts_with("a=candidate")).any(|l| {
+            let t: Vec<&str> = l.split_whitespace().collect();
+            let typ = t.iter().position(|x| *x == "typ").and_then(|i| t.get(i + 1));
+            typ == Some(&"relay") && t.get(4).is_some_and(|a| a.eq_ignore_ascii_case(ip))
+        })
+    };
+    if relay(remote_sdp) || relay(local_sdp) {
+        "relay"
+    } else {
+        "prflx"
+    }
+}
+
 /// 一条 PeerConnection（应答方：浏览器连进来；发起方：本机 App 连同一账户的其他电脑，见 `super::outbound`）。
 pub struct Pc {
     pc: Box<RtcPeerConnection<PcHandler>>,
@@ -365,8 +382,8 @@ impl Pc {
         let (la, ra) = (self.pc.local_address()?, self.pc.remote_address()?);
         let local = self.pc.local_description().and_then(|d| serde_json::to_value(&d).ok()).and_then(|v| v["sdp"].as_str().map(str::to_owned));
         let lt = local.as_deref().and_then(|sdp| cand_type_at(sdp, &la)).unwrap_or("host");
-        let rt = cand_type_at(&self.remote_sdp, &ra).unwrap_or("prflx");
         let host = |a: &str| a.rsplit_once(':').map_or(a, |(h, _)| h).trim_matches(['[', ']']).to_string();
+        let rt = cand_type_at(&self.remote_sdp, &ra).unwrap_or_else(|| prflx_type(&host(&ra), &self.remote_sdp, local.as_deref().unwrap_or("")));
         Some(path_info(&host(&la), lt, &host(&ra), rt))
     }
 
@@ -400,9 +417,27 @@ impl Pc {
 
     /// 等候选收集完（不用 trickle），返回 answer SDP：收集结束、或者有了 srflx / relay 候选再等 [`REFLEXIVE_GRACE`]，
     /// 最多 `limit`。
-    /// 之后才把 offer 里的候选交给 libjuice。
+    /// 之后才把 offer 里的候选交给 libjuice（`.local` mDNS 候选与本机收集并行解析，不白等）。
     pub async fn local_answer(&mut self, limit: Duration) -> Result<String> {
+        let has_mdns = self.deferred.iter().any(|(_, c)| super::mdns::extract_mdns_host(c).is_some());
+        let mdns_task = has_mdns.then(|| {
+            let allow_v6 = self.net.ipv6;
+            let cands = self.deferred.clone();
+            tokio::spawn(super::mdns::resolve_candidates(cands, allow_v6, Duration::from_millis(1200)))
+        });
         let sdp = self.local_sdp("answer", limit).await?;
+        if let Some(task) = mdns_task {
+            let mut handle = task;
+            match tokio::time::timeout(Duration::from_millis(250), &mut handle).await {
+                Ok(Ok(resolved)) => {
+                    tracing::debug!(before = self.deferred.len(), after = resolved.len(), "mDNS 候选解析完成");
+                    self.deferred = resolved;
+                }
+                _ => {
+                    handle.abort();
+                }
+            }
+        }
         for (mid, candidate) in std::mem::take(&mut self.deferred) {
             if let Err(e) = self.pc.add_remote_candidate(&IceCandidate { candidate, mid }) {
                 tracing::debug!(error = ?e, "添加对端候选失败");
@@ -696,6 +731,15 @@ mod tests {
         assert!(classify("garbage", "x").is_none());
     }
 
+    #[test]
+    fn prflx_from_turn_server_is_relay() {
+        let remote = "a=candidate:1 1 udp 2122260223 10.0.0.5 50000 typ host\r\na=candidate:3 1 udp 41885439 47.108.195.230 61234 typ relay raddr 117.174.76.145 rport 50000\r\n";
+        assert_eq!(prflx_type("47.108.195.230", remote, ""), "relay", "同一台 TURN、端口不同");
+        let local = "a=candidate:2 1 UDP 16777215 47.108.195.230 50111 typ relay raddr 0.0.0.0 rport 0\r\n";
+        assert_eq!(prflx_type("47.108.195.230", "", local), "relay", "本机也经同一台 TURN");
+        assert_eq!(prflx_type("117.174.76.145", remote, local), "prflx", "raddr 不算");
+    }
+
     /// 端口范围里的端口都被占了：改用随机端口，照样生成 offer；这时不写公网地址（随机端口没有放行）。
     #[tokio::test]
     async fn exhausted_port_range_falls_back_to_random_ports() {
@@ -773,6 +817,30 @@ mod tests {
         let hosts: Vec<&str> = sdp.lines().filter(|l| l.starts_with("a=candidate") && l.contains(" typ host")).collect();
         eprintln!("{hosts:#?}");
         assert!(!hosts.iter().any(|l| l.contains(" 198.18.") || l.contains(" 198.19.")), "{hosts:?}");
+    }
+
+    /// 有私有 IPv4 和 IPv6 host 候选时，私有 IPv4 的 ICE priority 严格高于 IPv6（确保局域网优先 IPv4 直连）。
+    #[tokio::test]
+    async fn host_candidates_ipv4_before_ipv6() {
+        let (mut pc, _ch) = Pc::offer(&[]).unwrap();
+        let sdp = pc.local_offer(Duration::from_secs(5)).await.unwrap();
+        let mut priv_v4_prios = Vec::new();
+        let mut v6_prios = Vec::new();
+        for l in sdp.lines().filter(|l| l.starts_with("a=candidate") && l.contains(" typ host")) {
+            let parts: Vec<&str> = l.split_whitespace().collect();
+            let Ok(prio) = parts.get(3).unwrap_or(&"").parse::<u32>() else { continue };
+            let Ok(ip) = parts.get(4).unwrap_or(&"").parse::<std::net::IpAddr>() else { continue };
+            match ip {
+                std::net::IpAddr::V4(v4) if v4.is_private() => priv_v4_prios.push(prio),
+                std::net::IpAddr::V6(_) => v6_prios.push(prio),
+                _ => {}
+            }
+        }
+        if !priv_v4_prios.is_empty() && !v6_prios.is_empty() {
+            let min_v4 = *priv_v4_prios.iter().min().unwrap();
+            let max_v6 = *v6_prios.iter().max().unwrap();
+            assert!(min_v4 > max_v6, "expected private IPv4 host priority ({min_v4}) > IPv6 ({max_v6})\n{sdp}");
+        }
     }
 }
 

@@ -34,6 +34,8 @@ pub fn os_name() -> &'static str {
 pub const TERM_EXE: &str = if cfg!(windows) { "looklook-term.exe" } else { "looklook-term" };
 /// 旧版安装包与开发时 vendor/ 里的原名
 const LEGACY_TERM_EXE: &str = if cfg!(windows) { "ttyd.exe" } else { "ttyd" };
+/// 自研持久终端守护进程（每用户一个，替代 ttyd + tmux / psmux）
+pub const TERMD_EXE: &str = if cfg!(windows) { "looklook-termd.exe" } else { "looklook-termd" };
 /// 随包的会话保持程序（Linux/macOS 是静态编译的 tmux，Windows 是 psmux）：同样改成看看自己的名字。
 /// Windows 例外，必须叫 psmux.exe：psmux 每次运行都按进程名（psmux/tmux/pmux）确认登记的会话服务还活着，
 /// 改了名的服务会被当成已经退出，登记文件随即被删——新建会话报“failed to create session”。
@@ -54,6 +56,7 @@ pub struct Paths {
     pub home: PathBuf,
     pub ttyd: Option<PathBuf>,
     pub mux: Option<PathBuf>,
+    pub termd: Option<PathBuf>,
     pub fonts: Option<PathBuf>,
     /// trz / tsz 所在目录（加在终端会话 `PATH` 的最前面）
     pub trzsz: Option<PathBuf>,
@@ -81,9 +84,19 @@ impl Paths {
         let mux = std::env::var_os("LOOKLOOK_MUX_BIN")
             .map(PathBuf::from)
             .or_else(|| dirs.iter().flat_map(|d| [d.join(MUX_EXE), d.join(LEGACY_MUX_EXE)]).find(|p| p.is_file()));
+        let mut termd_dirs = dirs.clone();
+        if cfg!(debug_assertions) {
+            // `cargo test` 时测试二进制在 target/debug/deps/，而 `cargo build` 的 looklook-termd 在 target/debug/
+            if let Some(p) = std::env::current_exe().ok().and_then(|e| e.parent().and_then(|d| d.parent()).map(Path::to_path_buf)) {
+                termd_dirs.push(p);
+            }
+        }
+        let termd = std::env::var_os("LOOKLOOK_TERMD_BIN")
+            .map(PathBuf::from)
+            .or_else(|| termd_dirs.iter().map(|d| d.join(TERMD_EXE)).find(|p| p.is_file()));
         let fonts = dirs.iter().map(|d| d.join("fonts")).find(|p| p.join("fonts.css").is_file());
         let trzsz = find_trzsz().map(|d| crate::versions::stable_trzsz(&home, d));
-        Ok(Self { home, ttyd, mux, fonts, trzsz })
+        Ok(Self { home, ttyd, mux, termd, fonts, trzsz })
     }
 
     pub fn db(&self) -> PathBuf {
@@ -100,6 +113,30 @@ impl Paths {
     }
     pub fn tmux_conf(&self) -> PathBuf {
         self.home.join("run").join("tmux.conf")
+    }
+    /// `looklook-termd` 本机 IPC 地址（Unix socket 路径或 Windows Named Pipe，按数据目录隔离）。
+    pub fn termd_socket(&self) -> String {
+        if let Some(s) = std::env::var_os("LOOKLOOK_TERMD_SOCKET") {
+            let s = s.to_string_lossy().into_owned();
+            if !s.trim().is_empty() {
+                return s;
+            }
+        }
+        #[cfg(unix)]
+        {
+            let p = self.home.join("run").join("termd.sock");
+            let s = p.to_string_lossy().into_owned();
+            // sun_path 长度限制（macOS 104 / Linux 108），超长数据目录退回短路径
+            if s.len() <= 96 {
+                s
+            } else {
+                format!("/tmp/ll-termd-{:016x}.sock", fnv1a64(self.home.to_string_lossy().as_bytes()))
+            }
+        }
+        #[cfg(windows)]
+        {
+            format!(r"\\.\pipe\looklook-termd-{:016x}", fnv1a64(self.home.to_string_lossy().as_bytes()))
+        }
     }
     pub fn instance_log(&self, id: &str) -> PathBuf {
         self.home.join("logs").join(format!("{id}.log"))
@@ -129,6 +166,15 @@ impl Paths {
 /// 没有指定（`--home` / `LOOKLOOK_HOME`）时的数据目录。启动时跳转版本（`versions::jump`）也按这个规则找，不能各写一套。
 pub fn default_home() -> Option<PathBuf> {
     dirs::data_dir().map(|d| d.join("looklook"))
+}
+
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in bytes {
+        hash ^= u64::from(b);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    hash
 }
 
 /// 随包 trzsz 所在的目录。

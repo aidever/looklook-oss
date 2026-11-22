@@ -8,6 +8,7 @@
 import { createContext, useContext, useEffect, useRef, useState } from 'react';
 
 import { api, ApiError, deviceApi, rememberTerminals, rtcMode, terminalDevice } from './api.js';
+import { useLinks } from './paths.jsx';
 import { rememberInstances, snapInstances } from './snapshot.js';
 import { useDevices } from './devices.jsx';
 
@@ -365,7 +366,7 @@ function useStoredProjects(devIds, key) {
       .then((r) => Array.isArray(r?.items) && setStore((s) => ({ ...s, [dev ?? '']: r.items })))
       .catch(() => {});
   };
-  return [store, save];
+  return [store, save, load];
 }
 
 /**
@@ -404,7 +405,7 @@ function useFolders(devIds, key) {
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [key]);
-  return [store, reload];
+  return [store, reload, load];
 }
 
 /**
@@ -552,8 +553,37 @@ export function SessionsProvider({ enabled, children }) {
   }, [enabled]);
   const devIds = multi ? devices.items.map((d) => d.id) : [null];
   const onlineDevIds = multi ? online.map((d) => d.id) : [null];
-  const [store, saveStore] = useStoredProjects(enabled ? onlineDevIds : [], `${enabled}:${multi}:${onlineKey}`);
-  const [folders, reloadFolders] = useFolders(enabled ? onlineDevIds : [], `${enabled}:${multi}:${onlineKey}`);
+  const [store, saveStore, reloadProj] = useStoredProjects(enabled ? onlineDevIds : [], `${enabled}:${multi}:${onlineKey}`);
+  const [folders, reloadFolders, reloadOneFolder] = useFolders(enabled ? onlineDevIds : [], `${enabled}:${multi}:${onlineKey}`);
+  // 某台电脑的 WebRTC 从连接中/重连中/连不上恢复成在线时，只重新拉取那台电脑的数据（不影响其他健康电脑）
+  const links = useLinks();
+  const prevLinks = useRef({});
+  useEffect(() => {
+    if (!rtcMode || !enabled) return;
+    const prev = prevLinks.current;
+    prevLinks.current = links;
+    if (multi) {
+      for (const id of onlineDevIds) {
+        const was = prev[id]?.s;
+        const now = links[id]?.s;
+        if (now === 'online' && was && was !== 'online') {
+          reloadGroups(id);
+          reloadProj(id);
+          reloadOneFolder(id);
+        }
+      }
+    } else {
+      const id = devices.def;
+      const was = id && prev[id]?.s;
+      const now = id && links[id]?.s;
+      if (now === 'online' && was && was !== 'online') {
+        reloadSingle();
+        reloadProj(null);
+        reloadOneFolder(null);
+      }
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [links, enabled, multi]);
   // 正在删除的会话：点了删除就先从列表里拿掉（标签也随之关掉），删除失败再放回来
   const [deleting, setDeleting] = useState(() => new Set());
   const hide = (id, on) =>

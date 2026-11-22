@@ -1102,11 +1102,12 @@ pub(crate) mod e2e {
         let store = Arc::new(Store::memory().unwrap());
         // 要真的打开终端的测试用 LOOKLOOK_TEST_TTYD 给出 ttyd
         let ttyd = std::env::var_os("LOOKLOOK_TEST_TTYD").map(std::path::PathBuf::from);
-        let paths = Paths { home: home.into(), ttyd, mux: None, fonts: None, trzsz: None };
+        let paths = Paths { home: home.into(), ttyd, mux: None, termd: None, fonts: None, trzsz: None };
         let plugin_paths = paths.clone();
         let account = test_support::logged_in(store.clone(), paths.clone(), server, dev, key);
         let instances = crate::instances::Instances::new(store.clone(), paths.clone());
         Arc::new(Inner {
+            direct: crate::direct_tls::Direct::new(store.clone(), 1),
             account: account.clone(),
             instances: instances.clone(),
             updater: crate::updater::Updater::new(store.clone(), paths.clone(), account.clone(), CancellationToken::new()),
@@ -1152,6 +1153,8 @@ pub(crate) mod e2e {
                             last_seen_ms: 0,
                             terminals: vec![],
                             keys: vec![DeviceKey { id: format!("k-{id}"), public_key: b64(k.verifying_key().as_bytes()) }],
+                            direct: None,
+                            reach: None,
                         })
                         .collect();
                     (StatusCode::OK, serde_json::to_vec(&RemoteDevices { items, default: None, max: 7, ice_servers: vec![] }).unwrap())

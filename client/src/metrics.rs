@@ -63,6 +63,8 @@ pub struct Proc {
 pub struct Roots {
     /// tmux 服务进程
     pub mux: Option<u32>,
+    /// looklook-termd 守护进程（如果运行）
+    pub termd: Option<u32>,
     pub sessions: Vec<SessionRoots>,
     /// 不是客户端子进程、但是看看起的（Codex app-server 单独运行）：名称、进程号
     pub helpers: Vec<(String, u32)>,
@@ -197,6 +199,9 @@ fn breakdown(procs: &HashMap<u32, &Process>, roots: &Roots, me: u32, cores: f32)
     if let Some(m) = roots.mux {
         owner.insert(m, Owner::Mux);
     }
+    if let Some(t) = roots.termd {
+        owner.insert(t, Owner::Mux);
+    }
     // 已经分过的不再往下走（先到先得：终端优先，剩下的才算辅助进程）
     let walk = |owner: &mut HashMap<u32, Owner>, start: u32, o: Owner| {
         let mut stack = vec![start];
@@ -229,13 +234,15 @@ fn breakdown(procs: &HashMap<u32, &Process>, roots: &Roots, me: u32, cores: f32)
     for &c in children.get(&me).into_iter().flatten() {
         walk(&mut owner, c, Owner::Helper);
     }
-    // tmux 服务进程下面不属于任何终端的（刚关掉的面板之类）
-    for &c in roots.mux.and_then(|m| children.get(&m)).into_iter().flatten() {
-        walk(&mut owner, c, Owner::Mux);
+    // tmux / termd 服务进程下面不属于任何终端的（刚关掉的面板之类）
+    for daemon in [roots.mux, roots.termd].into_iter().flatten() {
+        for &c in children.get(&daemon).into_iter().flatten() {
+            walk(&mut owner, c, Owner::Mux);
+        }
     }
     let mut out = Looklook { main_pid: me, codex_loaded: roots.codex_loaded, ..Default::default() };
     let mut sessions: Vec<(Usage, Option<(u64, String)>)> = vec![Default::default(); roots.sessions.len()];
-    let mut mux = roots.mux.filter(|m| procs.contains_key(m)).map(|_| Usage::default());
+    let mut mux = [roots.mux, roots.termd].into_iter().flatten().any(|m| procs.contains_key(&m)).then(Usage::default);
     let mut groups: Vec<Group> = vec![];
     for (&pid, &o) in &owner {
         let Some(p) = procs.get(&pid) else { continue };

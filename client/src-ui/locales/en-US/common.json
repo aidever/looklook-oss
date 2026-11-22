@@ -483,7 +483,11 @@
     "scope": "Settings for this computer:",
     "language_hint": "Only changes this browser or app.",
     "details": "Build details, server, source code",
-    "platform": "Platform"
+    "platform": "Platform",
+    "termd": "Terminal engine",
+    "termd_off": "Classic (ttyd + tmux)",
+    "termd_on": "Modern (looklook-termd)",
+    "termd_hint": "New terminals use Looklook's own terminal engine (on by default); turn it off to create new terminals on tmux. Existing terminals are not affected."
   },
   "account": {
     "days_left": "{{n}} days left",
@@ -823,6 +827,7 @@
     "connecting": "Connecting…",
     "reconnecting": "Reconnecting…",
     "unreachable": "Can't connect",
+    "unreachable_strip": "Can't reach “{{name}}”",
     "retry": "Retry",
     "unreachable_note": "This computer is online, but this browser can't reach it.",
     "last_seen": "Last online",
@@ -2714,6 +2719,8 @@
     "sub": "Sessions where the AI is working, waiting for you, or just finished."
   },
   "sess": {
+    "old_term": "legacy",
+    "old_term_hint": "Legacy terminal: still on tmux; new terminals use the new engine",
     "new": "New session",
     "undo": "Undo",
     "quick_done": "Created “{{name}}”",
@@ -3001,6 +3008,7 @@
     "e2e": "End-to-end, computer signature verified",
     "latency": "Latency",
     "loss": "Packet loss",
+    "all_devices": "All computers",
     "remote_note": "Tries to reach that computer directly and falls back to the route as a relay, which only sees encrypted data."
   },
   "hist": {
@@ -3102,15 +3110,26 @@
     "lan_hint": "Same local network; data never leaves it.",
     "p2p_hint": "Directly to that computer over the internet, no relay.",
     "relay_hint": "A direct link couldn't be made, so traffic goes through a relay (end-to-end encrypted; the relay can't read it). If it's slow, switch routes in Settings.",
+    "reach": {
+      "relay_only": "That computer is behind a symmetric NAT (a new port per destination), so hole punching can't work and only the relay is left.",
+      "wrong_addr": "The public address set on that computer can't be reached from outside (it doesn't match the real exit, or the port range isn't open).",
+      "partial": "Only part of that computer's port range can be reached from the internet.",
+      "proxy": "That computer's UDP goes through a proxy (e.g. Clash TUN), so its outside address isn't its own and a direct link can't be made.",
+      "see_settings": "Check Settings → Direct connection in Looklook on that computer."
+    },
     "none_hint": "Not connected yet; connects when needed.",
     "direct_only": "Connection",
     "direct_only_label": "Direct only (no relay)",
     "direct_only_fell_back": "Direct connection failed; using the relay instead.",
+    "direct_only_fell_back_p2p": "Direct only didn't connect; connected the usual way instead (still not through the relay).",
     "direct_only_hint": "Turn on to route this computer's traffic through a proxy such as Clash: skip the relay and connect straight to its public address, so a proxy rule for this computer's IP takes effect (the proxy node must support UDP). Falls back to the relay if direct fails. Applies to this browser / this computer only; reconnects when changed.",
     "direct_only_nudge": "Using a proxy like Clash and want traffic to this computer to go through it?",
     "direct_only_enable": "Turn on Direct only",
     "direct_only_nudge_elsewhere": "When connecting to it from another browser or computer, you can turn on Direct only in the connection details so a proxy rule for this computer's IP applies.",
-    "direct_only_nudge_off": "Don't show again"
+    "direct_only_nudge_off": "Don't show again",
+    "reconnect": "Reconnect",
+    "reconnecting_now": "Reconnecting…",
+    "try_direct": "Retry direct"
   },
   "pull": {
     "pull": "Pull to refresh",
@@ -3149,7 +3168,7 @@
     "public_v6_nic": "Public IPv6 on network adapters (used automatically, usually no need to fill in): {{ips}}",
     "not_set": "Not set",
     "detect": "Detect",
-    "detect_hint": "Detecting makes this computer ask the relay's STUN and cip.cc, ip.me, ipw.cn, ipify and ident.me. Results only fill the fields (a domain is kept); click Save to apply. With a proxy or VPN on, you may see its address.",
+    "detect_hint": "Detecting makes this computer ask the relays' STUN and cip.cc, ip.me, ipw.cn, ipify and ident.me. Results only fill the fields (a domain is kept); click Save to apply. It also asks the server to send a few UDP packets to the first and last ports in the range and checks the NAT type, to see whether direct connections work from outside; the result shows above. With a proxy or VPN on, you may see its address.",
     "source_relay": "Relay STUN",
     "probe_failed": "failed ({{why}})",
     "probe_disagree": "Sources disagree; a proxy or VPN may be in the way. Please check.",
@@ -3157,7 +3176,43 @@
     "ipv6_hint": "Turn off to use IPv4 only, e.g. when IPv6 is unreliable.",
     "firewall": "Direct connections need UDP {{begin}}–{{end}} open in the firewall or cloud security group (IPv4 and IPv6). With router port forwarding, external and internal ports must match.",
     "more": "Have a public IP? Add it and open the ports for faster remote access",
-    "intro_full": "If this computer has a public address (full-cone NAT only) and the ports below are open, phones and office networks can connect directly too. Changes apply to new connections only."
+    "intro_full": "If this computer has a public address (full-cone NAT only) and the ports below are open, phones and office networks can connect directly too. Changes apply to new connections only.",
+    "nat": {
+      "punch": "Network type: mostly direct",
+      "punch_hint": "Hole punching works on this network, so phones and browsers on most networks connect directly; peers behind strict NAT go through the relay. For direct everywhere: with a public IP, open the port range below in the firewall / security group, or forward it on the router.",
+      "relay_only": "Network type: relay only",
+      "relay_only_hint": "This network uses symmetric NAT (common on office networks, phone hotspots and some carriers), so hole punching fails and remote connections go through the relay. With a public IP, open the port range and set the public address to connect directly.",
+      "proxy": "Network type: can't tell, a proxy is taking over",
+      "proxy_hint": "A proxy (TUN mode or fake-ip) is taking over this computer's UDP, so the check sees the proxy's exit. Let the relays' STUN addresses and the port range below bypass the proxy, then check again. To use your own accelerated line, add the rule on the viewing side (the phone or browser's computer) and keep this computer direct.",
+      "wrong_addr_mismatch": "The public IPv4 you set can't be reached",
+      "wrong_addr_mismatch_hint": "You set {{ip}}, but this computer actually exits as {{exit}}. Likely carrier-grade NAT (common on home broadband; router port forwarding won't help) or a changed public IP. Clear the public IPv4 or use a DDNS domain.",
+      "wrong_addr_unresolved": "The public address (domain) hasn't resolved yet",
+      "wrong_addr_unresolved_hint": "It won't be used until it resolves. Check the domain and that DDNS is updating.",
+      "unknown_not_logged_in": "Network type: log in to check",
+      "unknown_one_relay": "Network type: can't check (needs two relays with different IPs)",
+      "unknown_no_reply": "Network type: can't check, the relays' STUN didn't answer",
+      "unknown_no_reply_hint": "UDP 3478 to the relays may be blocked by a firewall or proxy; remote connections will use the relay over TCP.",
+      "local_port": "Local port",
+      "random_port": "port range busy, used a random port",
+      "open": "Network: direct connections work",
+      "open_hint": "The port range is reachable from outside (both the first and last port received the server's packets), so phones and browsers on any network can connect directly.",
+      "partial": "Network: only part of the port range is open",
+      "partial_hint": "Only one of the first and last ports is reachable from outside. Open or forward the whole UDP range {{begin}}–{{end}} in the firewall, security group or router.",
+      "wrong_addr_blocked": "The public IPv4 you set can't be reached",
+      "wrong_addr_blocked_hint": "{{ip}} matches this computer's exit address, but the port range isn't reachable from outside: UDP {{begin}}–{{end}} isn't allowed by the firewall or security group, or the router's port forwarding isn't working.",
+      "suggest": "Direct connections work: set {{ip}}",
+      "suggest_hint": "This computer has a public IP and the port range is open. Set it as the public IPv4 so connections go to it directly first.",
+      "from_outside": "From outside",
+      "open_port": "open",
+      "closed_port": "closed",
+      "a_skipped": "Didn't check whether it's reachable from outside",
+      "a_why_ports_busy": "no free port in the range",
+      "a_why_no_target": "no public address set or found",
+      "a_why_unsupported": "the server doesn't support it yet",
+      "a_why_limited": "at most 6 checks an hour; try again later",
+      "a_why_not_logged_in": "not logged in",
+      "a_why_error": "the request to the server failed"
+    }
   },
   "addp": {
     "title": "Add project",
@@ -4060,15 +4115,21 @@
   },
   "rlink": {
     "resuming": "Restoring the connection…",
+    "resuming_name": "Restoring connection to “{{name}}”…",
     "reconnecting": "Connection lost, reconnecting… {{s}} s",
+    "reconnecting_name": "“{{name}}” disconnected, reconnecting… {{s}} s",
     "slow": "Can't reach your computer yet, still trying · {{s}} s",
+    "slow_name": "Can't reach “{{name}}” yet, still trying · {{s}} s",
     "net": "Your network is down. Reconnects automatically",
     "device_offline": "“{{name}}” went offline. Reconnects when it's back",
     "computer": "the computer",
     "connecting": "Connecting to your computer…",
     "connecting_name": "Connecting to “{{name}}”…",
+    "failed": "Can't reach your computer",
+    "failed_name": "Can't reach “{{name}}”",
     "retry": "Retry",
     "back": "Reconnected",
+    "back_name": "“{{name}}” reconnected",
     "dropped_one": "{{count}} key press wasn't sent (not connected yet). Check the screen and type it again",
     "dropped_other": "{{count}} key presses weren't sent (not connected yet). Check the screen and type them again",
     "send_wait": "Send when connected",
@@ -4625,5 +4686,60 @@
     "step_download": "Downloading…",
     "step_verify": "Checking signature…",
     "step_install": "Installing…"
+  },
+  "public_https": {
+    "title": "Public HTTPS",
+    "intro": "Computers with a fixed public IP (cloud servers, dev boxes) can be opened directly at https://IP:port in a browser, without Looklook's relay. To speed it up, add a Clash rule for this IP and use your own proxy.",
+    "enable": "Enable public HTTPS",
+    "enable_hint": "This computer gets a certificate for its public IP from Let's Encrypt (about 6 days each, renewed automatically) and serves HTTPS on the console port. Opening it from the internet requires signing in to Looklook and clicking “Open directly”, or entering the access code.",
+    "remote_only": "Public HTTPS can only be changed on this computer, on the local network, or over a direct connection, not when opened through the Looklook website.",
+    "confirm_title": "Expose the console to the internet?",
+    "confirm_body": "Anyone will be able to reach https://<public IP>:{{port}}, but they need your access code or a Looklook sign-in to get in. This is like putting a terminal on the internet, so keep the access code safe.\n\nCertificates are issued by Let's Encrypt. Enabling this means you agree to its Subscriber Agreement: {{tos}}",
+    "confirm_ok": "Enable",
+    "no_ip": "The public IPv4 of this computer is unknown. Fill it in under “Direct connection” above (try “Detect”); a certificate is requested once it is set.",
+    "working": "Requesting a certificate for {{ip}}… (TCP port 80 or 443 is used briefly)",
+    "url": "Open from any network:",
+    "cert_until": "Certificate expires",
+    "renew_at": "Next renewal",
+    "next_try": "Next attempt",
+    "method": {
+      "http01": "validated on port 80",
+      "tls_alpn01": "validated on port 443",
+      "forward": "validated through your web server"
+    },
+    "unreachable": "Looklook's server cannot open this address from outside ({{why}}). Allow TCP {{port}} in your security group / firewall.",
+    "code_short": "The access code of this computer is shorter than 12 characters and cannot be used from the internet. Generate a new one under “Access control”.",
+    "code_login": "Without a Looklook sign-in, opening from the internet asks for the access code: {{code}}",
+    "firewall": "Allow TCP 80 (for issuing and renewing certificates) and TCP {{port}} (the console) in your cloud security group / firewall.",
+    "clash": "To use your own proxy, add this line to your Clash rules before GEOIP,CN,DIRECT (replace “Proxy” with your node or group):",
+    "clash_node": "Proxy",
+    "forward_hint": "Ports 80 and 443 are both used by another program on this computer (nginx, Caddy, Docker…). Forward just the validation path to Looklook in your web server. Your site is not affected, and renewals keep working once it is set up:",
+    "privilege_hint": "Ports 80 / 443 cannot be used when running as a regular user. Install Looklook as root, or run one of these (repeat the first one after updating Looklook):",
+    "logins": "Recent internet sign-ins",
+    "via": {
+      "code": "access code",
+      "grant": "Looklook website"
+    },
+    "err": {
+      "no_privilege": "No permission to use port 80 / 443, so no certificate can be requested.",
+      "port_busy": "Ports 80 and 443 are both in use and no forwarding of the validation path was found.",
+      "unreachable": "Port 80 (or 443) of this computer cannot be reached from outside. Check your security group / firewall.",
+      "rate_limited": "Let's Encrypt is not issuing certificates for this IP right now (rate limit). It will retry automatically.",
+      "acme": "Let's Encrypt rejected the request.",
+      "network": "Cannot reach Let's Encrypt.",
+      "expired": "The certificate expired and HTTPS was turned off. Requesting a new one.",
+      "other": "Requesting the certificate failed ({{code}})."
+    }
+  },
+  "native": {
+    "menu": "Open in a native terminal",
+    "open_in": "Open in {{name}}",
+    "opened": "Opened in {{name}}",
+    "opened_body": "The session is in that window. Closing the window doesn't stop the session.",
+    "here": "Open here instead",
+    "again": "Open another window",
+    "setting": "Open terminals with",
+    "setting_hint": "With a native terminal chosen, opening a session on this computer pops up that terminal's window; scrolling, search and selection are the terminal's own.",
+    "builtin": "Looklook built-in"
   }
 }

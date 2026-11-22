@@ -32,7 +32,8 @@ import '@xterm/xterm/css/xterm.css';
 import { OverlayAddon } from './overlay.js';
 import { ProgressBar } from './progress.js';
 import { TrzszAddon } from './trzsz.js';
-import { setupTouch } from './touch.js';
+import { isTouchDevice, setupTouch } from './touch.js';
+import { TermZstdDecoder, ZSTD_SUBPROTOCOL, wsProtocols } from './zstd.js';
 import './style.css';
 
 // 服务端 → 浏览器 / 浏览器 → 服务端的消息类型（第一个字节）
@@ -50,6 +51,7 @@ const clientOptions = {
   enableTrzsz: false,
   isWindows: false,
   unicodeVersion: '11',
+  zstd: true,
 };
 const termOptions = {
   fontSize: 13,
@@ -82,7 +84,9 @@ class Xterm {
     this.resizeOverlay = true;
     this.reconnect = true;
     this.doReconnect = true;
-    this.writeFunc = (data) => this.writeData(new Uint8Array(data));
+    this.zstd = null;
+    this.zstdFailed = false;
+    this.writeFunc = (data) => this.writeData(data instanceof Uint8Array ? data : new Uint8Array(data));
     this.onUnload = this.onUnload.bind(this);
   }
 
@@ -245,7 +249,9 @@ class Xterm {
 
   // window.WebSocket 在这里现取：term-inject.js 把它换成了观察连接状态（远程时走 WebRTC）的版本
   connect() {
-    const socket = (this.socket = new WebSocket(wsUrl, ['tty']));
+    const zstdParam = new URLSearchParams(location.search).get('zstd');
+    const wantZstd = zstdParam !== '0' && zstdParam !== 'false';
+    const socket = (this.socket = new WebSocket(wsUrl, wsProtocols(wantZstd)));
     socket.binaryType = 'arraybuffer';
     this.register(listen(socket, 'open', () => this.onSocketOpen()));
     this.register(listen(socket, 'message', (e) => this.onSocketData(e)));
@@ -255,6 +261,9 @@ class Xterm {
 
   onSocketOpen() {
     console.log('[ttyd] websocket connection opened');
+    // 每次建连/重连都新建流式解压上下文；仅当服务端确认 tty-zstd 子协议时启用
+    this.zstdFailed = false;
+    this.zstd = this.socket?.protocol === ZSTD_SUBPROTOCOL ? new TermZstdDecoder() : null;
     const { terminal } = this;
     const msg = JSON.stringify({ AuthToken: this.token, columns: terminal.cols, rows: terminal.rows });
     this.socket?.send(this.encoder.encode(msg));
@@ -272,10 +281,13 @@ class Xterm {
 
   onSocketClose(event) {
     console.log(`[ttyd] websocket connection closed with code: ${event.code}`);
+    const forceReconnect = this.zstdFailed;
+    this.zstdFailed = false;
+    this.zstd = null;
     const doReconnect = this.doReconnect;
     this.dispose();
     // 1000：正常关闭。提示由 term-inject.js 显示，这里只管重连
-    if (event.code !== 1000 && doReconnect) {
+    if ((event.code !== 1000 || forceReconnect) && doReconnect) {
       this.refreshToken().then(() => this.connect());
     } else {
       // 正常结束的（比如程序退出了）：按回车重新连上
@@ -319,18 +331,34 @@ class Xterm {
 
   onSocketData(event) {
     const raw = event.data;
-    const cmd = String.fromCharCode(new Uint8Array(raw)[0]);
-    const data = raw.slice(1);
+    const bytes = new Uint8Array(raw);
+    const cmd = String.fromCharCode(bytes[0]);
     switch (cmd) {
       case OUTPUT:
-        this.writeFunc(data);
+        if (this.zstd) {
+          let out;
+          try {
+            out = this.zstd.decode(bytes.subarray(1));
+          } catch (e) {
+            console.error('[ttyd] zstd decode error, reconnecting:', e);
+            this.zstdFailed = true;
+            this.socket?.close(4000, 'zstd decode error');
+            return;
+          }
+          if (!out.length) break;
+          // 解压后的原始字节再交给 rz/sz 横幅检测与 trzsz / xterm
+          window.__llWatchOutput?.(out);
+          this.writeFunc(out);
+        } else {
+          this.writeFunc(raw.slice(1));
+        }
         break;
       case SET_WINDOW_TITLE:
-        this.title = this.decoder.decode(data);
+        this.title = this.decoder.decode(raw.slice(1));
         document.title = this.title;
         break;
       case SET_PREFERENCES:
-        this.applyPreferences({ ...clientOptions, ...JSON.parse(this.decoder.decode(data)), ...this.optsFromQuery(location.search) });
+        this.applyPreferences({ ...clientOptions, ...JSON.parse(this.decoder.decode(raw.slice(1))), ...this.optsFromQuery(location.search) });
         break;
       default:
         console.warn(`[ttyd] unknown command: ${cmd}`);
@@ -384,6 +412,7 @@ class Xterm {
         case 'enableSixel':
         case 'isWindows':
         case 'trzszDragInitTimeout':
+        case 'zstd':
           break;
         default:
           if (terminal.options[key] instanceof Object) terminal.options[key] = Object.assign({}, terminal.options[key], value);
@@ -425,9 +454,42 @@ class Xterm {
   }
 }
 
-const xterm = new Xterm();
 const container = document.getElementById('terminal-container');
+
+/**
+ * termd 会话（网关在页面里放了 window.__llTermd）用哪种终端：
+ * - 手机、平板：DOM 渲染 + looklook-term.v1（src-term/dom/，设计稿 §6）；
+ * - 电脑：wgpu 渲染 + looklook-term.v1（src-term/gpu/，设计稿 §7）；初始化失败退回 xterm.js（经 /ws 的 ttyd 兼容协议）；
+ * - 地址上 ?renderer=dom / gpu / xterm 可以强制选一种。
+ * @returns {'dom' | 'gpu' | null}
+ */
+function newRenderer() {
+  if (!window.__llTermd || typeof window.__llTermd !== 'object') return null;
+  const r = new URLSearchParams(location.search).get('renderer');
+  if (r === 'xterm') return null;
+  if (r === 'dom' || r === 'gpu') return r;
+  return isTouchDevice() ? 'dom' : 'gpu';
+}
+
 (async () => {
+  const kind = newRenderer();
+  if (kind) {
+    try {
+      if (kind === 'gpu') {
+        const { startGpu } = await import('./gpu/index.js');
+        await startGpu(container, window.__llTermd);
+      } else {
+        const { startDom } = await import('./dom/index.js');
+        await startDom(container, window.__llTermd);
+      }
+      return;
+    } catch (e) {
+      // WASM 加载失败、没有 WebGPU 也没有 WebGL2、老浏览器：退回 xterm.js（termd 的 /ws 说 ttyd 的协议，照样能用）
+      console.error(`[looklook] ${kind} renderer failed, falling back to xterm.js`, e);
+      container.textContent = '';
+    }
+  }
+  const xterm = new Xterm();
   await xterm.refreshToken();
   xterm.open(container);
   xterm.connect();

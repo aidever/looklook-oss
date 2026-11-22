@@ -161,6 +161,31 @@ pub struct HeartbeatRequest {
     /// 本设备当前全部终端实例 id（多设备，docs/05 §5）。平台据此维护终端路由表；None = 不更新。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminals: Option<Vec<String>>,
+    /// 公网 HTTPS 直连地址（服务端 docs/09 §5）：有有效证书时带上；None = 没开或还没有证书（平台清掉）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub direct: Option<crate::direct::DirectInfo>,
+    /// 直连自检的结论（docs/08 §8）：检测过才带；旧服务端忽略。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rtc_reach: Option<RtcReach>,
+}
+
+/// 直连自检的结论（docs/08 §5、§8）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RtcReach {
+    /// `open` / `partial` / `wrong_addr` / `proxy` / `punch` / `relay_only` / `unknown`
+    pub verdict: String,
+    /// 检测时间，Unix 秒
+    pub at: i64,
+    /// 端口可达（A）：`both` / `one` / `none` / `skipped`
+    #[serde(default)]
+    pub a: String,
+    /// NAT 映射（B）：`eim` / `symmetric` / `proxy` / `skipped`
+    #[serde(default)]
+    pub b: String,
+}
+
+impl RtcReach {
+    pub const VERDICTS: [&'static str; 7] = ["open", "partial", "wrong_addr", "proxy", "punch", "relay_only", "unknown"];
 }
 
 /// `PUT /api/client/v1/terminals`（签名）：终端新建/删除后立即上报本设备的全部终端 id（docs/05 §5）。
@@ -187,6 +212,12 @@ pub struct RemoteDevice {
     /// （[`crate::rtc::CLIENT_DEVICES_PATH`]）里给：电脑之间互相校验签名用（客户端 docs/SSH_TRANSFER.md §4.2）。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub keys: Vec<DeviceKey>,
+    /// 公网 HTTPS 直连地址（docs/09 §5）：启动页、设备列表据此显示“直接打开”。证书已过期的不给。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub direct: Option<crate::direct::DirectInfo>,
+    /// 直连自检的档位（docs/08 §8，只给 `verdict`）：启动页连接详情走中转时据此说明原因。没检测过不给。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reach: Option<String>,
 }
 
 /// 一把设备公钥：`id` 是请求签名里的 `X-LL-Key`，`public_key` 是 Ed25519 公钥（base64url 无填充）。

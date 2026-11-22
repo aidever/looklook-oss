@@ -9,7 +9,8 @@ import { createContext, useContext, useEffect, useLayoutEffect, useRef, useState
 import { useTranslation } from 'react-i18next';
 
 import { useStatus } from '../App.jsx';
-import { api, deviceApi, rememberTerminals, terminalDevice } from '../shared/api.js';
+import { api, deviceApi, rememberTerminals, rtcMode, terminalDevice } from '../shared/api.js';
+import { setFocusedDevice } from '../shared/conn.js';
 import { CHAT_LAUNCHES, isDshWeb } from '../shared/chat.js';
 import { DeviceAvatar, deviceColor, DeviceTag, LaunchIcon, SessionIcon } from '../shared/brands.jsx';
 import { deviceName, osLabel, RenameDeviceDialog, useDevices } from '../shared/devices.jsx';
@@ -1186,6 +1187,7 @@ export function SessionList({ currentId, onCollapse }) {
         )}
       </div>
       <div className="slist-body">
+        {rtcMode && multi && groupBy !== 'device' && <UnreachableStrip devices={devices} devOk={devOk} />}
         {s.error && <ErrorNote error={s.error} />}
         <SessionTips attn={attn.length > 0} />
         {attn.length > 0 && (
@@ -1261,6 +1263,31 @@ function SessionTips({ attn }) {
   return null;
 }
 
+function UnreachableStrip({ devices, devOk }) {
+  const { t } = useTranslation();
+  const links = useLinks();
+  const failed = devices.items.filter((d) => d.online && devOk(d.id) && linkState(d, links) === 'failed');
+  if (!failed.length) return null;
+  return (
+    <div className="slist-warn-list">
+      {failed.map((d) => {
+        const fail = linkFailure(d, links);
+        return (
+          <div key={d.id} className="slist-warn" role="status">
+            <span className="dot bad" aria-hidden="true" />
+            <span className="ellipsis">{t('devices.unreachable_strip', { name: deviceName(t, d) })}</span>
+            {fail && (
+              <button type="button" className="link-button" onClick={fail.retry}>
+                {t('devices.retry')}
+              </button>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 function NewProjectButton() {
   const { t } = useTranslation();
   const ui = useSessionUi();
@@ -1328,7 +1355,9 @@ function SessionLead({ inst }) {
   if (!inst) return null;
   const dev = devices.multi ? devices.byId(terminalDevice(inst.id)) : null;
   const dir = sessionDir(inst);
-  const full = [dev && deviceName(t, dev), inst.container && t('sess.in_container', { name: inst.container.name }), dir].filter(Boolean).join(' · ');
+  // 还跑在 tmux 上的会话（默认开启 termd 之前建的，设计稿 §4.7）；字段是 termd 版本之后才有的，没有就不标
+  const old = inst.termd === false;
+  const full = [dev && deviceName(t, dev), inst.container && t('sess.in_container', { name: inst.container.name }), dir, old && t('sess.old_term_hint')].filter(Boolean).join(' · ');
   return (
     <span className="slead" title={full}>
       {dev && (
@@ -1340,6 +1369,7 @@ function SessionLead({ inst }) {
       )}
       {inst.container && <Container size={12} aria-hidden="true" />}
       <span className="slead-proj ellipsis">{baseName(dir) || dir}</span>
+      {old && <span style={{ flexShrink: 0, opacity: 0.7, marginLeft: 6 }}>{t('sess.old_term')}</span>}
     </span>
   );
 }
@@ -1358,6 +1388,10 @@ export function SessionStage({ activeId }) {
   const ui = useSessionUi();
   const ref = useRef(null);
   const height = useFillHeight(ref, Boolean(activeId));
+  useEffect(() => {
+    setFocusedDevice(activeId ? terminalDevice(activeId) ?? null : null);
+    return () => setFocusedDevice(null);
+  }, [activeId]);
   const ids = activeId && !s.recent.includes(activeId) ? [activeId, ...s.recent] : s.recent;
   useEffect(() => {
     if (!activeId) return;

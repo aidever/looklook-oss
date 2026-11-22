@@ -23,6 +23,9 @@ rm -f "$APP/ttyd"
 cp -RL "$SRC/looklook" "$SRC/looklook-term" "$SRC/fonts" "$SRC/LICENSES" "$APP/"
 # 会话保持程序可能正被后台任务使用：先写临时文件再改名替换，不打断正在运行的任务。
 cp "$SRC/looklook-mux" "$APP/looklook-mux.new" && chmod 0755 "$APP/looklook-mux.new" && mv -f "$APP/looklook-mux.new" "$APP/looklook-mux"
+if [ -f "$SRC/looklook-termd" ]; then
+  cp -L "$SRC/looklook-termd" "$APP/looklook-termd.new" && chmod 0755 "$APP/looklook-termd.new" && mv -f "$APP/looklook-termd.new" "$APP/looklook-termd"
+fi
 # trz / tsz 可能正在运行：删掉再复制（不覆盖运行中的文件）
 rm -rf "$APP/trzsz" && { cp -RL "$SRC/trzsz" "$APP/" 2>/dev/null || true; }
 cp "$SRC/uninstall.sh" "$APP/uninstall.sh" 2>/dev/null || true

@@ -9,6 +9,8 @@ use crate::store::Store;
 
 const KEY: &str = "settings";
 const THEME_REV: u8 = 3;
+/// termd 开关的版本：1 = 默认开启之后存下的。之前的设置里 `termd: false` 多半只是当时的默认值，读的时候开一次（见 `migrated`）。
+const TERMD_REV: u8 = 1;
 /// 终端配色（和 instances.rs 的 xterm_theme、src-ui/shared/termTheme.js 保持一致）
 pub const THEMES: &[&str] = &["tangerine", "lagoon", "sunset", "mint", "agent", "dark", "light"];
 const DEFAULT_THEME: &str = "tangerine";
@@ -42,6 +44,15 @@ pub struct Settings {
     pub default_full_access: bool,
     /// 后台会话这么多天没在界面上打开过就自动停掉（会话留着，点开重新启动；有命令、AI 在跑的不停）。0 = 不自动停
     pub idle_stop_days: u16,
+    /// 新建终端会话用自研的 looklook-termd（默认开启；已有的 tmux 会话继续跑在 tmux 上，关掉后新建的回到 tmux）。
+    /// 没有字段级的 serde 默认：缺这个字段时取 `Settings::default()` 的 true。
+    pub termd: bool,
+    /// 见 `TERMD_REV`。字段自己的 serde 默认是 0（不是 Settings::default 里的值）。
+    #[serde(default)]
+    pub termd_rev: u8,
+    /// 在这台电脑上打开终端会话用哪个终端（native_term.rs 的 id，如 `ghostty`、`wt`）；空 = 看看内置
+    #[serde(default)]
+    pub native_terminal: String,
 }
 
 impl Default for Settings {
@@ -58,6 +69,9 @@ impl Default for Settings {
             attach_days: 7,
             default_full_access: false,
             idle_stop_days: 7,
+            termd: true,
+            termd_rev: TERMD_REV,
+            native_terminal: String::new(),
         }
     }
 }
@@ -109,6 +123,10 @@ impl Settings {
             }
             self.theme_rev = THEME_REV;
         }
+        if self.termd_rev < TERMD_REV {
+            self.termd = true;
+            self.termd_rev = TERMD_REV;
+        }
         self
     }
 
@@ -132,6 +150,7 @@ impl Settings {
             self.theme = DEFAULT_THEME.into();
         }
         self.theme_rev = THEME_REV;
+        self.termd_rev = TERMD_REV;
         self.font_size = self.font_size.clamp(10, 28);
         self.attach_days = self.attach_days.clamp(1, 365);
         self.idle_stop_days = self.idle_stop_days.min(365);
@@ -280,6 +299,13 @@ mod tests {
         assert_eq!(dark1.migrated().theme, "dark");
         let agent2: Settings = serde_json::from_str(r#"{"theme":"agent","theme_rev":2}"#).unwrap();
         assert_eq!(agent2.migrated().theme, "agent", "rev 2 时自己选的 agent 不动");
+        // 默认开启 termd 之前存下的 termd: false：开一次；之后自己关掉的不动
+        let old_off: Settings = serde_json::from_str(r#"{"termd":false}"#).unwrap();
+        assert!(old_off.migrated().termd);
+        let off: Settings = serde_json::from_str(r#"{"termd":false,"termd_rev":1}"#).unwrap();
+        assert!(!off.migrated().termd);
+        let missing: Settings = serde_json::from_str(r#"{}"#).unwrap();
+        assert!(missing.termd);
         let light: Settings = serde_json::from_str(r#"{"theme":"light"}"#).unwrap();
         assert_eq!(light.migrated().theme, "light", "自己选的浅色不动");
         // 之后又自己选回 agent / dark / lagoon 并保存：保留

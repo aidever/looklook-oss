@@ -30,9 +30,14 @@ pub async fn ui(uri: Uri) -> Response {
 
 /// 终端页（`/i/{id}/` 的首页）：看看自己的前端（term.html，src-term/），代替 ttyd 内嵌的页面，同样插入终端字体与辅助脚本。
 /// 构建产物里没有时（没执行过 npm run build）返回 None，仍用 ttyd 的页面。
-pub fn term_page() -> Option<Response> {
+/// `extra`：额外插在前面的标签（termd 会话的启动参数，见 termd_ws::term_boot_tag）。
+pub fn term_page(extra: Option<&str>) -> Option<Response> {
     let f = Ui::get("term.html")?;
-    let html = super::proxy::inject(&String::from_utf8_lossy(&f.data), super::proxy::TERM_TAGS);
+    let tags = match extra {
+        Some(e) => format!("{e}{}", super::proxy::TERM_TAGS),
+        None => super::proxy::TERM_TAGS.to_string(),
+    };
+    let html = super::proxy::inject(&String::from_utf8_lossy(&f.data), &tags);
     Some(([(header::CONTENT_TYPE, "text/html; charset=utf-8"), (header::CACHE_CONTROL, "no-store")], html).into_response())
 }
 
@@ -136,7 +141,10 @@ pub fn denied_page(ip: &str) -> Response {
 /// 输入访问码（局域网 / 白名单访问且启用了访问码时）。
 pub fn code_page(next: &str, error: Option<&str>) -> Response {
     let err = match error {
-        Some("too_many") => "<p class=\"e\">输错次数太多，请 15 分钟后再试。</p>",
+        Some("too_many") => "<p class=\"e\">输错次数太多，请稍后再试。</p>",
+        // 公网直连（docs/09 §4.3）：访问码太短不能用于公网
+        Some("short") => "<p class=\"e\">这台电脑的访问码不到 12 位，不能用于公网打开。请在电脑上的“设置 → 访问控制”里换一个新的访问码。</p>",
+        Some("not_ready") => "<p class=\"e\">这台电脑还没准备好公网打开，请稍后再试。</p>",
         Some(_) => "<p class=\"e\">访问码不对，请再看一下。</p>",
         None => "",
     };

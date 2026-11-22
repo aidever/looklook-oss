@@ -10,6 +10,8 @@
 
 pub mod bridge;
 pub mod frame;
+pub mod mdns;
+pub mod nat;
 pub mod net;
 pub mod outbound;
 pub mod peer;

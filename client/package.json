@@ -7,8 +7,9 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
+    "build:wasm": "bash scripts/build-term-web.sh",
     "check:locales": "node scripts/check-locales.mjs",
-    "test": "node --test src-ui/shared/xfer.test.mjs src-ui/shared/chat.test.mjs src-ui/shared/inputHistory.test.mjs src-ui/shared/chatCopy.test.mjs src-ui/shared/chatShare.test.mjs src-ui/shared/office.test.mjs src-ui/shared/selectAt.test.mjs src-ui/shared/mermaidView.test.mjs src-ui/shared/pet/brain.test.mjs src-ui/shared/pet/events.test.mjs src-ui/shared/project.test.mjs"
+    "test": "node --test src-term/zstd.test.mjs src-term/dom/dom.test.mjs src-ui/shared/xfer.test.mjs src-ui/shared/chat.test.mjs src-ui/shared/inputHistory.test.mjs src-ui/shared/chatCopy.test.mjs src-ui/shared/chatShare.test.mjs src-ui/shared/office.test.mjs src-ui/shared/selectAt.test.mjs src-ui/shared/mermaidView.test.mjs src-ui/shared/pet/brain.test.mjs src-ui/shared/pet/events.test.mjs src-ui/shared/project.test.mjs"
   },
   "dependencies": {
     "@codemirror/commands": "6.11.1",
@@ -26,6 +27,7 @@
     "@xterm/addon-webgl": "0.19.0",
     "@xterm/xterm": "6.0.0",
     "dompurify": "^3.4.17",
+    "fzstd": "0.1.1",
     "i18next": "^25.0.0",
     "lucide-react": "^0.500.0",
     "mammoth": "^1.13.0",

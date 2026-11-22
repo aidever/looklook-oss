@@ -1,0 +1,16 @@
+[package]
+name = "term-web"
+version = "0.1.0"
+edition = "2021"
+description = "Browser side of looklook-term.v1: decodes termd frames, keeps the client screen, and hands rows to the DOM / GPU renderers (wasm32)"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+term-proto = { path = "../term-proto" }
+wasm-bindgen = "=0.2.130"
+
+[dev-dependencies]
+term-core = { path = "../term-core" }
