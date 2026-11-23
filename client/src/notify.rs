@@ -615,7 +615,12 @@ impl Notifier {
     pub(crate) fn info(&self, app: &App, id: &str, brief: &Value, rules: &Rules) -> Option<Owned> {
         let row = app.store.instance(id).ok().flatten()?;
         let en = rules.lang.starts_with("en");
-        let agent = if brief["agent"] == "codex" { "Codex" } else { "Claude" };
+        let agent = match brief["agent"].as_str() {
+            Some("codex") => "Codex",
+            Some("agy") => "Antigravity",
+            Some("dsh") => "DSH",
+            _ => "Claude",
+        };
         let title = brief["title"].as_str().filter(|t| !t.is_empty()).unwrap_or(&row.name).to_string();
         let project = std::path::Path::new(&row.workdir).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| row.workdir.clone());
         let device = crate::settings::Settings::load(&app.store).device_name();

@@ -260,6 +260,8 @@ pub struct View {
     pub claude_profile: Option<String>,
     /// Codex 用哪个配置（codex_profiles.rs）；新建时记下的，没记下时 null
     pub codex_profile: Option<String>,
+    /// Antigravity 用哪个账号（agy_profiles.rs）；新建时记下的，没记下时 null
+    pub agy_profile: Option<String>,
 }
 
 /// 启动选项（不在 SQLite 的 instances 表里，单独存在 kv：`instance_opts.{id}`）。
@@ -350,6 +352,9 @@ pub struct Input {
     /// Codex 用哪个配置（codex_profiles.rs）；不填用当前默认。只在新建时有效
     #[serde(default)]
     pub codex_profile: Option<String>,
+    /// Antigravity 用哪个账号（agy_profiles.rs）；不填用当前默认。只在新建时有效，只管对话模式（终端里的 agy 没法换账号目录）
+    #[serde(default)]
+    pub agy_profile: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -545,6 +550,7 @@ impl Instances {
             fg: None,
             claude_profile: crate::claude_profiles::pinned(&self.store, &row.id),
             codex_profile: crate::codex_profiles::pinned(&self.store, &row.id),
+            agy_profile: crate::agy_profiles::pinned(&self.store, &row.id),
             container: self.container(&row.id),
             running,
             task_alive,
@@ -598,15 +604,7 @@ impl Instances {
         .unwrap_or_default();
         // 每个会话的工具：认出来的；看不到进程的（容器里、没有 tmux）按会话类型
         let tool_of = |v: &View| -> Option<&'static str> {
-            match probes.get(&v.row.id) {
-                Some(f) => Some(f.tool),
-                // stream-json 的 Claude Code 是看看的子进程，不在终端里：终端里只有普通 shell，对话号看对话界面记下的
-                None if self.claude_sdk_mode(&v.row) => Some("claude"),
-                None if v.container.is_some() || !panes.contains_key(&Self::session_name(&v.row.id)) => {
-                    crate::history::AGENTS.iter().chain(["dsh"].iter()).find(|a| **a == v.row.launch).copied()
-                }
-                None => None,
-            }
+            self.resolve_tool(v, probes.get(&v.row.id), panes.contains_key(&Self::session_name(&v.row.id)))
         };
         let mut convs = vec![];
         for agent in crate::history::AGENTS {
@@ -619,16 +617,12 @@ impl Instances {
             .filter(|v| v.container.is_none())
             .filter_map(|v| {
                 let id = v.row.id.as_str();
-                // 工具自己说的最准（终端里 /resume、/clear 换了对话也跟得上），其次对话界面记下的、接着的
-                let conv = probes
-                    .get(id)
-                    .and_then(|f| f.conv.clone())
-                    .or_else(|| crate::chat::binding(&self.store, id).map(|b| b.session_id))
-                    .or_else(|| self.store.get::<String>(&resume_key(id)).ok().flatten())?;
+                let conv = self.resolve_bound(v, probes.get(id))?;
                 Some((id, conv))
             })
             .collect();
         let taken: HashSet<&str> = bound.values().map(String::as_str).collect();
+        let ui_driven = |v: &View| self.agy_acp_mode(&v.row) || self.claude_sdk_mode(&v.row) || self.codex_app_mode(&v.row);
         for v in &live {
             let id = v.row.id.as_str();
             let tool = tool_of(v);
@@ -636,9 +630,9 @@ impl Instances {
             if let Some(t) = tool {
                 out.tools.insert(id.to_string(), t);
             }
-            // 在忙：工具自己说的；普通终端看前台程序是不是 shell
+            // 在忙：工具自己说的；普通终端看前台程序是不是 shell（对话模式的 agy 终端标签只是普通 shell，不拿它的探测结果当忙状态）
             match (tool, probes.get(id)) {
-                (Some(_), Some(f)) => {
+                (Some(_), Some(f)) if !self.agy_acp_mode(&v.row) => {
                     if let Some(b) = f.busy {
                         out.busy.insert(id.to_string(), b);
                     }
@@ -659,9 +653,14 @@ impl Instances {
                 Some(_) if v.container.is_some() => None,
                 Some(t) => match bound.get(id) {
                     Some(c) => convs.iter().find(|x| x.agent == t && &x.id == c),
+                    // 对话模式（ACP / SDK / app-server）没绑定对话前不按文件夹猜，避免错用同目录终端会话的对话
+                    None if ui_driven(v) => None,
                     None => {
-                        // 同一文件夹里同一工具没认出对话的会话只有这一个时，取工具启动之后开始的最新那个对话
-                        let peers = live.iter().filter(|o| tool_of(o) == Some(t) && !bound.contains_key(o.row.id.as_str()) && crate::history::same_dir(&o.row.workdir, &v.row.workdir)).count();
+                        // 同一文件夹里同一工具没认出对话的终端会话只有这一个时，取工具启动之后开始的最新那个对话
+                        let peers = live
+                            .iter()
+                            .filter(|o| !ui_driven(o) && tool_of(o) == Some(t) && !bound.contains_key(o.row.id.as_str()) && crate::history::same_dir(&o.row.workdir, &v.row.workdir))
+                            .count();
                         let since = probes.get(id).map(|f| f.since as i64 * 1000).or_else(|| v.started_at.as_deref().and_then(crate::util::parse_time_ms)).unwrap_or(i64::MAX);
                         let started = |c: &crate::history::Conv| c.started_at.as_deref().and_then(crate::util::parse_time_ms);
                         (peers == 1)
@@ -687,13 +686,49 @@ impl Instances {
                     crate::usage_stats::note_conv(&self.store, &c.id, &key);
                 }
             }
-            // 普通终端在提示符时 shell 的标题不算（clean_pane_title 已去掉常见的）
-            let title = conv.map(|c| c.title.clone()).filter(|t| !t.trim().is_empty()).or_else(|| pane.and_then(|p| p.title.clone()).filter(|_| tool.is_some()));
+            // 普通终端在提示符时 shell 的标题不算（clean_pane_title 已去掉常见的）；对话模式 agy 的终端标签是普通 shell，不用它的标题
+            let pane_title = if self.agy_acp_mode(&v.row) { None } else { pane.and_then(|p| p.title.clone()).filter(|_| tool.is_some()) };
+            let title = conv.map(|c| c.title.clone()).filter(|t| !t.trim().is_empty()).or(pane_title);
             if let Some(t) = title {
                 out.titles.insert(id.to_string(), clip_title(&t));
             }
         }
         out
+    }
+
+    /// 判断会话对应的 AI 工具：对话模式的 agy（ACP）始终是 `"agy"`；
+    /// 终端里没认出进程时，stream-json 的 Claude Code、app-server 的 Codex 也归回对应工具，容器 / 无面板按启动类型。
+    fn resolve_tool(&self, v: &View, probed: Option<&crate::session_probe::Found>, has_pane: bool) -> Option<&'static str> {
+        if self.agy_acp_mode(&v.row) {
+            return Some("agy");
+        }
+        match probed {
+            Some(f) => Some(f.tool),
+            // 对话模式的 Claude Code（stream-json）、Codex（app-server）是看看的子进程，不在终端里：终端里只有普通 shell，对话号看对话界面记下的
+            None if self.claude_sdk_mode(&v.row) => Some("claude"),
+            None if self.codex_app_mode(&v.row) => Some("codex"),
+            None if v.container.is_some() || !has_pane => {
+                crate::history::AGENTS.iter().chain(["dsh"].iter()).find(|a| **a == v.row.launch).copied()
+            }
+            None => None,
+        }
+    }
+
+    /// 确定会话绑定的对话号：
+    /// - 对话模式（`agy_acp_mode` / `claude_sdk_mode` / `codex_app_mode`）：优先用对话界面绑定的会话号（不被壳终端里手动跑的其他工具干扰）；
+    /// - 终端会话（`!v.chat_ui` 等）：工具自己说的最准（终端里 `/resume`、`/clear` 换了对话也跟得上），其次对话界面记下的、接着的。
+    fn resolve_bound(&self, v: &View, probed: Option<&crate::session_probe::Found>) -> Option<String> {
+        let id = v.row.id.as_str();
+        if self.agy_acp_mode(&v.row) || (v.chat_ui && (self.claude_sdk_mode(&v.row) || self.codex_app_mode(&v.row))) {
+            crate::chat::binding(&self.store, id)
+                .map(|b| b.session_id)
+                .or_else(|| self.store.get::<String>(&resume_key(id)).ok().flatten())
+        } else {
+            probed
+                .and_then(|f| f.conv.clone())
+                .or_else(|| crate::chat::binding(&self.store, id).map(|b| b.session_id))
+                .or_else(|| self.store.get::<String>(&resume_key(id)).ok().flatten())
+        }
     }
 
     /// Claude Code 的配置目录：本机默认的和每个另外登录的官方账号的（claude_profiles.rs 的 account_dir）
@@ -905,6 +940,12 @@ impl Instances {
                 return Err(LocalError::invalid("codex_profile", "not_found"));
             }
         }
+        let agy_profile = input.agy_profile.filter(|s| !s.is_empty());
+        if let Some(p) = &agy_profile {
+            if crate::agy_profiles::get(&self.store, p).is_none() {
+                return Err(LocalError::invalid("agy_profile", "not_found"));
+            }
+        }
         let mut opts = Opts {
             full_access: input.full_access.unwrap_or(false),
             root_confirmed: input.root_confirmed.unwrap_or(false),
@@ -957,6 +998,9 @@ impl Instances {
         }
         if row.launch == "codex" && container.is_none() {
             crate::codex_profiles::pin(&self.store, &row.id, codex_profile.as_deref())?;
+        }
+        if row.launch == "agy" && container.is_none() {
+            crate::agy_profiles::pin(&self.store, &row.id, agy_profile.as_deref())?;
         }
         if let Some(r) = input.resume {
             if !r.fork {
@@ -1119,6 +1163,7 @@ impl Instances {
         let _ = self.store.remove(&crate::run_actions::mark_key(id));
         crate::claude_profiles::unpin(&self.store, id);
         crate::codex_profiles::unpin(&self.store, id);
+        crate::agy_profiles::unpin(&self.store, id);
         lock(&self.health).remove(id);
         lock(&self.first_prompt).remove(id);
         lock(&self.first_resume).remove(id);
@@ -3073,5 +3118,64 @@ mod tests {
         if let Some(h) = dirs::home_dir() {
             assert_eq!(expand_home("~/x"), format!("{}/x", h.display()));
         }
+    }
+
+    #[test]
+    fn probe_distinguishes_agy_ui_and_terminal_sessions() {
+        let home = tempfile::tempdir().unwrap();
+        let paths = Paths::discover(Some(home.path().to_path_buf())).unwrap();
+        let store = Arc::new(Store::memory().unwrap());
+        let inst = Instances::new(store.clone(), paths);
+
+        // 1. agy 对话界面会话（agy_acp_mode）：终端里只是 shell，没有探测到进程时 tool 仍为 agy，bound 走 chat::binding
+        let agy_ui_row = InstanceRow { id: "agyui001".into(), port: 41101, launch: "agy".into(), ..row() };
+        store.insert_instance(&agy_ui_row).unwrap();
+        store.set(&opts_key(&agy_ui_row.id), &Opts { chat_ui: true, termd: true, ..Opts::default() }).unwrap();
+        store
+            .set(
+                &format!("chat.{}", agy_ui_row.id),
+                &crate::chat::Binding { session_id: "ui-conv-1".into(), transcript_path: PathBuf::from("agy/ui-conv-1") },
+            )
+            .unwrap();
+        let agy_ui_view = inst.view(agy_ui_row.clone(), None);
+        assert!(inst.agy_acp_mode(&agy_ui_row));
+        assert_eq!(inst.resolve_tool(&agy_ui_view, None, true), Some("agy"));
+        assert_eq!(inst.resolve_bound(&agy_ui_view, None).as_deref(), Some("ui-conv-1"));
+
+        // 即使在 agy UI 会话的 shell 标签里手动跑了别的 agy 或 claude，tool 仍是 agy，bound 仍以 chat::binding 为准
+        let manual_agy = crate::session_probe::Found { tool: "agy", since: 100, conv: Some("shell-conv-9".into()), busy: Some(true), account: None };
+        let manual_claude = crate::session_probe::Found { tool: "claude", since: 100, conv: Some("claude-9".into()), busy: Some(true), account: None };
+        assert_eq!(inst.resolve_tool(&agy_ui_view, Some(&manual_claude), true), Some("agy"));
+        assert_eq!(inst.resolve_bound(&agy_ui_view, Some(&manual_agy)).as_deref(), Some("ui-conv-1"));
+
+        // 2. agy 终端会话（!chat_ui）：bound 优先取进程探测到的对话号
+        let agy_term_row = InstanceRow { id: "agytrm01".into(), port: 41102, launch: "agy".into(), ..row() };
+        store.insert_instance(&agy_term_row).unwrap();
+        store.set(&opts_key(&agy_term_row.id), &Opts { chat_ui: false, termd: true, ..Opts::default() }).unwrap();
+        store
+            .set(
+                &format!("chat.{}", agy_term_row.id),
+                &crate::chat::Binding { session_id: "old-binding".into(), transcript_path: PathBuf::from("agy/old-binding") },
+            )
+            .unwrap();
+        let agy_term_view = inst.view(agy_term_row.clone(), None);
+        assert!(!inst.agy_acp_mode(&agy_term_row));
+        assert_eq!(inst.resolve_tool(&agy_term_view, Some(&manual_agy), true), Some("agy"));
+        assert_eq!(inst.resolve_bound(&agy_term_view, Some(&manual_agy)).as_deref(), Some("shell-conv-9"));
+
+        // 3. codex app-server 模式与 claude sdk 模式：终端里没探测到进程时也认出对应工具
+        let codex_ui_row = InstanceRow { id: "cdxui001".into(), port: 41103, launch: "codex".into(), ..row() };
+        store.insert_instance(&codex_ui_row).unwrap();
+        store.set(&opts_key(&codex_ui_row.id), &Opts { chat_ui: true, termd: true, ..Opts::default() }).unwrap();
+        let codex_ui_view = inst.view(codex_ui_row.clone(), None);
+        assert!(inst.codex_app_mode(&codex_ui_row));
+        assert_eq!(inst.resolve_tool(&codex_ui_view, None, true), Some("codex"));
+
+        let claude_ui_row = InstanceRow { id: "cldui001".into(), port: 41104, launch: "claude".into(), ..row() };
+        store.insert_instance(&claude_ui_row).unwrap();
+        store.set(&opts_key(&claude_ui_row.id), &Opts { chat_ui: true, sdk: true, termd: true, ..Opts::default() }).unwrap();
+        let claude_ui_view = inst.view(claude_ui_row.clone(), None);
+        assert!(inst.claude_sdk_mode(&claude_ui_row));
+        assert_eq!(inst.resolve_tool(&claude_ui_view, None, true), Some("claude"));
     }
 }

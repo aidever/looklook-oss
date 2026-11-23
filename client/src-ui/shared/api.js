@@ -197,7 +197,9 @@ export async function fetchDevices() {
       .map((x) => {
         const terminals = Array.isArray(x.terminals) ? x.terminals.filter((t) => typeof t === 'string') : [];
         for (const id of terminals) routing.owners.set(id, x.id);
-        return { id: x.id, name: x.name || '', os: x.os || '', online: x.online !== false, terminals };
+        // direct：公网 HTTPS 直连地址（连不上时在提示里写出来）
+        const direct = typeof x.direct?.url === 'string' ? { url: x.direct.url } : undefined;
+        return { id: x.id, name: x.name || '', os: x.os || '', online: x.online !== false, terminals, ...(direct ? { direct } : {}) };
       });
     // local_only：本机 App 的“只看本机”（远程打开时没有这个字段）
     return { items, default: d.default ?? null, max: d.max ?? null, localOnly: typeof d.local_only === 'boolean' ? d.local_only : null,

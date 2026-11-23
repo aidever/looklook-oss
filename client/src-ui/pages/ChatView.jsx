@@ -92,7 +92,9 @@ import {
   CODEX_COMMANDS,
   contextGauge,
   DSH_COMMANDS,
+  AGY_ACTIONS,
   AGY_COMMANDS,
+  AGY_ONLY,
   CODEX_ONLY,
   COMMANDS,
   SDK_UNAVAILABLE,
@@ -100,6 +102,7 @@ import {
   effortShown,
   effortsFor,
   EMPTY,
+  groupModelOptions,
   CODEX_DISPATCH_MODES,
   CODEX_MODE_CHOICES,
   MODE_CHOICES,
@@ -2250,7 +2253,7 @@ function PendingCard({ id, pending, active }) {
           <Button busy={spin('allow')} disabled={busy} onClick={() => answer('allow')}>
             {pending.guard ? t('chat.guard_allow') : t('chat.allow')} {!pending.guard && <kbd className="chat-kbd">↵</kbd>}
           </Button>
-          {caps.allow_session !== false && !pending.guard && (
+          {(caps.allow_session !== false || (Array.isArray(pending.suggestions) && pending.suggestions.some((o) => o.kind === 'allow_always'))) && !pending.guard && (
             <Button variant="secondary" busy={spin('allow_session')} disabled={busy} onClick={() => answer('allow_session')} title={t('chat.allow_session_hint')}>
               {t('chat.allow_session')}
             </Button>
@@ -2701,12 +2704,13 @@ function AccountFail({ id, error }) {
 /**
  * /login、/logout：会话所在那台电脑的账号管理，不离开对话页。跟设置页的“账号”是同一套（登录、重新登录、添加、删除），
  * 上面多一行：这段对话在用哪个、换一个接着聊（Claude Code）；Codex 的 ChatGPT / API Key 登录在这里直接做（app-server 的
- * account/login，已经登录时就是换一个登录）。
+ * account/login，已经登录时就是换一个登录）；Antigravity（agy）显示当前账号并在支持多账号时列出账号管理。
  */
 function AccountsDialog({ id, agent, onClose }) {
   const { t } = useT();
   const client = deviceApi(terminalDevice(id));
   const codex = agent === 'codex';
+  const agy = agent === 'agy';
   const [setup, , reload] = useLoad(() => (codex ? api.get(`/instances/${id}/chat/setup`).catch(() => ({})) : Promise.resolve(null)), [id, codex]);
   const toast = useToast();
   // 设备码登录等着时 CodexLogin 每 3 秒叫一次：登录好了就关掉
@@ -2718,11 +2722,11 @@ function AccountsDialog({ id, agent, onClose }) {
     } else reload();
   }, [id, setup?.login_required]);
   return (
-    <Modal open wide className={`chat-acct-modal${codex ? ' chat-acct-codex' : ''}`} onClose={onClose} title={t(codex ? 'chat.accounts_title_codex' : 'chat.accounts_title')}>
+    <Modal open wide className={`chat-acct-modal${codex ? ' chat-acct-codex' : ''}`} onClose={onClose} title={t(codex ? 'chat.accounts_title_codex' : agy ? 'chat.accounts_title_agy' : 'chat.accounts_title')}>
       {codex ? (
         setup ? <CodexLogin id={id} onDone={codexDone} again={!setup.login_required} /> : <Skeleton height={60} />
       ) : (
-        <SessionAccount id={id} client={client} />
+        <SessionAccount id={id} client={client} agent={agy ? 'agy' : 'claude'} />
       )}
       <ProfilesApi value={client}>
         <ProfilesList agent={agent} />
@@ -2754,56 +2758,60 @@ function SkillsDialog({ id, agent, onClose }) {
 }
 
 /** 账号弹窗顶上：这段对话在用的 Claude Code 账号，旁边“换个账号”（换了接着同一段对话） */
-function SessionAccount({ id, client }) {
+function SessionAccount({ id, client, agent = 'claude' }) {
   const { t } = useT();
-  const [data] = useLoad(() => Promise.all([client.get('/claude-profiles'), api.get(`/instances/${id}`)]).catch(() => null), [id]);
+  const agy = agent === 'agy';
+  const [data] = useLoad(() => Promise.all([client.get(agy ? '/agy-profiles' : '/claude-profiles'), api.get(`/instances/${id}`)]).catch(() => null), [id, agy]);
   if (!data) return null;
   const [{ profiles, default: def }, inst] = data;
   if (inst.container) return <p className="chat-note">{t('chat.accounts_container')}</p>;
-  const cur = profiles.find((p) => p.id === (inst.claude_profile ?? def));
+  const cur = profiles.find((p) => p.id === ((agy ? inst.agy_profile : inst.claude_profile) ?? def));
   return (
     <div className="chat-acct-cur">
       <span className="grow">
         <span className="chat-note">{t('chat.accounts_using')}</span>{' '}
         {cur && (
           <b>
-            <KindIcon p={cur} /> {profileName(t, cur)}
+            <KindIcon p={cur} /> {profileName(t, cur, agent)}
           </b>
         )}
       </span>
-      <SwitchProfile id={id} goOn={false} />
+      <SwitchProfile id={id} agent={agent} goOn={false} />
     </div>
   );
 }
 
-/** “换个账号继续”：这台电脑上另外的 Claude Code 账号 / 接口，选了就用它接着同一段对话。
+/** “换个账号继续”：这台电脑上另外的账号 / 接口，选了就用它接着同一段对话。
  *  `goOn`（额度用完、账号用不了时）：起来后自动发 continue。`manage`：没有别的账号时也给一个去添加账号的按钮 */
-function SwitchProfile({ id, manage, goOn = true }) {
+function SwitchProfile({ id, agent = 'claude', manage, goOn = true }) {
   const { t } = useT();
   const { navigate } = useRouter();
   const toast = useToast();
   const [busy, setBusy] = useState(false);
   const devices = useDevices();
-  // 账号是会话所在那台电脑的：多台电脑时 /claude-profiles 默认发给选中的电脑，要先找到会话在哪台、再问它
+  const base = agent === 'agy' ? '/agy-profiles' : '/claude-profiles';
+  const anchor = agent === 'agy' ? 'agy-accounts' : 'claude-accounts';
+  const nameOf = (p) => profileName(t, p, agent);
+  // 账号是会话所在那台电脑的：多台电脑时默认发给选中的电脑，要先找到会话在哪台、再问它
   const [data] = useLoad(
     () =>
       api
         .get(`/instances/${id}`)
-        .then(async (inst) => [await deviceApi(terminalDevice(id)).get('/claude-profiles'), inst])
+        .then(async (inst) => [await deviceApi(terminalDevice(id)).get(base), inst])
         .catch(() => null),
-    [id],
+    [id, base],
   );
   // 去“账号”页之前先切到会话那台电脑，不然管的是另一台的账号
   const manageAccounts = () => {
     const dev = terminalDevice(id);
     if (dev && devices.multi && dev !== devices.selected) devices.select(dev);
-    navigate('/ai#claude-accounts');
+    navigate(`/ai#${anchor}`);
   };
   if (!data) return null;
-  const [{ profiles, default: def }, inst] = data;
+  const [{ profiles = [], default: def }, inst] = data;
   // 容器里的会话不用看看的账号
   if (inst.container) return null;
-  const cur = inst.claude_profile ?? def;
+  const cur = (agent === 'agy' ? inst.agy_profile : inst.claude_profile) ?? def;
   const others = profiles.filter((p) => p.id !== cur);
   if (!others.length) {
     return manage ? (
@@ -2816,7 +2824,7 @@ function SwitchProfile({ id, manage, goOn = true }) {
     setBusy(true);
     try {
       await api.post(`/instances/${id}/chat/switch-profile`, { profile: p.id, continue: goOn });
-      toast(t(goOn ? 'chat.limit.switched' : 'chat.limit.switched_plain', { name: profileName(t, p) }), 'ok');
+      toast(t(goOn ? 'chat.limit.switched' : 'chat.limit.switched_plain', { name: nameOf(p) }), 'ok');
     } catch (e) {
       toast(errorText(t, e), 'error');
     } finally {
@@ -2833,7 +2841,7 @@ function SwitchProfile({ id, manage, goOn = true }) {
       items={[
         ...others.map((p) => ({
           icon: (x) => <KindIcon p={p} {...x} />,
-          label: profileName(t, p),
+          label: nameOf(p),
           hint: p.kind === 'api' ? p.base_url : p.id === def ? t('cprof.default') : undefined,
           onClick: () => pick(p),
         })),
@@ -2985,9 +2993,9 @@ function Popover({ onClose, className = '', children, label }) {
   );
 }
 
-const MODEL_RE = /^[A-Za-z0-9._\-[\]]{1,64}$/;
+const MODEL_RE = /^[A-Za-z0-9._\-:[\]]{1,80}$/;
 
-/** 模型菜单：Claude Code 的选项（和 /model 一样）、服务商的其他模型、自定义模型 ID，下面是这个模型的思考强度。 */
+/** 模型菜单：Claude Code / Codex / Antigravity 的选项（支持按模型组展示）、服务商的其他模型、自定义模型 ID，下面是这个模型的思考强度。 */
 function ModelMenu({ id, status, models, view, onClose }) {
   const { t } = useT();
   const toast = useToast();
@@ -3027,13 +3035,18 @@ function ModelMenu({ id, status, models, view, onClose }) {
   const row = (o) => (
     <button key={o.value} type="button" className="chat-mi" role="menuitemradio" aria-checked={(picked?.kind === 'model' ? picked.value : view.checked) === o.value} disabled={!idle || busy != null} onClick={() => set('model', o.value)}>
       <span className="chat-mi-text">
-        <span className={o.section === 'provider' ? 'mono' : ''}>{o.value === 'default' ? t('chat.model_default') : o.label}</span>
+        <span className="chat-mi-label">
+          <span className={o.section === 'provider' ? 'mono' : ''}>{o.value === 'default' ? t('chat.model_default') : o.label}</span>
+          {o.is_group && <span className="badge chat-mi-group-badge">{t('chat.model_group_badge')}</span>}
+        </span>
         {(o.value === 'default' ? o.description && t('chat.model_default_is', { name: o.description }) : o.description) && <small>{o.value === 'default' ? t('chat.model_default_is', { name: o.description }) : o.description}</small>}
       </span>
       {slow && busy === `model:${o.value}` ? <LoaderCircle size={15} className="spin" /> : <Check size={15} className="chat-mi-check" aria-hidden="true" />}
     </button>
   );
   const main = options.filter((o) => o.section === 'main');
+  const mainGroups = groupModelOptions(main);
+  const hasGroups = mainGroups.some((g) => g.groupName);
   const older = options.filter((o) => o.section === 'more');
   const provider = options.filter((o) => o.section === 'provider');
   const olderOpen = more || older.some((o) => o.value === view.checked);
@@ -3044,7 +3057,19 @@ function ModelMenu({ id, status, models, view, onClose }) {
         {models?.provider?.name && <span>{models.provider.name}</span>}
       </div>
       {!models && <LoaderCircle size={16} className="spin chat-pop-wait" />}
-      {main.map(row)}
+      {hasGroups
+        ? mainGroups.map((g, i) => (
+            <div key={g.group ?? g.groupName ?? i} className="chat-pop-group">
+              {i > 0 && <div className="chat-pop-sep" />}
+              {g.groupName && (
+                <div className="chat-pop-h chat-pop-group-h">
+                  <span>{g.groupName}</span>
+                </div>
+              )}
+              {g.options.map(row)}
+            </div>
+          ))
+        : main.map(row)}
       {older.length > 0 &&
         (olderOpen ? (
           older.map(row)
@@ -3938,9 +3963,9 @@ function Composer({ id, active, status, phase, touch, offline, models, usage, it
     else if (action === 'history') setMenu('resume');
     else if (action === 'worktree') setMenu('worktree');
     else if (action === 'mode') setMenu('mode');
-    // /status：stream-json 的 Claude 和 Codex 有自己的会话信息；老的终端模式看用量栏
+    // /status：stream-json 的 Claude、Codex 和 Antigravity 有自己的会话信息；老的终端模式看用量栏
     else if (action === 'status') {
-      if (agentId === 'codex' || (agentId === 'claude' && caps?.sdk)) setDialog('status');
+      if (agentId === 'codex' || agentId === 'agy' || (agentId === 'claude' && caps?.sdk)) setDialog('status');
       else onAction('usage');
     } else if (action === 'feedback') setDialog('feedback');
     else if (action === 'login') setDialog('accounts');
@@ -4094,19 +4119,37 @@ function Composer({ id, active, status, phase, touch, offline, models, usage, it
     if (!wantSlash) return [];
     const q = slashWord.toLowerCase();
     const builtin = COMMANDS.filter(([name]) =>
-      agentId === 'codex' ? CODEX_COMMANDS.includes(name) : agentId === 'dsh' ? DSH_COMMANDS.includes(name) : agentId === 'agy' ? AGY_COMMANDS.includes(name) : !CODEX_ONLY.includes(name) && !(caps?.sdk && SDK_UNAVAILABLE.includes(name)),
+      agentId === 'codex'
+        ? CODEX_COMMANDS.includes(name)
+        : agentId === 'dsh'
+          ? DSH_COMMANDS.includes(name)
+          : agentId === 'agy'
+            ? AGY_COMMANDS.includes(name)
+            : !CODEX_ONLY.includes(name) && !AGY_ONLY.includes(name) && !(caps?.sdk && SDK_UNAVAILABLE.includes(name)),
     ).map(([name, action]) => {
-      const codex = agentId === 'codex' ? CODEX_ACTIONS[name] : null;
-      // Codex 里意思不一样的有自己的说明（codex_ 开头），没有的用通用的
+      const override = agentId === 'codex' ? CODEX_ACTIONS[name] : agentId === 'agy' ? AGY_ACTIONS[name] : null;
+      // Codex / agy 里意思不一样的有自己的说明（codex_ / agy_ 开头），没有的用通用的
       const plain = t(`chat.cmd.${name.slice(1)}`);
-      return { name, action: codex ?? action, description: agentId === 'codex' ? t(`chat.cmd.codex_${name.slice(1)}`, { defaultValue: plain }) : plain };
+      const description =
+        agentId === 'codex'
+          ? t(`chat.cmd.codex_${name.slice(1)}`, { defaultValue: plain })
+          : agentId === 'agy'
+            ? t(`chat.cmd.agy_${name.slice(1)}`, { defaultValue: plain })
+            : plain;
+      return { name, action: override ?? action, description };
     });
-    const names = new Set([...builtin.map((c) => c.name), ...TERMINAL_ONLY]);
-    const mine = (custom ?? []).filter((c) => c.name.startsWith('/') && !names.has(c.name));
+    const seen = new Set([...builtin.map((c) => c.name.toLowerCase()), ...TERMINAL_ONLY]);
+    const mine = [];
+    for (const c of custom ?? []) {
+      const key = String(c?.name ?? '').toLowerCase();
+      if (!key.startsWith('/') || seen.has(key)) continue;
+      seen.add(key);
+      mine.push(c);
+    }
     const all = [...builtin, ...mine];
     const hit = all.filter((c) => c.name.toLowerCase().startsWith(q));
     return (hit.length ? hit : all.filter((c) => c.name.toLowerCase().includes(q.slice(1)))).slice(0, 40);
-  }, [wantSlash, slashWord, custom, caps?.sdk]);
+  }, [wantSlash, slashWord, custom, caps?.sdk, agentId, t]);
   // 把光标放到 at，并记下来（程序改了输入框的字以后）：在这次渲染完、下一个按键之前放好，
   // 不用 requestAnimationFrame——选完马上接着打字时，晚到的光标会把刚打的字挤到后面去
   const pendingCaret = useRef(null);
@@ -4332,10 +4375,10 @@ function Composer({ id, active, status, phase, touch, offline, models, usage, it
       {menu === 'review' && <ReviewMenu id={id} onClose={() => setMenu(null)} />}
       {dialog === 'status' && <StatusDialog id={id} onClose={() => setDialog(null)} />}
       {dialog === 'skills' && <SkillsDialog id={id} agent={agentId} onClose={() => setDialog(null)} />}
-      {dialog === 'accounts' && <AccountsDialog id={id} agent={agentId === 'codex' ? 'codex' : 'claude'} onClose={() => setDialog(null)} />}
+      {dialog === 'accounts' && <AccountsDialog id={id} agent={agentId === 'codex' ? 'codex' : agentId === 'agy' ? 'agy' : 'claude'} onClose={() => setDialog(null)} />}
       {dialog === 'feedback' && <FeedbackDialog id={id} agent={agentId === 'codex' ? 'Codex' : 'Claude Code'} onClose={() => setDialog(null)} />}
       {(menu === 'new' || menu === 'worktree') && <WorktreeMenu id={id} status={status} kind={menu === 'new' ? 'new' : 'menu'} onClose={() => setMenu(null)} />}
-      {/* 运行中发的、还在 Claude Code 队列里的消息：这一步做完会并进对话 */}
+      {/* 运行中发的、还在队列里的消息：这一步做完会并进对话；agy 支持撤回放回输入框 */}
       {status?.queued?.length > 0 && (
         <div className="chat-queued" role="status">
           <span className="chat-queued-head">
@@ -4355,6 +4398,13 @@ function Composer({ id, active, status, phase, touch, offline, models, usage, it
               <div key={n} className="chat-queued-text chat-queued-evt">
                 <AssistantEvent text={q} compact />
               </div>
+            ) : agentId === 'agy' ? (
+              <p key={n} className="chat-queued-text chat-later-row">
+                <span className="grow">{q || <ImageIcon size={14} aria-label={t('chat.images', { n: 1 })} />}</span>
+                <button type="button" className="btn btn-plain btn-icon btn-sm" onClick={() => takeLater(n)} aria-label={t('chat.later_take')} title={t('chat.later_take')}>
+                  <Undo2 size={14} />
+                </button>
+              </p>
             ) : (
               <p key={n} className="chat-queued-text">
                 {q || <ImageIcon size={14} aria-label={t('chat.images', { n: 1 })} />}
@@ -5072,8 +5122,10 @@ function AgentStrip({ id, items, live, bg, onOpen }) {
   const { id: agent } = useContext(AgentCtx);
   const fromItems = useMemo(() => conversationAgents(items, live).filter((a) => a.state === 'running'), [items, live]);
   const claude = agent === 'claude';
-  const { data } = usePoll(`/instances/${id}/chat/tasks`, { enabled: claude && (bg.subagent > 0 || fromItems.length > 0), every: 3000 });
-  const running = claude ? (data?.agents ?? []).filter((a) => a.state === 'running') : fromItems;
+  const polling = claude && (bg.subagent > 0 || fromItems.length > 0);
+  const { data } = usePoll(`/instances/${id}/chat/tasks`, { enabled: polling, every: 3000 });
+  // 不轮询了（状态栏没有子代理、条目里也没有在跑的）就别再用最后一次的快照，否则做完了还显示“运行中”
+  const running = claude ? (polling ? data?.agents ?? [] : []).filter((a) => a.state === 'running') : fromItems;
   // 服务端还没列出来（刚派出去）时先按对话条目
   const list = running.length || !claude ? running : fromItems;
   if (!list.length) return null;
@@ -5450,7 +5502,8 @@ function UsageTab({ id, status, onCompact }) {
   const cxp = agentId === 'codex' && data.compact?.at ? data.compact : null;
   const lim = data.limits;
   const stale = !!(data.version && data.installed && data.installed !== data.version && !versionAtLeast(data.version, String(data.installed).split('.').map((x) => parseInt(x, 10))));
-  const swaps = agentId === 'codex' || !!caps?.sdk;
+  const swaps = agentId === 'codex' || agentId === 'agy' || !!caps?.sdk;
+  const hasLimits = Boolean(lim && (lim.five_hour || lim.seven_day || lim.groups?.length > 0));
   return (
     <>
       {g.total ? (
@@ -5508,11 +5561,17 @@ function UsageTab({ id, status, onCompact }) {
           </>
         )}
       </dl>
-      {/* Claude：订阅账号（data.account）；Codex：登录的账号（limits.account，ChatGPT 登录才有邮箱） */}
-      {(data.account?.email || lim?.account) && (
+      {/* Claude / Antigravity：订阅账号（data.account）；Codex：登录的账号（limits.account，ChatGPT 登录才有邮箱） */}
+      {(data.account?.email || data.account?.name || lim?.account) && (
         <dl className="chat-kv">
           <dt>{t('chat.usage_account')}</dt>
-          <dd className="chat-account">{data.account?.email || lim?.account?.email ? <MaskedEmail email={data.account?.email || lim.account.email} show={showAcct} setShow={setShowAcct} /> : lim.account.type ?? '—'}</dd>
+          <dd className="chat-account">
+            {data.account?.email || lim?.account?.email ? (
+              <MaskedEmail email={data.account?.email || lim.account.email} show={showAcct} setShow={setShowAcct} />
+            ) : (
+              data.account?.name ?? lim?.account?.name ?? lim?.account?.type ?? '—'
+            )}
+          </dd>
           {data.account?.org && (
             <>
               <dt>{t('chat.usage_org')}</dt>
@@ -5521,27 +5580,37 @@ function UsageTab({ id, status, onCompact }) {
               </dd>
             </>
           )}
-          {(lim?.account?.plan || lim?.plan) && (
+          {(data.account?.plan || lim?.account?.plan || lim?.plan) && (
             <>
               <dt>{t('chat.usage_plan')}</dt>
-              <dd>{lim?.account?.plan || lim?.plan}</dd>
+              <dd>{data.account?.plan || lim?.account?.plan || lim?.plan}</dd>
             </>
           )}
         </dl>
       )}
       {/* 随时能换：订阅到期这类情况不一定报成额度用完、账号出错（见 AccountFail） */}
-      {agentId === 'claude' && status?.phase === 'idle' && (
+      {(agentId === 'claude' || (agentId === 'agy' && (data.account || lim?.account))) && status?.phase === 'idle' && (
         <div className="chat-acts">
           {/* 在等额度重置时换号：换完接着跑（服务端也会这样判断） */}
-          <SwitchProfile id={id} goOn={!!status?.limit} />
+          <SwitchProfile id={id} agent={agentId} goOn={!!status?.limit} />
         </div>
       )}
       {lim?.five_hour && <Meter label={t('chat.usage_5h')} value={lim.five_hour.used} sub={resetText(t, lim.five_hour.resets_at)} />}
       {lim?.seven_day && <Meter label={t('chat.usage_7d')} value={lim.seven_day.used} sub={resetText(t, lim.seven_day.resets_at)} />}
+      {Array.isArray(lim?.groups) &&
+        lim.groups.map((grp) => (
+          <Meter key={grp.id ?? grp.name} label={grp.name} value={grp.used} sub={resetText(t, grp.resets_at)} />
+        ))}
       <ExtraUsage lim={lim} />
       {lim?.reached && <p className="chat-note chat-warn">{t('chat.usage_reached')}</p>}
-      {lim && (lim.five_hour || lim.seven_day) && <p className="chat-note">{lim.provider ? t('chat.usage_limits_note_provider', { provider: lim.provider }) : t(lim.account ? 'chat.usage_limits_note_codex' : lim.live ? 'chat.usage_limits_note_live' : 'chat.usage_limits_note')}</p>}
-      {!lim?.live && lim?.fetched_at > 0 && <p className="chat-note">{t(lim.five_hour || lim.seven_day ? 'chat.usage_fetched' : 'chat.usage_stale', { ago: spanText(t, Date.now() - lim.fetched_at) })}</p>}
+      {hasLimits && (
+        <p className="chat-note">
+          {lim.provider
+            ? t('chat.usage_limits_note_provider', { provider: lim.provider })
+            : t(agentId === 'agy' ? 'chat.usage_limits_note_agy' : lim.account ? 'chat.usage_limits_note_codex' : lim.live ? 'chat.usage_limits_note_live' : 'chat.usage_limits_note')}
+        </p>
+      )}
+      {!lim?.live && lim?.fetched_at > 0 && <p className="chat-note">{t(hasLimits ? 'chat.usage_fetched' : 'chat.usage_stale', { ago: spanText(t, Date.now() - lim.fetched_at) })}</p>}
       <Button variant="secondary" onClick={onCompact} disabled={status?.phase !== 'idle' || !g.used}>
         {t('chat.usage_compact')}
       </Button>
@@ -5909,8 +5978,161 @@ function ConfigTab({ id }) {
   );
 }
 
+/** Antigravity（agy）的“设置”栏：MCP 服务器（支持启用/停用）、插件、代理、设置与权限摘要 */
+function AgyConfigTab({ id }) {
+  const { t } = useT();
+  const toast = useToast();
+  const { open: openFile } = useContext(PreviewCtx);
+  const [rev, setRev] = useState(0);
+  const { data, error } = usePoll(`/instances/${id}/chat/config`, { deps: [rev] });
+  const [busy, setBusy] = useState(null);
+  if (!data) return error ? <p className="chat-note">{errorText(t, error)}</p> : <LoaderCircle size={16} className="spin" />;
+  const mcp = data.mcp ?? [];
+  const agents = data.agents ?? [];
+  const settings = data.settings ?? {};
+  const hooks = Array.isArray(settings.hooks) ? settings.hooks : [];
+  const perms = settings.permissions && typeof settings.permissions === 'object' ? settings.permissions : null;
+  const sandbox = settings.sandbox;
+  const hasSettings = Boolean(perms || sandbox != null || hooks.length > 0);
+  const toggleMcp = async (m) => {
+    setBusy(`mcp:${m.name}`);
+    try {
+      await api.post(`/instances/${id}/chat/config/mcp`, { name: m.name, op: 'toggle', enabled: !!m.disabled });
+      setRev((r) => r + 1);
+    } catch (e) {
+      toast(errorText(t, e), 'error');
+    } finally {
+      setBusy(null);
+    }
+  };
+  return (
+    <>
+      <h4 className="chat-side-title">
+        <Plug size={15} aria-hidden="true" /> {t('chat.config_mcp')}
+        <button type="button" className="chat-more" onClick={() => setRev((r) => r + 1)}>
+          {t('chat.mcp_refresh')}
+        </button>
+      </h4>
+      {mcp.length === 0 ? (
+        <p className="chat-note">{t('chat.config_mcp_empty')}</p>
+      ) : (
+        <ul className="chat-rules">
+          {mcp.map((m) => (
+            <li key={m.name} data-off={m.disabled ? '' : undefined} data-mcp={m.disabled ? 'disabled' : 'connected'}>
+              <b className="ellipsis" title={m.url || m.command || m.name}>
+                {m.name}
+              </b>
+              {m.type && <span className="chat-note">{m.type}</span>}
+              <span className="badge">{t(m.disabled ? 'chat.mcp_disabled' : 'chat.mcp_connected')}</span>
+              <button type="button" className="chat-more" disabled={busy != null} onClick={() => toggleMcp(m)}>
+                {busy === `mcp:${m.name}` ? <LoaderCircle size={13} className="spin" /> : t(m.disabled ? 'chat.mcp_enable' : 'chat.mcp_disable')}
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
+
+      <div id={`plugins-${id}`}>
+        <PluginsSection id={id} agent="agy" />
+      </div>
+
+      <div id={`subagents-${id}`}>
+        <h4 className="chat-side-title">
+          <Bot size={15} aria-hidden="true" /> {t('chat.subagents')}
+        </h4>
+        {agents.length === 0 ? (
+          <p className="chat-note">{t('chat.agy_agents_empty')}</p>
+        ) : (
+          <ul className="chat-rules">
+            {agents.map((a) => (
+              <li key={`${a.source ?? ''}:${a.path ?? a.name}`}>
+                <b className="ellipsis" title={a.description || a.name}>
+                  {a.name}
+                </b>
+                {a.source && <span className="chat-note">{t(`chat.src_${a.source}`, { defaultValue: a.source })}</span>}
+                {a.path && openFile && (
+                  <button type="button" className="chat-more" onClick={() => openFile({ ep: fileEndpoints(id), path: a.path })}>
+                    {t('chat.config_open')}
+                  </button>
+                )}
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
+
+      <h4 className="chat-side-title">
+        <ShieldCheck size={15} aria-hidden="true" /> {t('chat.agy_settings')}
+        {settings.exists && settings.path && openFile && (
+          <button type="button" className="chat-more" onClick={() => openFile({ ep: fileEndpoints(id), path: settings.path })}>
+            {t('chat.config_open')}
+          </button>
+        )}
+      </h4>
+      {!hasSettings ? (
+        <p className="chat-note">{t('chat.agy_settings_empty')}</p>
+      ) : (
+        <>
+          {(perms || sandbox != null) && (
+            <dl className="chat-kv">
+              {perms?.defaultMode && (
+                <>
+                  <dt>{t('chat.mode_pick')}</dt>
+                  <dd className="mono">{perms.defaultMode}</dd>
+                </>
+              )}
+              {sandbox != null && (
+                <>
+                  <dt>{t('chat.sandbox')}</dt>
+                  <dd className="mono">{typeof sandbox === 'object' ? String(sandbox.enabled ?? sandbox.mode ?? JSON.stringify(sandbox)) : String(sandbox)}</dd>
+                </>
+              )}
+            </dl>
+          )}
+          {['allow', 'ask', 'deny'].some((k) => Array.isArray(perms?.[k]) && perms[k].length > 0) && (
+            <ul className="chat-rules">
+              {['allow', 'ask', 'deny'].flatMap((kind) =>
+                (Array.isArray(perms?.[kind]) ? perms[kind] : []).map((r, n) => (
+                  // eslint-disable-next-line react/no-array-index-key -- 规则可能重复
+                  <li key={`${kind}:${n}`} data-kind={kind}>
+                    <span className="badge">{t(`chat.rule_${kind}`)}</span>
+                    <code className="ellipsis" title={String(r)}>
+                      {String(r)}
+                    </code>
+                  </li>
+                )),
+              )}
+            </ul>
+          )}
+          {hooks.length > 0 && (
+            <>
+              <h4 className="chat-side-title">
+                <Wrench size={15} aria-hidden="true" /> {t('chat.config_hooks')}
+              </h4>
+              <ul className="chat-rules">
+                {hooks.map((h, n) => (
+                  // eslint-disable-next-line react/no-array-index-key -- 可能一样
+                  <li key={n}>
+                    <span className="badge">{h.event}</span>
+                    <code className="ellipsis" title={h.command}>
+                      {h.matcher ? `[${h.matcher}] ` : ''}
+                      {h.command}
+                    </code>
+                  </li>
+                ))}
+              </ul>
+            </>
+          )}
+        </>
+      )}
+      <p className="chat-note">{t('chat.agy_config_note')}</p>
+    </>
+  );
+}
+
 const SIDE_TABS = ['changes', 'outline', 'tasks', 'usage', 'config'];
 const CODEX_TABS = ['changes', 'outline', 'agents', 'resources', 'usage', 'config'];
+const AGY_TABS = ['changes', 'outline', 'agents', 'usage', 'config'];
 const DSH_TABS = ['changes', 'outline', 'usage'];
 
 const RES_ICONS = { link: Globe, search: Search, image: ImageIcon };

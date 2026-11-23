@@ -69,6 +69,8 @@ struct Dirs {
     dsh: PathBuf,
     /// Antigravity（agy）：`~/.gemini/config`
     agy: PathBuf,
+    /// Antigravity（agy）数据目录：`~/.gemini/antigravity-cli`
+    agy_data: PathBuf,
     /// 会话的项目：工作目录往上到 Git 仓库根（含）的每一层，近的在前；不带项目时为空
     project: Vec<PathBuf>,
 }
@@ -76,7 +78,16 @@ struct Dirs {
 impl Dirs {
     fn real() -> Self {
         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-        Dirs { claude: Agent::Claude.dir(), codex: Agent::Codex.dir(), agents: home.join(".agents"), opencode: Agent::OpenCode.dir(), dsh: Agent::Dsh.dir(), agy: Agent::Agy.dir(), project: vec![] }
+        Dirs {
+            claude: Agent::Claude.dir(),
+            codex: Agent::Codex.dir(),
+            agents: home.join(".agents"),
+            opencode: Agent::OpenCode.dir(),
+            dsh: Agent::Dsh.dir(),
+            agy: Agent::Agy.dir(),
+            agy_data: crate::agents::agy_data_dir(),
+            project: vec![],
+        }
     }
 
     /// 带上会话的项目目录
@@ -104,6 +115,7 @@ impl Dirs {
             user("dsh", self.dsh.join("skills"), vec!["dsh"]),
             user("agy", self.agy.join("skills"), vec!["agy"]),
             Root { source: Source::System, ..user("codex-system", self.codex.join("skills").join(".system"), vec!["codex"]) },
+            Root { source: Source::System, ..user("agy-builtin", self.agy_data.join("builtin").join("skills"), vec!["agy"]) },
         ];
         // 项目里的：键带层数（0 = 工作目录），同一个项目每次拼出来一样，详情接口能按键找回来
         for (n, d) in self.project.iter().enumerate() {
@@ -503,7 +515,16 @@ mod tests {
     fn setup() -> (tempfile::TempDir, Dirs) {
         let d = tempfile::tempdir().unwrap();
         let p = d.path();
-        let dirs = Dirs { claude: p.join(".claude"), codex: p.join(".codex"), agents: p.join(".agents"), opencode: p.join("oc"), dsh: p.join(".dsh"), agy: p.join(".gemini").join("config"), project: vec![] };
+        let dirs = Dirs {
+            claude: p.join(".claude"),
+            codex: p.join(".codex"),
+            agents: p.join(".agents"),
+            opencode: p.join("oc"),
+            dsh: p.join(".dsh"),
+            agy: p.join(".gemini").join("config"),
+            agy_data: p.join(".gemini").join("antigravity-cli"),
+            project: vec![],
+        };
         (d, dirs)
     }
 
@@ -625,5 +646,23 @@ mod tests {
         let det = detail_in(&dirs, "claude", "ok").unwrap();
         assert_eq!(det.body, "# x");
         assert_eq!(det.files, [("SKILL.md".to_string(), 3)]);
+    }
+
+    #[test]
+    fn lists_agy_builtin_skills_as_system() {
+        let (d, dirs) = setup();
+        let trash = d.path().join("trash");
+        skill(&dirs.agy.join("skills"), "user-skill", "---\ndescription: 用户装的\n---\n");
+        skill(&dirs.agy_data.join("builtin").join("skills"), "run-workflow", "---\nname: run-workflow\ndescription: 内置工作流\n---\n正文");
+        let items = list_in(&dirs);
+        let user = items.iter().find(|i| i.id == "agy/user-skill").expect("user agy skill");
+        assert_eq!((user.source, user.deletable), (Source::User, true));
+        assert_eq!(user.tools, ["agy"]);
+        let builtin = items.iter().find(|i| i.id == "agy-builtin/run-workflow").expect("agy builtin skill");
+        assert_eq!((builtin.name.as_str(), builtin.description.as_str()), ("run-workflow", "内置工作流"));
+        assert_eq!((builtin.source, builtin.deletable), (Source::System, false));
+        assert_eq!(builtin.tools, ["agy"]);
+        assert_eq!(detail_in(&dirs, "agy-builtin", "run-workflow").unwrap().item.id, "agy-builtin/run-workflow");
+        assert!(delete_in(&dirs, &trash, "agy-builtin", "run-workflow", SystemTime::now()).is_err(), "内置技能不可删");
     }
 }

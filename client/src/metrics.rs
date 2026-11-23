@@ -72,6 +72,10 @@ pub struct Roots {
     pub codex_loaded: Option<usize>,
     /// Codex 对话起的后台命令
     pub codex_bg: Vec<BgRoot>,
+    /// Antigravity `agy acp` 的进程号
+    pub agy: Option<u32>,
+    /// `agy acp` 里加载着几段对话
+    pub agy_loaded: Option<usize>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -162,6 +166,10 @@ pub struct Looklook {
     pub helper_groups: Vec<Group>,
     /// Codex app-server 里加载着几段对话（没起 app-server 时为 None）
     pub codex_loaded: Option<usize>,
+    /// Antigravity `agy acp` 的进程号（没起时为 None）
+    pub agy: Option<u32>,
+    /// `agy acp` 里加载着几段对话（没起时为 None）
+    pub agy_loaded: Option<usize>,
     /// Codex 对话的后台命令（也算在各自的终端里）
     pub background: Vec<BgUse>,
     /// 所有终端（停止的也在，按内存从多到少）
@@ -231,6 +239,9 @@ fn breakdown(procs: &HashMap<u32, &Process>, roots: &Roots, me: u32, cores: f32)
     for &(_, pid) in &roots.helpers {
         walk(&mut owner, pid, Owner::Helper);
     }
+    if let Some(pid) = roots.agy {
+        walk(&mut owner, pid, Owner::Helper);
+    }
     for &c in children.get(&me).into_iter().flatten() {
         walk(&mut owner, c, Owner::Helper);
     }
@@ -240,7 +251,7 @@ fn breakdown(procs: &HashMap<u32, &Process>, roots: &Roots, me: u32, cores: f32)
             walk(&mut owner, c, Owner::Mux);
         }
     }
-    let mut out = Looklook { main_pid: me, codex_loaded: roots.codex_loaded, ..Default::default() };
+    let mut out = Looklook { main_pid: me, codex_loaded: roots.codex_loaded, agy: roots.agy, agy_loaded: roots.agy_loaded, ..Default::default() };
     let mut sessions: Vec<(Usage, Option<(u64, String)>)> = vec![Default::default(); roots.sessions.len()];
     let mut mux = [roots.mux, roots.termd].into_iter().flatten().any(|m| procs.contains_key(&m)).then(Usage::default);
     let mut groups: Vec<Group> = vec![];
@@ -257,13 +268,17 @@ fn breakdown(procs: &HashMap<u32, &Process>, roots: &Roots, me: u32, cores: f32)
             Owner::Mux => mux.get_or_insert_with(Usage::default).add(cpu, mem),
             Owner::Helper => {
                 out.helpers.add(cpu, mem);
-                // npm 装的 codex：app-server 的进程号是 node 外壳，下面那个真的 codex 也算同一组
+                // npm 装的 codex / agy acp：外层进程和直接子进程算同一组
                 let own = p.name().to_string_lossy().into_owned();
                 let parent = p.parent().map(|pp| pp.as_u32());
                 let name = roots
                     .helpers
                     .iter()
-                    .find(|h| h.1 == pid || (Some(h.1) == parent && own.to_ascii_lowercase().starts_with("codex")))
+                    .find(|h| {
+                        h.1 == pid
+                            || (Some(h.1) == parent
+                                && (own.to_ascii_lowercase().starts_with("codex") || own.to_ascii_lowercase().starts_with("agy")))
+                    })
                     .map(|h| h.0.clone())
                     .unwrap_or(own);
                 match groups.iter_mut().find(|g| g.name == name) {
@@ -568,6 +583,9 @@ async fn own_roots(instances: &crate::instances::Instances, chat: &crate::chat::
     roots.helpers.extend(chat_roots.codex.map(|p| ("Codex app-server".to_string(), p)));
     roots.codex_loaded = chat_roots.codex_loaded;
     roots.codex_bg = chat_roots.codex_bg.into_iter().map(|b| BgRoot { session: b.session, process_id: b.process_id, command: b.command, pid: b.pid }).collect();
+    roots.helpers.extend(chat_roots.agy.iter().map(|p| ("Antigravity ACP".to_string(), *p)));
+    roots.agy = chat_roots.agy.first().copied();
+    roots.agy_loaded = chat_roots.agy_loaded;
     roots
 }
 
@@ -665,6 +683,16 @@ mod tests {
         assert_eq!((l.background[0].process_id.as_str(), l.background[0].usage.procs), ("7", l.sessions[0].usage.procs));
         assert!(!unique || !l.helper_groups.iter().any(|g| g.name == child_name), "后台命令不算辅助进程");
         assert_eq!(l.total.procs, l.main.procs + l.helpers.procs + l.sessions.iter().map(|s| s.usage.procs).sum::<u32>());
+        // Antigravity ACP 进程作为辅助进程归组并透传 agy / agy_loaded
+        let agy_roots = Roots {
+            helpers: vec![("Antigravity ACP".to_string(), child.id())],
+            agy: Some(child.id()),
+            agy_loaded: Some(2),
+            ..Default::default()
+        };
+        let l = breakdown(&procs, &agy_roots, me, 1.0);
+        assert_eq!((l.agy, l.agy_loaded), (Some(child.id()), Some(2)));
+        assert!(l.helper_groups.iter().any(|g| g.name == "Antigravity ACP" && g.usage.procs >= 1));
         let _ = child.kill();
         let _ = child.wait();
     }

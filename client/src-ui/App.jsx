@@ -56,7 +56,7 @@ import { JustUpdatedBanner, shouldRemind, UpdateBanner, UpdateProvider } from '.
 import { TransferBanner } from './pages/SshTransfer.jsx';
 import { remoteAllowed, renewSoon } from './shared/Remote.jsx';
 import { splitTitle } from './shared/title.js';
-import { InAppAlerts, useForegroundPing } from './shared/inapp.jsx';
+import { ConnFailAlerts, InAppAlerts, useForegroundPing } from './shared/inapp.jsx';
 import { noteVersion } from './shared/stale.js';
 
 const StatusCtx = createContext({ status: null, reload: () => {} });
@@ -776,7 +776,11 @@ function ConsoleLayout({ path, stale, children }) {
   useResumeLast(path);
   return (
     <>
-      <InAppAlerts activeId={sess} open={ui.openSession} />
+      {/* 右上角的提醒：连不上的电脑（要手动关）在上，会话的提醒在下 */}
+      <div className="notices" aria-live="polite">
+        <ConnFailAlerts />
+        <InAppAlerts activeId={sess} open={ui.openSession} />
+      </div>
       {/* 手机上的顶栏；电脑上这些都在图标栏里 */}
       <header className="topbar topbar-console">
         <Link to="/assistant" className="brand">

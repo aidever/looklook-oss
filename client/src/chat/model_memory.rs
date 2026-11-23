@@ -111,6 +111,12 @@ pub fn codex_base(codex_home: &Path, p: &crate::codex_profiles::Profile) -> Stri
     json!([top("model"), top("model_reasoning_effort"), top("profile"), p.model, p.tuning.effort]).to_string()
 }
 
+/// Antigravity（agy）用户级配置里和模型有关的默认值
+pub fn agy_base(config_dir: &Path) -> String {
+    let s = read_json(&config_dir.join("settings.json"));
+    json!([s["model"], s["thoughtLevel"], s["thought_level"]]).to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -187,5 +193,9 @@ mod tests {
         let c0 = codex_base(d.path(), &p);
         std::fs::write(d.path().join("config.toml"), "model = \"gpt-5.5\"\n[x]\nmodel = \"y\"\n").unwrap();
         assert_ne!(codex_base(d.path(), &p), c0);
+        let a0 = agy_base(d.path());
+        std::fs::write(d.path().join("settings.json"), r#"{"model":"gemini-4-neon","thoughtLevel":"high"}"#).unwrap();
+        let a1 = agy_base(d.path());
+        assert_ne!(a0, a1);
     }
 }

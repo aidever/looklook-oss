@@ -16,12 +16,12 @@ const enc = encodeURIComponent;
  */
 export function useComposeAssist({ client, agent, workdir, text, setText, area }) {
   const { t } = useTranslation();
-  const on = Boolean(workdir) && (agent === 'claude' || agent === 'codex');
+  const on = Boolean(workdir) && (agent === 'claude' || agent === 'codex' || agent === 'agy');
   const [caret, setCaret] = useState(0);
   const at = Math.min(caret, text.length);
   const [cmds, setCmds] = useState(null);
   useEffect(() => setCmds(null), [agent, workdir]);
-  const slashWord = on && agent === 'claude' ? slashAt(text, at) : null;
+  const slashWord = on && (agent === 'claude' || agent === 'agy') ? slashAt(text, at) : null;
   const skillQ = on && agent === 'codex' ? skillAt(text, at) : null;
   const [off, setOff] = useState(null);
   const wantCmds = slashWord != null || skillQ != null;

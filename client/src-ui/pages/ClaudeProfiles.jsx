@@ -29,12 +29,13 @@ const MODEL_KEYS = ['main', 'opus', 'sonnet', 'haiku'];
 const AGENTS = {
   claude: { base: '/claude-profiles', t: 'cprof', anchor: 'claude-accounts' },
   codex: { base: '/codex-profiles', t: 'xprof', anchor: 'codex-profiles' },
+  agy: { base: '/agy-profiles', t: 'aprof', anchor: 'agy-accounts' },
 };
 const PRESET = 'preset:';
 
 /** 配置显示的名字：本机默认账号没有名字；另外的官方账号登录成功后才有（登录的邮箱） */
 export function profileName(t, p, agent = 'claude') {
-  return p.id === 'official' ? p.name || t(`${AGENTS[agent].t}.builtin`) : p.name || t('cprof.unnamed');
+  return p.id === 'official' ? p.name || t(`${AGENTS[agent].t}.builtin`) : p.name || p.email || t(agent === 'agy' ? 'aprof.unnamed' : 'cprof.unnamed');
 }
 
 /** models.dev 的价格（美元 / 百万 token）：“$1.2 / $4.2” */
@@ -71,9 +72,9 @@ export function KindIcon({ p, size = 15 }) {
 }
 
 /** 官方账号的登录状态：每个单独问（`claude auth status` 要一两秒）。`expired`：查用量时发现登录失效了 */
-function LoginStatus({ s, err, expired }) {
+function LoginStatus({ s, err, expired, agent = 'claude' }) {
   const { t } = useTranslation();
-  if (err || s?.error) return <span className="muted">{t(s?.error === 'not_installed' ? 'cprof.not_installed' : 'cprof.status_failed')}</span>;
+  if (err || s?.error) return <span className="muted">{t(s?.error === 'not_installed' ? (agent === 'agy' ? 'aprof.not_installed' : 'cprof.not_installed') : 'cprof.status_failed')}</span>;
   if (!s) return <span className="muted">{t('cprof.checking')}</span>;
   if (!s.logged_in) return <span className="cprof-warn">{t(expired ? 'cprof.expired' : 'cprof.logged_out')}</span>;
   // 本机默认账号也可能是环境变量里的 Key（authMethod 不是 claude.ai）
@@ -86,24 +87,61 @@ function LoginStatus({ s, err, expired }) {
   );
 }
 
-/** 查到的订阅用量：“5 小时 5% · 7 天 91%”，用得多的标黄，重置时间放在提示里 */
+function compactTokens(n) {
+  if (n >= 1e9) return `${(n / 1e9).toFixed(2)}B`;
+  if (n >= 1e6) return `${(n / 1e6).toFixed(1)}M`;
+  if (n >= 1e3) return `${(n / 1e3).toFixed(1)}K`;
+  return String(n ?? 0);
+}
+
+/** 查到的订阅用量：“5 小时 5% · 7 天 91%”，用得多的标黄，重置时间放在提示里；agy 另支持模型分组额度与本地今日/7天统计 */
 function UsageLine({ limits }) {
   const { t } = useTranslation();
   const wins = [
     ['usage_5h', limits?.five_hour],
     ['usage_7d', limits?.seven_day],
   ].filter(([, w]) => w);
-  if (!wins.length) return <span className="muted">{t('cprof.usage_empty')}</span>;
+  const groups = (limits?.groups ?? []).filter((g) => g && typeof g.used === 'number');
+  const localToday = limits?.local_stats?.today;
+  const local7d = limits?.local_stats?.seven_day;
+  const hasToday = Boolean(localToday && (localToday.requests > 0 || localToday.tokens > 0));
+  const has7d = Boolean(local7d && (local7d.requests > 0 || local7d.tokens > 0));
+  if (!wins.length && !groups.length && !hasToday && !has7d) return <span className="muted">{t('cprof.usage_empty')}</span>;
+  let sep = false;
+  const dot = () => {
+    const s = sep ? ' · ' : '';
+    sep = true;
+    return s;
+  };
   return (
     <>
-      {wins.map(([key, w], i) => (
+      {wins.map(([key, w]) => (
         <span key={key} className={w.used > 85 ? 'cprof-warn' : 'muted'} title={w.resets_at ? t('cprof.usage_reset', { at: formatTime(w.resets_at) }) : undefined}>
-          {i > 0 && ' · '}
+          {dot()}
           {t(`cprof.${key}`, { used: Math.round(w.used) })}
           {/* 用完了：直接写出什么时候重置；服务商没给时间就照实说不知道 */}
           {w.used >= 100 && ` (${w.resets_at ? t('cprof.usage_reset', { at: formatTime(w.resets_at) }) : t('cprof.usage_reset_unknown')})`}
         </span>
       ))}
+      {groups.map((g) => (
+        <span key={g.id ?? g.label} className={g.used > 85 ? 'cprof-warn' : 'muted'} title={g.resets_at ? t('cprof.usage_reset', { at: formatTime(g.resets_at) }) : undefined}>
+          {dot()}
+          {`${g.label || g.id} ${Math.round(g.used)}%`}
+          {g.used >= 100 && ` (${g.resets_at ? t('cprof.usage_reset', { at: formatTime(g.resets_at) }) : t('cprof.usage_reset_unknown')})`}
+        </span>
+      ))}
+      {hasToday && (
+        <span className="muted">
+          {dot()}
+          {t('cprof.usage_today', { tokens: compactTokens(localToday.tokens), requests: localToday.requests })}
+        </span>
+      )}
+      {has7d && (
+        <span className="muted">
+          {dot()}
+          {t('cprof.usage_7d_local', { tokens: compactTokens(local7d.tokens) })}
+        </span>
+      )}
       {/* 开了额外用量（额度用完后按量付费）：这个月花了多少 */}
       {limits.extra?.enabled && (
         <span className="muted">
@@ -117,7 +155,7 @@ function UsageLine({ limits }) {
   );
 }
 
-/** 登录失败时 Claude Code 说的话：授权码被拒（400）换成能照着做的说明 */
+/** 登录失败时 Claude Code / agy 说的话：授权码被拒（400）换成能照着做的说明 */
 function loginError(t, st) {
   if (!st.error) return t('cprof.login_failed');
   if (/status code 400\b/.test(st.error)) return t('cprof.login_code_rejected');
@@ -125,59 +163,61 @@ function loginError(t, st) {
 }
 
 /**
- * 登录官方账号：电脑上在后台运行 Claude Code 自己的 `claude auth login`，这里只显示它给的登录地址（不做成链接，
- * 旁边的按钮打开、复制），用户在 claude.com 登录后把页面上的 Authentication Code 贴回来。
+ * 登录官方账号：Claude Code 在后台运行 `claude auth login`，Antigravity 在后台运行 `agy acp --login`。
+ * 这里只显示授权页地址（旁边的按钮打开、复制），用户在浏览器登录后把授权码或回调链接贴回来。
  * `onClose(ok)`：登录成功时为 true。
  */
-function LoginModal({ profile, onClose }) {
+function LoginModal({ agent = 'claude', profile, onClose }) {
   const api = useApi();
   const { t } = useTranslation();
   const toast = useToast();
+  const cfg = AGENTS[agent];
+  const isAgy = agent === 'agy';
   const [st, setSt] = useState(null);
   const [code, setCode] = useState('');
   const { busy, error, setError, run } = useAction();
   const start = () => {
     setSt(null);
     setCode('');
-    run(async () => setSt(await api.post(`/claude-profiles/${profile.id}/login`, {})));
+    run(async () => setSt(await api.post(`${cfg.base}/${profile.id}/login`, {})));
   };
-  useEffect(start, [profile.id]);
-  // 等授权页地址、等换令牌的结果（Claude Code 自己打开了本机浏览器时，不用贴授权码也会完成）
+  useEffect(start, [agent, profile.id]);
+  // 等授权页地址、等换令牌的结果（工具自己打开了本机浏览器时，不用贴授权码也会完成）
   useEffect(() => {
     if (st?.state !== 'running') return undefined;
     const timer = setTimeout(async () => {
-      const r = await api.get(`/claude-profiles/${profile.id}/login`).catch(() => null);
+      const r = await api.get(`${cfg.base}/${profile.id}/login`).catch(() => null);
       if (r) setSt(r);
     }, 1500);
     return () => clearTimeout(timer);
   }, [st]);
   useEffect(() => {
     if (st?.state !== 'ok') return;
-    toast(t('cprof.login_done', { name: profileName(t, profile) }));
+    toast(t('cprof.login_done', { name: profileName(t, profile, agent) }));
     onClose(true);
   }, [st?.state]);
   const close = () => {
-    if (st?.state === 'running') api.del(`/claude-profiles/${profile.id}/login`).catch(() => {});
+    if (st?.state === 'running') api.del(`${cfg.base}/${profile.id}/login`).catch(() => {});
     onClose(false);
   };
   const submit = (e) => {
     e.preventDefault();
     setError(null);
-    run(async () => setSt(await api.post(`/claude-profiles/${profile.id}/login/code`, { code: code.trim() })));
+    run(async () => setSt(await api.post(`${cfg.base}/${profile.id}/login/code`, { code: code.trim() })));
   };
   const waiting = st?.state === 'running' && st.code_sent;
   return (
-    <Modal open onClose={close} title={profile.fresh ? t('cprof.add_official') : t('cprof.login_title', { name: profileName(t, profile) })}>
-      {profile.fresh && <p className="small muted">{t('cprof.official_intro')}</p>}
+    <Modal open onClose={close} title={profile.fresh ? t(isAgy ? 'aprof.add_official' : 'cprof.add_official') : t('cprof.login_title', { name: profileName(t, profile, agent) })}>
+      {profile.fresh && <p className="small muted">{t(isAgy ? 'aprof.official_intro' : 'cprof.official_intro')}</p>}
       {!st && !error && <Skeleton height={80} />}
       {st?.state === 'running' && !st.url && (
         <p className="muted small">
-          <Spinner size={14} /> {t('cprof.login_starting')}
+          <Spinner size={14} /> {t(isAgy ? 'aprof.login_starting' : 'cprof.login_starting')}
         </p>
       )}
       {st?.url && st.state !== 'ok' && (
         <form onSubmit={submit}>
-          <Field label={t('cprof.login_url')} hint={t('cprof.login_url_hint')}>
+          <Field label={t('cprof.login_url')} hint={t(isAgy ? 'aprof.login_url_hint' : 'cprof.login_url_hint')}>
             <div className="cprof-url">
               <code className="mono">{st.url}</code>
               <span className="inline">
@@ -188,7 +228,7 @@ function LoginModal({ profile, onClose }) {
               </span>
             </div>
           </Field>
-          <Field label="Authentication Code" hint={t('cprof.login_code_hint')}>
+          <Field label={isAgy ? t('aprof.login_code_label') : 'Authentication Code'} hint={t(isAgy ? 'aprof.login_code_hint' : 'cprof.login_code_hint')}>
             <input className="mono" value={code} onChange={(e) => setCode(e.target.value)} autoComplete="off" spellCheck={false} autoCapitalize="none" disabled={st.state !== 'running' || waiting} autoFocus />
           </Field>
           {st.state === 'failed' && <Note kind="warn">{loginError(t, st)}</Note>}
@@ -230,22 +270,23 @@ function LoginModal({ profile, onClose }) {
 }
 
 /** 改官方账号的名字（添加时不用起名字，登录成功后用邮箱） */
-function OfficialForm({ initial, onClose, onSaved }) {
+function OfficialForm({ agent = 'claude', initial, onClose, onSaved }) {
   const api = useApi();
   const { t } = useTranslation();
+  const cfg = AGENTS[agent];
   const [name, setName] = useState(initial.name);
   // 本机默认账号：名字可以清空，回到“本机默认账号”
   const builtin = initial.id === 'official';
   const { busy, error, run } = useAction();
   const save = (e) => {
     e.preventDefault();
-    run(async () => onSaved(await api.put(`/claude-profiles/${initial.id}`, { name })));
+    run(async () => onSaved(await api.put(`${cfg.base}/${initial.id}`, { name })));
   };
   return (
     <Modal open onClose={onClose} title={t('cprof.rename')}>
       <form onSubmit={save}>
         <Field label={t('cprof.name')}>
-          <input value={name} onChange={(e) => setName(e.target.value)} maxLength={40} placeholder={builtin ? t('cprof.builtin') : t('cprof.name_ph_official')} required={!builtin} autoFocus />
+          <input value={name} onChange={(e) => setName(e.target.value)} maxLength={40} placeholder={builtin ? t(`${cfg.t}.builtin`) : t(agent === 'agy' ? 'aprof.name_ph_official' : 'cprof.name_ph_official')} required={!builtin} autoFocus />
         </Field>
         <ErrorNote error={error} />
         <div className="modal-actions">
@@ -807,9 +848,9 @@ function ProfileRow({ agent, p, isDefault, busy, nonce, onDefault, onLogin, onEd
   const { t } = useTranslation();
   const toast = useToast();
   const cfg = AGENTS[agent];
-  const official = p.kind === 'official';
-  const claudeLogin = official && agent === 'claude';
-  const [loaded, err] = useLoad(() => (claudeLogin ? api.get(`/claude-profiles/${p.id}/status`) : Promise.resolve(null)), [p.id, nonce]);
+  const official = p.kind === 'official' || agent === 'agy';
+  const hasLogin = official && (agent === 'claude' || agent === 'agy');
+  const [loaded, err] = useLoad(() => (hasLogin ? api.get(`${cfg.base}/${p.id}/status`) : Promise.resolve(null)), [agent, p.id, nonce]);
   // 查用量时顺便拿到的登录状态比上面问到的新；重新问过之后以问到的为准
   const [fresh, setFresh] = useState(null);
   useEffect(() => setFresh(null), [loaded]);
@@ -826,17 +867,17 @@ function ProfileRow({ agent, p, isDefault, busy, nonce, onDefault, onLogin, onEd
     if (!r) return;
     take(r);
     if (r.state === 'logged_out') toast(t('cprof.expired_toast', { name }), 'error');
-    else if (r.state === 'no_limits') toast(t(official ? 'cprof.usage_none' : 'cprof.usage_none_api'), 'error');
+    else if (r.state === 'no_limits') toast(t(agent === 'agy' ? 'aprof.usage_none' : official ? 'cprof.usage_none' : 'cprof.usage_none_api'), 'error');
     else if (r.state === 'failed') toast(t('cprof.usage_failed'), 'error');
   };
   useEffect(() => {
     if (q.error) toast(errorText(t, q.error), 'error');
   }, [q.error]);
   const loggedIn = Boolean(s?.logged_in);
-  // 定时自动查用量：打开页面时查一次，开着时第三方接口每 5 分钟、官方账号每 10 分钟（要起一次 claude）再查；
+  // 定时自动查用量：打开页面时查一次，开着时第三方接口每 5 分钟、官方账号每 10 分钟再查；
   // 页面在后台时不查，回到前台时过了间隔就补一次。自动查的不弹提示，失败了保留上次的数
-  const autoQuery = claudeLogin ? loggedIn : !official && p.quota && p.key_set;
-  const every = claudeLogin ? 10 * 60_000 : 5 * 60_000;
+  const autoQuery = hasLogin ? loggedIn || (agent === 'agy' && p.id === 'official' && Boolean(s) && !s.error) : !official && p.quota && p.key_set;
+  const every = hasLogin ? 10 * 60_000 : 5 * 60_000;
   useEffect(() => {
     if (!autoQuery) return undefined;
     let alive = true;
@@ -851,7 +892,7 @@ function ProfileRow({ agent, p, isDefault, busy, nonce, onDefault, onLogin, onEd
         /* 自动查的：不打扰 */
       }
     };
-    // 几个配置错开一点，不同时起好几个 claude
+    // 几个配置错开一点，不同时起好几个子进程
     const first = setTimeout(run, 300 + Math.random() * 1500);
     const iv = setInterval(run, every);
     const vis = () => !document.hidden && run();
@@ -864,7 +905,7 @@ function ProfileRow({ agent, p, isDefault, busy, nonce, onDefault, onLogin, onEd
     };
   }, [autoQuery, p.id, agent]);
   const model = agent === 'codex' ? p.model : p.models?.main;
-  const tuned = tuningSummary(t, agent, p);
+  const tuned = agent === 'agy' ? [] : tuningSummary(t, agent, p);
   return (
     <li className={isDefault ? 'cprof-default' : ''}>
       <button
@@ -884,8 +925,8 @@ function ProfileRow({ agent, p, isDefault, busy, nonce, onDefault, onLogin, onEd
           {isDefault && <span className="badge badge-ok">{t('cprof.default')}</span>}
         </b>
         <span className="small" style={{ display: 'block' }}>
-          {claudeLogin ? (
-            <LoginStatus s={s} err={err} expired={usage?.state === 'logged_out'} />
+          {hasLogin ? (
+            <LoginStatus s={s} err={err} expired={usage?.state === 'logged_out'} agent={agent} />
           ) : official ? (
             <span className="muted">{t('xprof.builtin_desc')}</span>
           ) : (
@@ -906,7 +947,7 @@ function ProfileRow({ agent, p, isDefault, busy, nonce, onDefault, onLogin, onEd
             <SlidersHorizontal size={13} aria-hidden="true" /> {tuned.join(' · ')}
           </button>
         )}
-        {(loggedIn || !official) && usage?.state === 'ok' && (
+        {(loggedIn || !official || agent === 'agy') && usage?.state === 'ok' && (
           <span className="small" style={{ display: 'block' }}>
             <UsageLine limits={usage.limits} />
             {usage.at && <span className="muted"> · {t('cprof.usage_auto_at', { at: new Date(usage.at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) })}</span>}
@@ -914,9 +955,9 @@ function ProfileRow({ agent, p, isDefault, busy, nonce, onDefault, onLogin, onEd
         )}
       </span>
       <span className="inline">
-        {claudeLogin &&
+        {hasLogin &&
           (loggedIn || !s ? (
-            <Button variant="ghost" icon={Gauge} onClick={queryUsage} busy={q.busy} disabled={busy || !s} title={t('cprof.usage_hint')}>
+            <Button variant="ghost" icon={Gauge} onClick={queryUsage} busy={q.busy} disabled={busy || !s} title={t(agent === 'agy' ? 'aprof.usage_hint' : 'cprof.usage_hint')}>
               {t('cprof.usage')}
             </Button>
           ) : (
@@ -929,15 +970,16 @@ function ProfileRow({ agent, p, isDefault, busy, nonce, onDefault, onLogin, onEd
             {t('cprof.usage')}
           </Button>
         )}
-        {/* Claude Code 的本机默认账号也能改名、从列表里去掉（只剩它一个时不能去掉）；Codex 的本机默认只能改模型设置 */}
+        {/* Claude Code 的本机默认账号也能改名、从列表里去掉（只剩它一个时不能去掉）；Codex 的本机默认只能改模型设置；Antigravity 的本机默认可改名、不能删除 */}
         <PopMenu
             label={t('action.more')}
             items={[
-              claudeLogin && loggedIn && { icon: LogIn, label: t('cprof.relogin'), onClick: () => onLogin(p) },
+              hasLogin && loggedIn && { icon: LogIn, label: t('cprof.relogin'), onClick: () => onLogin(p) },
+              agent === 'agy' && !loggedIn && s && !s.error && { icon: Gauge, label: t('cprof.usage'), onClick: queryUsage },
               !isDefault && { icon: Check, label: t('cprof.make_default'), onClick: () => onDefault(p) },
-              { icon: SlidersHorizontal, label: t('tune.menu'), hint: t(`tune.menu_hint_${agent}`), onClick: () => onTune(p) },
-              (p.id !== 'official' || agent === 'claude') && { label: t(p.kind === 'api' ? 'cprof.edit' : 'cprof.rename'), onClick: () => onEdit(p) },
-              !(p.id === 'official' && (only || agent === 'codex')) && { label: t(p.id === 'official' ? 'cprof.hide_builtin' : 'action.delete'), danger: true, onClick: () => onRemove(p) },
+              agent !== 'agy' && { icon: SlidersHorizontal, label: t('tune.menu'), hint: t(`tune.menu_hint_${agent}`), onClick: () => onTune(p) },
+              (p.id !== 'official' || agent === 'claude' || agent === 'agy') && { label: t(p.kind === 'api' ? 'cprof.edit' : 'cprof.rename'), onClick: () => onEdit(p) },
+              !(p.id === 'official' && (only || agent === 'codex' || agent === 'agy')) && { label: t(p.id === 'official' ? 'cprof.hide_builtin' : 'action.delete'), danger: true, onClick: () => onRemove(p) },
             ]}
           />
       </span>
@@ -961,11 +1003,11 @@ function ProfilesCard({ agent, bare }) {
     if (data && window.location.hash === `#${cfg.anchor}`) document.getElementById(cfg.anchor)?.scrollIntoView({ block: 'start' });
   }, [Boolean(data)]);
   useEffect(() => {
-    if (agent !== 'claude') return undefined;
+    if (agent !== 'claude' && agent !== 'agy') return undefined;
     const again = () => document.visibilityState === 'visible' && setNonce((n) => n + 1);
     document.addEventListener('visibilitychange', again);
     return () => document.removeEventListener('visibilitychange', again);
-  }, []);
+  }, [agent]);
   const apply = () => reload();
   // 正在登录的账号（弹出登录框）
   const [loggingIn, setLoggingIn] = useState(null);
@@ -981,7 +1023,7 @@ function ProfilesCard({ agent, bare }) {
     const builtin = p.id === 'official';
     const ok = await confirm({
       title: t(builtin ? 'cprof.hide_builtin_title' : 'cprof.delete_title', { name: profileName(t, p, agent) }),
-      body: t(builtin ? 'cprof.hide_builtin_body' : p.kind === 'api' ? `${cfg.t}.delete_body_api` : 'cprof.delete_body_official'),
+      body: t(builtin ? 'cprof.hide_builtin_body' : p.kind === 'api' ? `${cfg.t}.delete_body_api` : `${cfg.t}.delete_body_official`),
       confirm: t(builtin ? 'cprof.hide_builtin' : 'action.delete'),
       danger: true,
     });
@@ -991,7 +1033,7 @@ function ProfilesCard({ agent, bare }) {
   };
   // 添加官方账号：不用先填什么，直接去登录；登录框没登录成功就关掉时删掉这个空账号
   const addOfficial = async () => {
-    const r = await run(() => api.post('/claude-profiles', { kind: 'official' }));
+    const r = await run(() => api.post(cfg.base, agent === 'claude' ? { kind: 'official' } : {}));
     const p = r?.profiles?.find((x) => x.id === r.added);
     if (!p) return;
     apply(r);
@@ -1001,7 +1043,7 @@ function ProfilesCard({ agent, bare }) {
     const p = loggingIn;
     setLoggingIn(null);
     if (p?.fresh && !ok) {
-      const r = await api.del(`/claude-profiles/${p.id}`).catch(() => null);
+      const r = await api.del(`${cfg.base}/${p.id}`).catch(() => null);
       if (r) apply(r);
     } else reload();
     setNonce((n) => n + 1);
@@ -1023,6 +1065,10 @@ function ProfilesCard({ agent, bare }) {
           { icon: Server, label: t('cprof.add_api'), hint: t('cprof.add_api_hint'), onClick: () => setForm({ kind: 'api' }) },
         ]}
       />
+    ) : agent === 'agy' ? (
+      <Button variant="secondary" icon={Plus} onClick={addOfficial} disabled={busy}>
+        {t('aprof.add_official')}
+      </Button>
     ) : (
       <Button variant="secondary" icon={Plus} onClick={() => setForm({ kind: 'api' })}>
         {t('xprof.add_api')}
@@ -1046,7 +1092,7 @@ function ProfilesCard({ agent, bare }) {
                 nonce={nonce}
                 onDefault={setDefault}
                 onLogin={login}
-                onEdit={(x) => setForm({ kind: x.kind, initial: x })}
+                onEdit={(x) => setForm({ kind: x.kind || 'official', initial: x })}
                 onTune={(x) => setForm({ kind: 'tune', initial: x })}
                 onRemove={remove}
                 only={data.profiles.length === 1}
@@ -1058,9 +1104,9 @@ function ProfilesCard({ agent, bare }) {
           {t(`${cfg.t}.note`)}
         </p>
       </Shell>
-      {loggingIn && <LoginModal profile={loggingIn} onClose={loginClosed} />}
+      {loggingIn && <LoginModal agent={agent} profile={loggingIn} onClose={loginClosed} />}
       {form?.kind === 'tune' && <TuningModal agent={agent} p={form.initial} onClose={() => setForm(null)} onSaved={saved} />}
-      {form?.kind === 'official' && <OfficialForm initial={form.initial} onClose={() => setForm(null)} onSaved={saved} />}
+      {form?.kind === 'official' && <OfficialForm agent={agent} initial={form.initial} onClose={() => setForm(null)} onSaved={saved} />}
       {form?.kind === 'api' && data && <ApiForm agent={agent} initial={form.initial} accepted={Boolean(data.accepted_at)} onClose={() => setForm(null)} onSaved={saved} />}
     </div>
   );
@@ -1088,6 +1134,10 @@ export default function ClaudeProfilesCard() {
 
 export function CodexProfilesCard() {
   return <ProfilesCard agent="codex" />;
+}
+
+export function AgyProfilesCard() {
+  return <ProfilesCard agent="agy" />;
 }
 
 /**
@@ -1133,4 +1183,8 @@ export function ClaudeProfilePick(props) {
 
 export function CodexProfilePick(props) {
   return <ProfilePick agent="codex" {...props} />;
+}
+
+export function AgyProfilePick(props) {
+  return <ProfilePick agent="agy" {...props} />;
 }

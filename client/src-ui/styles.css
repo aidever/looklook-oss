@@ -424,7 +424,12 @@ input[type="checkbox"], input[type="radio"] { width: auto; min-height: 0; paddin
 
 /* ---------- 看看里的会话提醒（别的会话做完了 / 在等你 / 出错了） ----------
    电脑上在右上角、会话标签和会话顶栏下面（不挡底部输入框和顶栏按钮）；手机上在顶栏下面。多条合成一张卡片，一个会话一行。 */
-.notices { position: fixed; top: 100px; right: 16px; z-index: 60; width: min(340px, calc(100vw - 32px)); pointer-events: none; }
+.notices { position: fixed; top: 100px; right: 16px; z-index: 60; width: min(340px, calc(100vw - 32px)); pointer-events: none; display: grid; gap: 8px; }
+.notice-conn { cursor: default; align-items: flex-start; padding-top: 10px; padding-bottom: 10px; }
+.notice-conn:hover { background: none; }
+.notice-conn .notice-icon { margin-top: 2px; }
+.notice-text-col { flex-direction: column; align-items: stretch; gap: 2px; }
+.notice-detail { font-size: 13px; color: var(--muted); line-height: 1.45; overflow-wrap: anywhere; }
 .notice-card {
   pointer-events: auto; display: flex; flex-direction: column; overflow: hidden;
   background: var(--panel); color: var(--text); border: 1px solid var(--line); border-radius: 14px; box-shadow: var(--shadow-lg);
@@ -4154,6 +4159,8 @@ button.link-badge:hover { filter: brightness(1.15); }
 .asst-card:disabled { opacity: .55; cursor: not-allowed; }
 @media (max-width: 560px) { .asst-cards, .asst-cards-3 { grid-template-columns: minmax(0, 1fr); } }
 .asst-dev { flex: none; }
+/* 空白页的药丸在内容区最左边，菜单靠右对齐会伸到侧栏底下 */
+.asst-pad > .asst-dev .device-menu { left: 0; right: auto; }
 @media (max-width: 899px) { .asst-dev { display: none; } }
 .asst-chip-tag { flex: none; padding: 2px 5px; border-radius: 4px; background: var(--panel-2); color: var(--muted); font-size: 11px; font-weight: 500; }
 .asst-side-btn { position: relative; flex: none; display: inline-flex; align-items: center; gap: 4px; }
@@ -4591,6 +4598,7 @@ button.link-badge:hover { filter: brightness(1.15); }
 .conn-dev-row .dot { width: 7px; height: 7px; flex: none; }
 .conn-dev-name { flex: 1; min-width: 0; font-weight: 500; }
 .conn-dev-meta { flex: none; color: var(--muted); font-variant-numeric: tabular-nums; }
+.conn-dev-err { margin: 0 6px 4px 19px; font-size: 12px; line-height: 1.45; color: var(--danger); overflow-wrap: anywhere; }
 .conn-dev-btn { width: 24px; height: 24px; min-height: 24px; padding: 0; flex: none; }
 .slist-warn-list { display: flex; flex-direction: column; gap: 6px; margin-bottom: 8px; }
 .slist-warn { display: flex; align-items: center; gap: 8px; padding: 6px 10px; border-radius: 10px; border: 1px solid var(--line); background: var(--panel-2); font-size: 12px; }

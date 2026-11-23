@@ -329,6 +329,13 @@ pub fn routes(app: App) -> Router<App> {
         .route("/ollama", get(ollama))
         .route("/claude-profiles/{id}/login", get(claude_login_state).post(login_claude_profile).delete(cancel_claude_login))
         .route("/claude-profiles/{id}/login/code", post(claude_login_code))
+        .route("/agy-profiles", get(get_agy_profiles).post(add_agy_profile))
+        .route("/agy-profiles/default", put(set_default_agy_profile))
+        .route("/agy-profiles/{id}", put(update_agy_profile).delete(delete_agy_profile))
+        .route("/agy-profiles/{id}/status", get(agy_profile_status))
+        .route("/agy-profiles/{id}/usage", post(agy_profile_usage))
+        .route("/agy-profiles/{id}/login", get(agy_login_state).post(login_agy_profile).delete(cancel_agy_login))
+        .route("/agy-profiles/{id}/login/code", post(agy_login_code))
         .route("/metrics", get(metrics))
         .route("/mac/folders", get(mac_folders).post(mac_folders_grant))
         .route("/mac/privacy", post(mac_privacy))
@@ -3428,6 +3435,86 @@ async fn claude_login_code(Path(id): Path<String>, Json(req): Json<LoginCodeReq>
 
 async fn cancel_claude_login(Path(id): Path<String>) -> StatusCode {
     crate::claude_profiles::login_cancel(&id);
+    StatusCode::NO_CONTENT
+}
+
+// ---------------- Antigravity（agy）账号切换（见 agy_profiles.rs） ----------------
+
+fn agy_profiles_view(app: &App) -> Value {
+    use crate::agy_profiles as ap;
+    let profiles: Vec<Value> = ap::list(&app.store)
+        .into_iter()
+        .map(|p| {
+            let mut v = json!(p);
+            v["kind"] = json!("official");
+            v
+        })
+        .collect();
+    json!({
+        "default": ap::default_id(&app.store),
+        "profiles": profiles,
+    })
+}
+
+async fn get_agy_profiles(State(app): State<App>) -> Json<Value> {
+    Json(agy_profiles_view(&app))
+}
+
+#[derive(Deserialize, Default)]
+struct AgyProfileReq {
+    #[serde(default)]
+    name: Option<String>,
+}
+
+async fn add_agy_profile(State(app): State<App>, Json(req): Json<AgyProfileReq>) -> R<Json<Value>> {
+    let p = crate::agy_profiles::add(&app.store, &app.paths.home, req.name.as_deref())?;
+    let mut v = agy_profiles_view(&app);
+    v["added"] = json!(p.id);
+    Ok(Json(v))
+}
+
+async fn update_agy_profile(State(app): State<App>, Path(id): Path<String>, Json(req): Json<AgyProfileReq>) -> R<Json<Value>> {
+    crate::agy_profiles::update(&app.store, &id, req.name.as_deref())?;
+    Ok(Json(agy_profiles_view(&app)))
+}
+
+async fn delete_agy_profile(State(app): State<App>, Path(id): Path<String>) -> R<Json<Value>> {
+    crate::agy_profiles::remove(&app.store, &app.paths.home, &id)?;
+    Ok(Json(agy_profiles_view(&app)))
+}
+
+async fn set_default_agy_profile(State(app): State<App>, Json(req): Json<DefaultReq>) -> R<Json<Value>> {
+    crate::agy_profiles::set_default(&app.store, &req.id)?;
+    Ok(Json(agy_profiles_view(&app)))
+}
+
+async fn agy_profile_status(State(app): State<App>, Path(id): Path<String>) -> R<Json<Value>> {
+    crate::agy_profiles::get(&app.store, &id).ok_or_else(LocalError::not_found)?;
+    Ok(Json(crate::agy_profiles::status(&app.paths.home, app.instances.shell(), &id).await))
+}
+
+async fn agy_profile_usage(State(app): State<App>, Path(id): Path<String>) -> R<Json<Value>> {
+    crate::agy_profiles::get(&app.store, &id).ok_or_else(LocalError::not_found)?;
+    let mut u = crate::agy_profiles::usage(&app.store, &app.paths.home, &id).await;
+    let st = crate::agy_profiles::status(&app.paths.home, app.instances.shell(), &id).await;
+    u["status"] = st;
+    Ok(Json(u))
+}
+
+async fn login_agy_profile(State(app): State<App>, Path(id): Path<String>) -> R<Json<crate::agy_profiles::LoginView>> {
+    Ok(Json(crate::agy_profiles::start_login(&app.paths.home, app.instances.shell(), app.store.clone(), &id).await?))
+}
+
+async fn agy_login_state(Path(id): Path<String>) -> R<Json<crate::agy_profiles::LoginView>> {
+    crate::agy_profiles::login_state(&id).map(Json).ok_or_else(LocalError::not_found)
+}
+
+async fn agy_login_code(Path(id): Path<String>, Json(req): Json<LoginCodeReq>) -> R<Json<crate::agy_profiles::LoginView>> {
+    Ok(Json(crate::agy_profiles::submit_login_code(&id, &req.code).await?))
+}
+
+async fn cancel_agy_login(Path(id): Path<String>) -> StatusCode {
+    crate::agy_profiles::cancel_login(&id);
     StatusCode::NO_CONTENT
 }
 

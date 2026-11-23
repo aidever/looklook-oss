@@ -155,6 +155,9 @@ pub struct Transcript {
     pub queued: Vec<String>,
     /// Claude Code 的整个队列（含不显示的后台任务通知）：`dequeue` 不带内容，取的是最前面那条，要照着它的顺序记
     queue: std::collections::VecDeque<String>,
+    /// `dequeue` / `remove` 已经取走、但对应的消息记录（用户消息、`queued_command` 附件）还没读到的条目：
+    /// 记录到了就把这笔账销掉，不再动队列；没有这笔账说明队列里那条是被前面的残留顶了位，要按内容删掉
+    taken: HashMap<String, usize>,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Serialize)]
@@ -227,7 +230,7 @@ pub fn tool_calls_in(items: &[Item]) -> Vec<ToolCall<'_>> {
 
 impl Transcript {
     pub fn new(path: PathBuf) -> Self {
-        Self { path, pos: 0, partial: vec![], recs: vec![], by_uuid: HashMap::new(), first_of_msg: HashMap::new(), display: vec![], version: None, stats: Stats::default(), sidechain: false, notes: HashMap::new(), model: None, usage: None, model_msg: None, totals: Totals::default(), per_msg: HashMap::new(), title: None, custom_title: false, queued: vec![], queue: Default::default() }
+        Self { path, pos: 0, partial: vec![], recs: vec![], by_uuid: HashMap::new(), first_of_msg: HashMap::new(), display: vec![], version: None, stats: Stats::default(), sidechain: false, notes: HashMap::new(), model: None, usage: None, model_msg: None, totals: Totals::default(), per_msg: HashMap::new(), title: None, custom_title: false, queued: vec![], queue: Default::default(), taken: HashMap::new() }
     }
 
     /// 子代理的 transcript
@@ -542,6 +545,9 @@ impl Transcript {
             }
         }
         uuid.as_ref()?;
+        if !rec.sidechain && matches!(ty, "user" | "attachment") && !rec.items.is_empty() {
+            self.reconcile_queue(&rec.items);
+        }
         rec.uuid = uuid;
         Some(rec)
     }
@@ -555,20 +561,58 @@ impl Transcript {
         match v["operation"].as_str() {
             Some("enqueue") => self.queue.push_back(text.unwrap_or("").to_string()),
             Some("dequeue") => {
-                self.queue.pop_front();
+                if let Some(q) = self.queue.pop_front() {
+                    self.note_taken(q);
+                }
             }
             Some("popAll" | "clear") => self.queue.clear(),
             _ => {
                 // 带图片的消息 `enqueue` 不带内容（content 缺），`remove` 才带文字：按内容对不上就取走最前面那条没内容的，
                 // 否则它一直留在队列里，后面的 `dequeue`（取最前面那条）取错，真正排着的反而删不掉、旧消息也冒出来
                 let at = text.and_then(|t| self.queue.iter().position(|q| same_queued(q, t))).or_else(|| text.and_then(|_| self.queue.iter().position(|q| q.is_empty())));
-                if let Some(n) = at {
-                    self.queue.remove(n);
+                if let Some(q) = at.and_then(|n| self.queue.remove(n)) {
+                    // 带图片的消息 enqueue 没有内容：账记在 remove 带的文字上
+                    self.note_taken(if q.is_empty() { text.unwrap_or("").to_string() } else { q });
                 }
             }
         }
+        self.refresh_queued();
+    }
+
+    fn note_taken(&mut self, text: String) {
+        if !text.trim().is_empty() && !text.contains("<task-notification>") && !text.starts_with("<cross-session-message") {
+            *self.taken.entry(text.trim().to_string()).or_default() += 1;
+        }
+    }
+
+    fn refresh_queued(&mut self) {
         // 后台任务通知、别的会话发来的消息（`<cross-session-message>`）不是用户发的，并进对话时也不显示
         self.queued = self.queue.iter().filter(|s| !s.contains("<task-notification>") && !s.starts_with("<cross-session-message") && !s.trim().is_empty()).cloned().collect();
+    }
+
+    /// 对话里真的出现了一条用户消息（发出去的、或运行中并进来的）：它不可能还在排队。
+    /// `dequeue` 不带内容、取最前面那条，前面要是留着一条没人取走的旧条目（没执行完的斜杠命令……），取走的就是它，
+    /// 真正的消息一直挂在“排队中”，之后每条都这样。照着对话里出现的消息把队列对齐
+    fn reconcile_queue(&mut self, items: &[Item]) {
+        let mut changed = false;
+        for it in items {
+            let Body::User { text, .. } = &it.body else { continue };
+            let t = text.trim();
+            if t.is_empty() {
+                continue;
+            }
+            if let Some(n) = self.taken.get_mut(t).filter(|n| **n > 0) {
+                *n -= 1;
+                continue;
+            }
+            if let Some(at) = self.queue.iter().position(|q| !q.is_empty() && same_queued(q.trim(), t)) {
+                self.queue.remove(at);
+                changed = true;
+            }
+        }
+        if changed {
+            self.refresh_queued();
+        }
     }
 }
 
@@ -1312,5 +1356,26 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// 队首留着一条没人取走的旧条目（没执行完的斜杠命令）：后面的 dequeue 取走的是它，真消息不能一直挂在“排队中”
+    #[test]
+    fn stale_queue_head_does_not_pin_later_messages() {
+        let mut t = Transcript::new("/nonexistent".into());
+        let op = |o: &str, c: Option<&str>| line(match c { Some(c) => json!({"type":"queue-operation","operation":o,"content":c}), None => json!({"type":"queue-operation","operation":o}) });
+        t.feed(op("enqueue", Some("/new")).as_bytes());
+        // 空闲时发的：enqueue、dequeue 同一瞬间，随后才是用户消息
+        t.feed(op("enqueue", Some("第一条")).as_bytes());
+        t.feed(op("dequeue", None).as_bytes());
+        assert_eq!(t.queued, ["第一条"]);
+        t.feed(user("u1", None, json!("第一条")).as_bytes());
+        assert!(t.queued.is_empty(), "第一条已进对话，不再排队");
+        // 正常情况：账对得上，不多删
+        let mut t = Transcript::new("/nonexistent".into());
+        t.feed(op("enqueue", Some("好")).as_bytes());
+        t.feed(op("dequeue", None).as_bytes());
+        t.feed(op("enqueue", Some("好")).as_bytes());
+        t.feed(user("u1", None, json!("好")).as_bytes());
+        assert_eq!(t.queued, ["好"], "后面排着的同名消息还在");
     }
 }

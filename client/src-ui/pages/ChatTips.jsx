@@ -15,7 +15,7 @@ const HOWTO = [
   { id: 'slash' },
   { id: 'paste', desk: true },
   { id: 'photo', touch: true },
-  { id: 'mode', only: ['claude'], desk: true },
+  { id: 'mode', only: ['claude', 'agy'], desk: true },
   { id: 'resume' },
   { id: 'history', desk: true },
   { id: 'find', desk: true },

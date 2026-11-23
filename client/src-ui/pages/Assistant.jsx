@@ -797,6 +797,7 @@ function DispatchDefaults({ state, onChange }) {
         {t('asst.defaults')}
       </h3>
       <p className="muted asst-small">{t('asst.defaults_hint')}</p>
+      <DispatchEngine state={state} installed={engines} onChange={onChange} />
       {list.map((e) => (
         <EngineDefaults key={e} engine={e} cur={state.settings?.[e] ?? {}} onChange={onChange} />
       ))}
@@ -804,21 +805,78 @@ function DispatchDefaults({ state, onChange }) {
   );
 }
 
+/** 派活默认用哪个工具：自动（装了 Claude Code 用它，否则 Codex）或固定一个；助理按你的话指定了的照你说的 */
+function DispatchEngine({ state, installed, onChange }) {
+  const { t } = useTranslation();
+  const { busy, save } = useSaveSettings(onChange);
+  const cur = state.settings?.dispatch_engine ?? '';
+  const opts = [
+    ['', t('asst.dispatch_engine_auto'), { hint: t('asst.dispatch_engine_auto_hint') }],
+    ...ENGINES.filter((e) => installed.includes(e) || e === cur).map((e) => [
+      e,
+      <span key={e} className="asst-opt">
+        <LaunchIcon launch={e} size={14} />
+        {ENGINE_NAMES[e]}
+      </span>,
+      installed.includes(e) ? undefined : { hint: t('asst.dispatch_engine_missing') },
+    ]),
+  ];
+  return (
+    <div className="asst-switch">
+      <span>{t('asst.dispatch_engine')}</span>
+      <Select
+        className="asst-pick"
+        value={cur}
+        disabled={busy}
+        options={opts}
+        onChange={(e) => {
+          const v = e.target.value;
+          if (v !== cur) save({ dispatch_engine: v }, () => t('asst.dispatch_engine_saved', { name: v ? ENGINE_NAMES[v] : t('asst.dispatch_engine_auto') }));
+        }}
+        aria-label={t('asst.dispatch_engine')}
+        title={t('asst.dispatch_engine')}
+      />
+    </div>
+  );
+}
+
 function EngineDefaults({ engine, cur, onChange }) {
   const { t } = useTranslation();
   const { busy, save } = useSaveSettings(onChange);
   const [models, setModels] = useState(null);
+  const [accounts, setAccounts] = useState(null);
+  const account = cur.account ?? '';
   useEffect(() => {
     let live = true;
-    api.get(`/draft/models?agent=${engine}`).then(
+    api.get(engine === 'codex' ? '/codex-profiles' : '/claude-profiles').then(
+      (r) => live && setAccounts(r ?? { profiles: [] }),
+      () => live && setAccounts({ profiles: [] }),
+    );
+    return () => {
+      live = false;
+    };
+  }, [engine]);
+  useEffect(() => {
+    let live = true;
+    setModels(null);
+    // 模型列表按选的账号拉（第三方接口的模型不一样）
+    api.get(`/draft/models?agent=${engine}&profile=${encodeURIComponent(account)}`).then(
       (r) => live && setModels(r?.options ?? []),
       () => live && setModels([]),
     );
     return () => {
       live = false;
     };
-  }, [engine]);
+  }, [engine, account]);
   const name = ENGINE_NAMES[engine];
+  const acctName = (x) => x.name || t(engine === 'codex' ? 'xprof.builtin' : 'cprof.builtin');
+  const acctList = accounts?.profiles ?? [];
+  const defAcct = acctList.find((x) => x.id === accounts?.default);
+  const acctNone = t('asst.defaults_account_none', { name: defAcct ? acctName(defAcct) : '' });
+  const acctOpts = [
+    ['', acctNone, { hint: t('asst.defaults_account_none_hint') }],
+    ...acctList.map((x) => [x.id, acctName(x), x.kind === 'api' ? { hint: t('asst.defaults_account_api') } : undefined]),
+  ];
   const put = (key, v, label) => save({ defaults: { [engine]: { [key]: v } } }, () => t('asst.defaults_saved', { engine: name, name: label }));
   const modeOpts = [['', t('asst.defaults_mode_none', { name: t('asst.level.project') }), { hint: t('asst.defaults_mode_none_hint') }], ...engineModeOptions(t, engine)];
   const known = (models ?? []).filter((o) => o.value && o.value !== 'default');
@@ -834,6 +892,22 @@ function EngineDefaults({ engine, cur, onChange }) {
         <LaunchIcon launch={engine} size={15} />
         <b>{name}</b>
       </div>
+      {acctList.length > 1 || account ? (
+        <div className="asst-switch">
+          <span>{t('asst.defaults_account')}</span>
+          <Select
+            className="asst-pick"
+            value={acctList.some((x) => x.id === account) ? account : ''}
+            disabled={busy || accounts == null}
+            options={acctOpts}
+            onChange={(e) => {
+              const v = e.target.value;
+              if (v !== account) put('account', v, v ? acctName(acctList.find((x) => x.id === v) ?? { name: v }) : acctNone);
+            }}
+            aria-label={`${name} ${t('asst.defaults_account')}`}
+          />
+        </div>
+      ) : null}
       <div className="asst-switch">
         <span>{t('asst.defaults_mode')}</span>
         <Select

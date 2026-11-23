@@ -9,7 +9,7 @@ import { useTranslation } from 'react-i18next';
 
 import { SafetyNote, useStatus } from '../App.jsx';
 import { deviceApi, rememberTerminals, terminalDevice } from '../shared/api.js';
-import { ATTACH_FILE_MAX, ATTACH_MAX, CHAT_LAUNCHES, effortsFor, isDshWeb } from '../shared/chat.js';
+import { ATTACH_FILE_MAX, ATTACH_MAX, CHAT_LAUNCHES, effortsFor, groupModelOptions, isDshWeb } from '../shared/chat.js';
 import { formatBytes } from '../shared/xfer.js';
 import { DeviceAvatar, deviceColor, LaunchIcon } from '../shared/brands.jsx';
 import { deviceName, osLabel, useDevices } from '../shared/devices.jsx';
@@ -20,7 +20,7 @@ import PopMenu from '../shared/PopMenu.jsx';
 import { useRouter } from '../shared/router.jsx';
 import { baseName, isDraftProject, projectEntries, projectKey, projectPath, useSessions } from '../shared/sessions.jsx';
 import { Button, ErrorNote, Spinner, Switch, useLoad, useToast } from '../shared/ui.jsx';
-import { ClaudeProfilePick, CodexProfilePick } from './ClaudeProfiles.jsx';
+import { AgyProfilePick, ClaudeProfilePick, CodexProfilePick } from './ClaudeProfiles.jsx';
 import { DiscoverCard } from './AddProject.jsx';
 import { Onboarding, useGuideShowsRemote } from './Onboarding.jsx';
 import { AiLinks, DraftTip } from './Discover.jsx';
@@ -366,8 +366,8 @@ function DraftForm() {
   const willChat = canChat && !termMode;
   // 类型按钮上写清楚开出来的是对话界面还是终端
   const modeName = t(willChat ? 'sess.mode.chat' : 'sess.mode.term_short');
-  // 选模型：那台电脑上的 Claude Code / Codex 自己列的（对话界面才能先选好）
-  const pickModel = willChat && (launch === 'claude' || launch === 'codex');
+  // 选模型：那台电脑上的 Claude Code / Codex / Antigravity 自己列的（对话界面才能先选好）
+  const pickModel = willChat && (launch === 'claude' || launch === 'codex' || launch === 'agy');
   const [models] = useLoad(
     () => (pickModel ? client.get(`/draft/models?agent=${launch}${profile ? `&profile=${encodeURIComponent(profile)}` : ''}`).catch(() => null) : Promise.resolve(null)),
     [pickModel, launch, device, profile],
@@ -387,6 +387,18 @@ function DraftForm() {
   // 不选时用的强度：Claude 的 settings 里存的 > 模型自己的默认
   const defEffort = (launch === 'claude' ? models?.effort_setting : null) ?? baseOpt?.default_effort ?? null;
   const effortName = (x) => t(`pet.effort.${x}`, { defaultValue: x });
+  const modelGroups = groupModelOptions(modelOpts);
+  const hasModelGroups = modelGroups.some((g) => g.groupName);
+  const modelItem = (o) => {
+    const hint = [last?.model === o.value && t('draft.model_last'), o.description].filter(Boolean).join(' · ');
+    return {
+      label: o.label,
+      badge: o.is_group ? t('chat.model_group_badge') : undefined,
+      hint: hint || undefined,
+      checked: model === o.value,
+      onClick: () => setModel(o.value),
+    };
+  };
   // 思考强度放在最上面：模型列表很长，放在后面要滚到底才看得到
   const modelItems = [
     efforts.length > 0 && { head: t('pet.gen_effort') },
@@ -394,10 +406,9 @@ function DraftForm() {
     ...efforts.map((x) => ({ label: effortName(x), hint: last?.effort === x ? t('draft.model_last') : undefined, checked: effort === x, onClick: () => setEffort(x) })),
     { head: t('chat.model') },
     { label: t('draft.model_default'), checked: !model, onClick: () => setModel('') },
-    ...modelOpts.map((o) => {
-      const hint = [last?.model === o.value && t('draft.model_last'), o.description].filter(Boolean).join(' · ');
-      return { label: o.label, hint: hint || undefined, checked: model === o.value, onClick: () => setModel(o.value) };
-    }),
+    ...(hasModelGroups
+      ? modelGroups.flatMap((g) => [g.groupName && { head: g.groupName }, ...g.options.map(modelItem)])
+      : modelOpts.map(modelItem)),
   ];
   // 按钮上的选择正是上次用的（没另选）：标一下，免得以为默认就是这个
   const usingLast = Boolean(last && !modelTouched.current && (model || effort) && (last.model ?? '') === model && (last.effort ?? '') === effort);
@@ -503,6 +514,8 @@ function DraftForm() {
         full_access: canFull && fullAccess,
         claude_profile: launch === 'claude' && !container && profile ? profile : undefined,
         codex_profile: launch === 'codex' && !container && profile ? profile : undefined,
+        // 只有对话模式能换 agy 账号（终端里的 agy 没有换账号目录的参数）
+        agy_profile: launch === 'agy' && willChat && !container && profile ? profile : undefined,
         start: true,
       });
       if (r.id) {
@@ -821,6 +834,7 @@ function DraftForm() {
             )}
             {launch === 'claude' && !container && <ClaudeProfilePick client={client} device={device} value={profile} onChange={setProfile} className="draft-chip" />}
             {launch === 'codex' && !container && <CodexProfilePick client={client} device={device} value={profile} onChange={setProfile} className="draft-chip" />}
+            {launch === 'agy' && willChat && !container && <AgyProfilePick client={client} device={device} value={profile} onChange={setProfile} className="draft-chip" />}
             {canFull && (
               <button type="button" className="draft-chip draft-full" aria-pressed={fullAccess} onClick={() => setFullAccess(!fullAccess)} title={t(`form.full_access_hint_${launch}`)}>
                 <ShieldCheck size={14} aria-hidden="true" />

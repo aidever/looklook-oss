@@ -203,6 +203,7 @@ function PluginBrowser({ agent, data, busy, onOp, onClose }) {
   const [q, setQ] = useState('');
   const [scope, setScope] = useState('user');
   const [market, setMarket] = useState('');
+  const [target, setTarget] = useState('');
   const have = useMemo(() => new Set((data.installed ?? []).map((p) => p.id)), [data]);
   const list = useMemo(() => {
     const s = q.trim().toLowerCase();
@@ -210,69 +211,91 @@ function PluginBrowser({ agent, data, busy, onOp, onClose }) {
   }, [data, q, have]);
   return (
     <Modal open onClose={onClose} title={t('chat.plugins_browse')} wide className="chat-plugins-modal">
-      <div className="chat-acts">
-        <Search size={15} aria-hidden="true" />
-        <input className="chat-field grow" placeholder={t('chat.plugins_search')} value={q} onChange={(e) => setQ(e.target.value)} />
-        {agent === 'claude' && (
-          <select className="chat-field" value={scope} onChange={(e) => setScope(e.target.value)} aria-label={t('chat.config_rule_where')}>
-            {['user', 'project', 'local'].map((k) => (
-              <option key={k} value={k}>
-                {t(`chat.src_${k}`)}
-              </option>
+      {agent === 'agy' && (
+        <form
+          className="chat-acts chat-config-add"
+          onSubmit={async (e) => {
+            e.preventDefault();
+            if (target.trim() && (await onOp('ai', { op: 'install', name: target.trim() }))) setTarget('');
+          }}
+        >
+          <input className="chat-field grow" placeholder={t('chat.plugin_install_ph')} value={target} onChange={(e) => setTarget(e.target.value)} />
+          <Button type="submit" variant="secondary" busy={busy === 'ai'} disabled={!!busy || !target.trim()}>
+            {t('chat.plugin_install')}
+          </Button>
+        </form>
+      )}
+      {(agent !== 'agy' || list.length > 0) && (
+        <>
+          <div className="chat-acts">
+            <Search size={15} aria-hidden="true" />
+            <input className="chat-field grow" placeholder={t('chat.plugins_search')} value={q} onChange={(e) => setQ(e.target.value)} />
+            {agent === 'claude' && (
+              <select className="chat-field" value={scope} onChange={(e) => setScope(e.target.value)} aria-label={t('chat.config_rule_where')}>
+                {['user', 'project', 'local'].map((k) => (
+                  <option key={k} value={k}>
+                    {t(`chat.src_${k}`)}
+                  </option>
+                ))}
+              </select>
+            )}
+          </div>
+          <ul className="chat-rules chat-plugin-list">
+            {list.length === 0 && <li className="chat-note">{t('chat.plugins_none')}</li>}
+            {list.map((p) => (
+              <li key={p.id}>
+                <span className="chat-plugin-text">
+                  <b>{p.name ?? p.id}</b>
+                  <span className="chat-note">{p.market}</span>
+                  {p.description && <small>{p.description}</small>}
+                </span>
+                <Button variant="secondary" busy={busy === `i:${p.id}`} disabled={!!busy || p.available === false} onClick={() => onOp(`i:${p.id}`, { op: 'install', name: p.id, scope: agent === 'claude' ? scope : undefined })}>
+                  {t('chat.plugin_install')}
+                </Button>
+              </li>
             ))}
-          </select>
-        )}
-      </div>
-      <ul className="chat-rules chat-plugin-list">
-        {list.length === 0 && <li className="chat-note">{t('chat.plugins_none')}</li>}
-        {list.map((p) => (
-          <li key={p.id}>
-            <span className="chat-plugin-text">
-              <b>{p.name ?? p.id}</b>
-              <span className="chat-note">{p.market}</span>
-              {p.description && <small>{p.description}</small>}
-            </span>
-            <Button variant="secondary" busy={busy === `i:${p.id}`} disabled={!!busy || p.available === false} onClick={() => onOp(`i:${p.id}`, { op: 'install', name: p.id, scope: agent === 'claude' ? scope : undefined })}>
-              {t('chat.plugin_install')}
+          </ul>
+        </>
+      )}
+      {agent !== 'agy' && (
+        <>
+          <h4 className="chat-side-title">{t('chat.plugin_markets')}</h4>
+          <ul className="chat-rules">
+            {(data.markets ?? []).map((m) => (
+              <li key={m.name}>
+                <b className="ellipsis">{m.name}</b>
+                {m.source && m.source !== m.name && <span className="chat-note ellipsis">{m.source}</span>}
+                <button type="button" className="chat-more" disabled={!!busy} onClick={() => onOp(`mu:${m.name}`, { op: 'market_update', name: m.name })}>
+                  {busy === `mu:${m.name}` ? <LoaderCircle size={13} className="spin" /> : t('chat.plugin_update')}
+                </button>
+                <button
+                  type="button"
+                  className="chat-more"
+                  disabled={!!busy}
+                  aria-label={t('chat.config_remove')}
+                  onClick={async () => {
+                    if (await confirm({ title: t('chat.plugin_market_remove_q', { name: m.name }), confirm: t('chat.config_remove'), danger: true })) onOp(`mr:${m.name}`, { op: 'market_remove', name: m.name });
+                  }}
+                >
+                  <X size={13} aria-hidden="true" />
+                </button>
+              </li>
+            ))}
+          </ul>
+          <form
+            className="chat-acts chat-config-add"
+            onSubmit={async (e) => {
+              e.preventDefault();
+              if (market.trim() && (await onOp('ma', { op: 'market_add', name: market.trim() }))) setMarket('');
+            }}
+          >
+            <input className="chat-field grow" placeholder={t('chat.plugin_market_ph')} value={market} onChange={(e) => setMarket(e.target.value)} />
+            <Button type="submit" variant="secondary" busy={busy === 'ma'} disabled={!!busy || !market.trim()}>
+              {t('chat.config_add')}
             </Button>
-          </li>
-        ))}
-      </ul>
-      <h4 className="chat-side-title">{t('chat.plugin_markets')}</h4>
-      <ul className="chat-rules">
-        {(data.markets ?? []).map((m) => (
-          <li key={m.name}>
-            <b className="ellipsis">{m.name}</b>
-            {m.source && m.source !== m.name && <span className="chat-note ellipsis">{m.source}</span>}
-            <button type="button" className="chat-more" disabled={!!busy} onClick={() => onOp(`mu:${m.name}`, { op: 'market_update', name: m.name })}>
-              {busy === `mu:${m.name}` ? <LoaderCircle size={13} className="spin" /> : t('chat.plugin_update')}
-            </button>
-            <button
-              type="button"
-              className="chat-more"
-              disabled={!!busy}
-              aria-label={t('chat.config_remove')}
-              onClick={async () => {
-                if (await confirm({ title: t('chat.plugin_market_remove_q', { name: m.name }), confirm: t('chat.config_remove'), danger: true })) onOp(`mr:${m.name}`, { op: 'market_remove', name: m.name });
-              }}
-            >
-              <X size={13} aria-hidden="true" />
-            </button>
-          </li>
-        ))}
-      </ul>
-      <form
-        className="chat-acts chat-config-add"
-        onSubmit={async (e) => {
-          e.preventDefault();
-          if (market.trim() && (await onOp('ma', { op: 'market_add', name: market.trim() }))) setMarket('');
-        }}
-      >
-        <input className="chat-field grow" placeholder={t('chat.plugin_market_ph')} value={market} onChange={(e) => setMarket(e.target.value)} />
-        <Button type="submit" variant="secondary" busy={busy === 'ma'} disabled={!!busy || !market.trim()}>
-          {t('chat.config_add')}
-        </Button>
-      </form>
+          </form>
+        </>
+      )}
       <div className="modal-actions">
         <Button variant="secondary" onClick={onClose}>
           {t('action.close')}

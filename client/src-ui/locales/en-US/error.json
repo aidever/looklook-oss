@@ -370,5 +370,11 @@
   "PLUGIN_UNSUPPORTED": "Plugins aren't supported on this system yet",
   "NATIVE_TERM_HERE_ONLY": "Native terminals can only be opened on this computer",
   "NATIVE_TERM_FAILED": "Couldn't open the terminal: {{error}}",
-  "NOT_RUNNING": "The terminal isn't running"
+  "NOT_RUNNING": "The terminal isn't running",
+  "HTTPS_UNREACHABLE": "Public HTTPS failed: this browser can't reach the direct address the computer reported. Looklook may not be running there, the security group / firewall may not allow this TCP port, the public IP may have changed, or the browser or a proxy blocked the connection. Try opening the address in a new tab",
+  "HTTPS_TIMEOUT": "Public HTTPS timed out: the computer's direct address did not respond within 4 seconds; a firewall may be dropping this TCP port, or the network is very slow",
+  "HTTPS_NO_HELLO": "Connected over public HTTPS, but Looklook on the computer did not respond. Retry later; if it keeps happening, restart Looklook there",
+  "HTTPS_GRANT": "Couldn't get a direct-connection ticket: public HTTPS may have just been turned off on this computer, or its certificate expired",
+  "HTTPS_CERT_EXPIRED": "This computer's public HTTPS certificate has expired and wasn't renewed. Check that it can reach Let's Encrypt and that port 80 is open",
+  "HTTPS_FAILED": "The public HTTPS connection to this computer could not be established"
 }

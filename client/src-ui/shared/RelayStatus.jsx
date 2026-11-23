@@ -5,7 +5,7 @@
 //   远程（浏览器，或 App 里选中了别的电脑）：“远程 · 86 ms”，点开是连着哪台电脑、端到端加密、延迟和线路；
 //   局域网：“局域网”，点开说明是直接连到这台电脑。
 import { Globe, Lock, RefreshCw } from 'lucide-react';
-import { useEffect, useRef, useState } from 'react';
+import { Fragment, useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 
 import { useStatus } from '../App.jsx';
@@ -211,8 +211,10 @@ function RemotePop({ ms, name, path, device }) {
             const dotCls = st === 'failed' ? 'bad' : st === 'connecting' || st === 'reconnecting' ? 'wait' : p ? `path-${p.kind}` : 'path-none';
             const subText = st === 'online' ? (p ? [t(`path.${p.kind}`), p.rtt_ms != null ? `${p.rtt_ms} ms` : null].filter(Boolean).join(' · ') : t('devices.online')) : linkLabel(t, d, links);
             const busy = reconnectingId === d.id;
+            const reason = st === 'failed' ? links[d.id]?.reason || '' : '';
             return (
-              <div key={d.id} className={`conn-dev-row ${d.id === device ? 'on' : ''}`}>
+              <Fragment key={d.id}>
+              <div className={`conn-dev-row ${d.id === device ? 'on' : ''}`}>
                 <span className={`dot ${dotCls}`} aria-hidden="true" />
                 <span className="conn-dev-name ellipsis">{deviceName(t, d)}</span>
                 <span className="conn-dev-meta">{subText}</span>
@@ -236,6 +238,14 @@ function RemotePop({ ms, name, path, device }) {
                   <RefreshCw size={12} className={busy ? 'spin' : undefined} />
                 </button>
               </div>
+              {/* 连不上：写明原因（公网 HTTPS 直连不通时不会回退 WebRTC，靠这里和右上角的提示告诉用户） */}
+              {st === 'failed' && (
+                <p className="conn-dev-err">
+                  {t(`error:${reason}`, { defaultValue: t('devices.unreachable_note') })}
+                  {reason.startsWith('HTTPS_') && d.direct?.url && <span className="mono"> {d.direct.url}</span>}
+                </p>
+              )}
+              </Fragment>
             );
           })}
         </div>

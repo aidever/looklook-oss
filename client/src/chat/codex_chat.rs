@@ -229,11 +229,32 @@ pub const ASK_COMMANDS: &str = "askCommands";
 /// 全权但危险的问：不用沙箱，每条命令都先来问（untrusted），看看照命令规则、风险替它放，命中的才问用户。
 /// Codex 自己不问的命令看看拦不到，所以全权不直接用 never
 pub const FULL_GUARDED: &str = "fullGuarded";
+/// Codex 问“要不要让 MCP 服务跑这个工具”（`mcpServer/elicitation/request`，`_meta.codex_approval_kind = mcp_tool_call`）：
+/// 没标只读的 MCP 工具在 untrusted / on-request 下每次调用都来问（实测 0.171）。挂起时 `Pending.tool` 记成这个
+const MCP_CALL: &str = "mcp_tool_call";
 
-/// 助理派出去的会话（[`ASK_COMMANDS`]、[`FULL_GUARDED`]）来问的审批，看看能不能直接替用户放：
-/// 全权：命令规则没拦（调用前已经看过）、不是高风险的命令都放，改文件都放；动手前问：只放改项目里的文件
+/// 挂起的审批按什么算：MCP 工具调用是 [`MCP_CALL`]（`tool` 是服务名，界面标题要用），其余就是 `tool`
+fn approval_tool<'a>(tool: &'a str, input: &Value) -> &'a str {
+    if input.get("mcp_call").is_some() { MCP_CALL } else { tool }
+}
+
+/// 替用户放行时给 app-server 的答复
+fn accept_result(tool: &str, input: &Value) -> Value {
+    match tool {
+        MCP_CALL => json!({ "action": "accept", "content": {} }),
+        "permissions" => json!({ "permissions": input["permissions"], "scope": "turn" }),
+        _ => json!({ "decision": "accept" }),
+    }
+}
+
+/// 来问的审批看看能不能照会话现在的权限模式直接替用户放（`tool` 是 [`MCP_CALL`] 时是 MCP 工具调用）：
+/// - 全权（[`FULL_GUARDED`]）：命令规则没拦（调用前已经看过）、不是高风险的命令都放，改文件、MCP 工具都放；
+/// - 完全访问：都放。Codex 在完全访问下本来不问，来问的是换模式前就开始的这一轮（审批策略一轮里换不了）；
+/// - 动手前问：只放改项目里的文件。
 fn auto_accept(perm: &str, tool: &str, input: &Value, root: &std::path::Path) -> bool {
     match (perm, tool) {
+        ("fullAccess", _) => true,
+        (FULL_GUARDED, MCP_CALL) => true,
         (FULL_GUARDED, "Bash") => super::risk::level("Bash", input) != "high",
         (FULL_GUARDED, "apply_patch") => true,
         (ASK_COMMANDS, "apply_patch") => {
@@ -1120,8 +1141,12 @@ impl Chat {
             // 要多给权限（联网、目录外读写）：和终端里一样问一次，允许 = 这一轮 / 本会话都给
             "item/permissions/requestApproval" => ("permissions", "permission", json!({ "permissions": p["permissions"], "description": p["reason"], "cwd": p["cwd"] })),
             // MCP 服务要用户填表 / 打开网址
+            // （Codex 问要不要跑某个 MCP 工具也走这里：带上工具名、参数，好按权限模式替用户放）
             "mcpServer/elicitation/request" => {
-                let view = super::elicitation_view(p["message"].as_str().unwrap_or(""), p["mode"].as_str().unwrap_or("form"), p["url"].as_str(), &p["requestedSchema"], None, None);
+                let mut view = super::elicitation_view(p["message"].as_str().unwrap_or(""), p["mode"].as_str().unwrap_or("form"), p["url"].as_str(), &p["requestedSchema"], None, None);
+                if p["_meta"]["codex_approval_kind"] == "mcp_tool_call" {
+                    view["mcp_call"] = json!({ "tool": p["_meta"]["tool_name"], "params": p["_meta"]["tool_params"] });
+                }
                 (p["serverName"].as_str().unwrap_or("MCP"), "elicitation", view)
             }
             _ => {
@@ -1139,10 +1164,14 @@ impl Chat {
             let _ = server.respond(rid, none).await;
             return;
         };
+        let what = approval_tool(tool, &input);
         // 助理的大脑：沙箱挡下来、来问的，先过助理的闸门（放行的不用问用户，拒绝的告诉它为什么）
-        if kind == "permission" && tool != "permissions" && crate::assistant::is_gated(&self.store, &inst.id) {
+        if (kind == "permission" || what == MCP_CALL) && tool != "permissions" && crate::assistant::is_gated(&self.store, &inst.id) {
             use crate::assistant::Verdict;
-            let verdict = if tool == "Bash" {
+            let verdict = if what == MCP_CALL {
+                let name = format!("mcp__{tool}__{}", input["mcp_call"]["tool"].as_str().unwrap_or_default());
+                self.assistant_gate(&inst.id, &name, &input["mcp_call"]["params"])
+            } else if tool == "Bash" {
                 self.assistant_gate(&inst.id, "Bash", &json!({ "command": command_text(&p["command"]) }))
             } else {
                 // 改文件：每个文件都要放行才放行，有一个拒绝就拒绝
@@ -1152,11 +1181,11 @@ impl Chat {
             };
             match verdict {
                 Verdict::Allow => {
-                    let _ = server.respond(rid, json!({ "decision": "accept" })).await;
+                    let _ = server.respond(rid, accept_result(what, &input)).await;
                     return;
                 }
                 Verdict::Deny(why) => {
-                    let _ = server.respond(rid, json!({ "decision": "decline" })).await;
+                    let _ = server.respond(rid, if what == MCP_CALL { json!({ "action": "decline" }) } else { json!({ "decision": "decline" }) }).await;
                     self.codex_say_later(&inst.id, why);
                     return;
                 }
@@ -1173,15 +1202,13 @@ impl Chat {
             }
             hit => hit.map(|h| super::GuardWait::new(h, cmd)),
         };
-        // 助理派出去的会话：照它那一档替用户放（命令规则要确认的不放）
-        if kind == "permission" && guard.is_none() {
+        // 照会话现在的权限模式替用户放（助理派出去的会话那几档；一轮里换了模式也按新的，见 auto_accept）。命令规则要确认的不放
+        if (kind == "permission" || what == MCP_CALL) && guard.is_none() {
             let perm = lock(&inst.st).codex.perm.clone().unwrap_or_default();
-            if perm == ASK_COMMANDS || perm == FULL_GUARDED {
-                let root = self.codex_current_cwd(&inst.id).map(PathBuf::from).unwrap_or_default();
-                if auto_accept(&perm, tool, &input, &root) {
-                    let _ = server.respond(rid, json!({ "decision": "accept" })).await;
-                    return;
-                }
+            let root = self.codex_current_cwd(&inst.id).map(PathBuf::from).unwrap_or_default();
+            if auto_accept(&perm, what, &input, &root) {
+                let _ = server.respond(rid, accept_result(what, &input)).await;
+                return;
             }
         }
         let (tx, rx) = oneshot::channel();
@@ -1706,6 +1733,8 @@ impl Chat {
 
     /// 模型、思考强度：记下来，下一轮 `turn/start` 带上（之后的轮次都沿用）
     pub(super) fn codex_setting(&self, id: &str, kind: &str, value: &str) -> Result<(), LocalError> {
+        // 换权限模式时重判等着的改文件审批要用（先拿：里面要锁 st）
+        let root = if kind == "mode" { self.codex_current_cwd(id).map(PathBuf::from).unwrap_or_default() } else { PathBuf::new() };
         let inst = self.inst(id);
         let mut st = lock(&inst.st);
         match kind {
@@ -1737,6 +1766,17 @@ impl Chat {
                 }
                 st.codex.perm = Some(value.to_string());
                 st.mode = Some(value.to_string());
+                // 正在等用户点的审批：新模式下该放的马上放（这一轮的审批策略换不了，之后来问的也按新模式放，见 auto_accept）
+                let fits = st.pending.as_ref().is_some_and(|p| {
+                    p.guard.is_none() && (p.kind == "permission" || approval_tool(&p.tool, &p.input) == MCP_CALL) && auto_accept(value, approval_tool(&p.tool, &p.input), &p.input, &root)
+                });
+                if fits {
+                    if let Some(p) = st.pending.as_mut() {
+                        tracing::info!(id, mode = value, "换了权限模式：等着的审批照新模式放行");
+                        p.resolve(accept_result(approval_tool(&p.tool, &p.input), &p.input).to_string());
+                    }
+                    Self::settle(&inst, &mut st, Phase::Running);
+                }
             }
             _ => return Err(LocalError::invalid("kind", "invalid")),
         }
@@ -2783,7 +2823,10 @@ mod tests {
         assert!(!auto_accept(ASK_COMMANDS, "apply_patch", &patch(&["/work/app/a.rs"], json!("/work")), root), "要多给目录的问用户");
         assert!(!auto_accept(ASK_COMMANDS, "apply_patch", &patch(&[], Value::Null), root));
         assert!(!auto_accept("workspaceWrite", "Bash", &bash("ls"), root), "用户自己选的档不替他放");
-        assert!(!auto_accept("fullAccess", "apply_patch", &patch(&["/work/app/a.rs"], Value::Null), root));
+        assert!(auto_accept("fullAccess", "Bash", &bash("git push --force origin main"), root), "换成完全访问前开始的一轮：都放");
+        assert!(auto_accept(FULL_GUARDED, MCP_CALL, &json!({}), root), "全权：MCP 工具（连服务器等）不问");
+        assert!(!auto_accept(ASK_COMMANDS, MCP_CALL, &json!({}), root));
+        assert!(!auto_accept("workspaceWrite", MCP_CALL, &json!({}), root));
     }
 
     #[test]

@@ -6,6 +6,8 @@ import { useTranslation } from 'react-i18next';
 
 import { deviceApi } from './api.js';
 import { boardState } from './board.js';
+import { deviceName, useDevices } from './devices.jsx';
+import { linkState, useLinks } from './paths.jsx';
 import { petNotify, useDeskNotify } from './ChatPet.jsx';
 import { useSessions } from './sessions.jsx';
 
@@ -159,7 +161,7 @@ export function InAppAlerts({ activeId, open }) {
   const more = list.length - shown.length;
   const Icon = { done: CheckCircle2, failed: XCircle, attn: BellRing };
   return (
-    <div className="notices" aria-live="polite">
+    <>
       <div className="notice-card" onMouseEnter={() => setHover(true)} onMouseLeave={leave} onPointerDown={onDown} onPointerUp={onUp}>
         <div className={`notice-rows ${expanded ? 'notice-rows-all' : ''}`}>
           {shown.map((x) => {
@@ -218,6 +220,54 @@ export function InAppAlerts({ activeId, open }) {
             </button>
           </div>
         )}
+      </div>
+    </>
+  );
+}
+
+/**
+ * 连不上某台电脑（连接状态 failed，比如公网 HTTPS 直连不通）：右上角一张卡片写明原因，不自动消失，要点叉关掉。
+ * 关掉的只在这次失败里不再弹；那台电脑连上过（不再是 failed）、或者原因变了，再失败时重新弹。
+ */
+export function ConnFailAlerts() {
+  const { t } = useTranslation();
+  const devices = useDevices();
+  const links = useLinks();
+  const [closed, setClosed] = useState(() => new Set());
+  const failed = (devices?.items ?? []).filter((d) => d.online && linkState(d, links) === 'failed');
+  const key = (d) => `${d.id}|${links[d.id]?.reason || ''}`;
+  const live = new Set(failed.map(key));
+  // 恢复了或者原因变了：忘掉关过的，下次失败再弹
+  useEffect(() => {
+    setClosed((xs) => {
+      const keep = new Set([...xs].filter((k) => live.has(k)));
+      return keep.size === xs.size ? xs : keep;
+    });
+  }, [[...live].sort().join('\n')]);
+  const shown = failed.filter((d) => !closed.has(key(d)));
+  if (!shown.length) return null;
+  return (
+    <div className="notice-card" role="alert">
+      <div className="notice-rows">
+        {shown.map((d) => {
+          const reason = links[d.id]?.reason || '';
+          const addr = reason.startsWith('HTTPS_') ? d.direct?.url : null;
+          return (
+            <div key={d.id} className="notice-row notice-failed notice-conn">
+              <XCircle size={18} className="notice-icon" />
+              <span className="notice-text notice-text-col">
+                <span className="notice-title">{t('inapp.conn_failed', { name: deviceName(t, d) })}</span>
+                <span className="notice-detail">
+                  {t(`error:${reason}`, { defaultValue: t('devices.unreachable_note') })}
+                  {addr && <span className="mono"> {addr}</span>}
+                </span>
+              </span>
+              <button type="button" className="notice-x" aria-label={t('action.close')} onClick={() => setClosed((xs) => new Set(xs).add(key(d)))}>
+                <X size={15} />
+              </button>
+            </div>
+          );
+        })}
       </div>
     </div>
   );

@@ -281,6 +281,9 @@ export const COMMANDS = [
   ['/worktree', 'worktree'],
   ['/share', 'share'],
   ['/export', 'outline'],
+  ['/planning'],
+  ['/grill-me'],
+  ['/schedule'],
 ];
 
 /** Codex（走 app-server）认的内置命令：/compact、/clear 由看看换成对应的请求，其余是界面自己的动作 */
@@ -297,8 +300,17 @@ export const CODEX_PASS = ['/logout'];
 
 /** DSH（走 dsh web）认的：/clear、/new 开新会话，/model 是界面的模型菜单；别的斜杠命令交给 DSH 自己执行 */
 export const DSH_COMMANDS = ['/clear', '/new', '/model', '/share', '/export'];
-/** Antigravity（agy acp）：看看自己处理的命令（别的斜杠命令照常送给 agy，菜单里列的是 agy 报的命令和技能） */
-export const AGY_COMMANDS = ['/clear', '/new', '/model', '/share', '/export'];
+/** Antigravity（agy acp）：看看界面处理的命令 + agy 原生斜杠命令（菜单里还会合并 agy 报的命令和技能） */
+export const AGY_COMMANDS = [
+  '/clear', '/new', '/model', '/resume', '/usage', '/context', '/status', '/mcp', '/plugins', '/agents', '/skills', '/hooks', '/permissions',
+  '/diff', '/rename', '/login', '/logout', '/share', '/export', '/compact', '/fast', '/goal', '/planning', '/grill-me', '/schedule', '/tasks', '/add-dir', '/btw',
+];
+
+/** Antigravity 里意思不一样的命令：/permissions 换权限模式，/tasks 打开子代理面板 */
+export const AGY_ACTIONS = { '/permissions': 'mode', '/tasks': 'agents' };
+
+/** 只有 Antigravity 有的原生工作流命令：不列给 Claude */
+export const AGY_ONLY = ['/planning', '/grill-me', '/schedule'];
 
 /** stream-json 的 Claude Code 里用不了的（`claude -p` 回“isn't available in this environment”）：不列。
  *  要回到前面用编辑重发（铅笔）或检查点 */
@@ -320,10 +332,14 @@ export function slashAction(text, agent) {
   // 带参数的照常送（例如 /model sonnet）
   if (s !== cmd) return null;
   if (agent !== 'codex' && CODEX_ONLY.includes(cmd)) return null;
+  if (agent !== 'agy' && AGY_ONLY.includes(cmd)) return null;
   if (agent === 'codex' && CODEX_ACTIONS[cmd]) return CODEX_ACTIONS[cmd];
   if (agent === 'codex' && CODEX_PASS.includes(cmd)) return null;
   if (agent === 'dsh' && !DSH_COMMANDS.includes(cmd)) return null;
-  if (agent === 'agy' && !AGY_COMMANDS.includes(cmd)) return null;
+  if (agent === 'agy') {
+    if (!AGY_COMMANDS.includes(cmd)) return null;
+    if (AGY_ACTIONS[cmd]) return AGY_ACTIONS[cmd];
+  }
   return COMMANDS.find(([c]) => c === cmd)?.[1] ?? null;
 }
 
@@ -510,13 +526,38 @@ export function baseModel(id) {
 
 const ALIASES = ['opus', 'sonnet', 'haiku', 'fable'];
 
-/** 选项是否就是这个模型（选项值、对应的模型 ID、或者别名对上家族） */
+/** 选项是否就是这个模型（选项值、对应的模型 ID、模型组成员、或者别名对上家族） */
 function optionIs(o, model) {
   const m = String(model ?? '').toLowerCase();
   if (!m) return false;
-  if (o.value.toLowerCase() === m) return true;
+  if (String(o.value ?? '').toLowerCase() === m) return true;
+  const members = o.models ?? o.group_models;
+  if (Array.isArray(members) && members.some((x) => String(x).toLowerCase() === m || baseModel(x) === baseModel(m))) return true;
   if (ALIASES.includes(m)) return o.value === m || (!o.model && modelFamily(o.value) === m);
   return Boolean(o.model) && baseModel(o.model) === baseModel(m) && o.value !== 'default';
+}
+
+/**
+ * 把模型选项按 `group` / `group_name` 分组（保持原有先后顺序）。
+ * 没有任何项带分组信息时只返回一个未分组的 `{ group: null, groupName: null, options }`。
+ */
+export function groupModelOptions(options = []) {
+  if (!options.some((o) => o?.group_name || o?.group)) return [{ group: null, groupName: null, options }];
+  const groups = [];
+  const byKey = new Map();
+  for (const o of options) {
+    const key = o?.group || o?.group_name || '';
+    let g = byKey.get(key);
+    if (!g) {
+      g = { group: o?.group ?? null, groupName: o?.group_name ?? o?.group ?? null, options: [] };
+      byKey.set(key, g);
+      groups.push(g);
+    } else if (!g.groupName && (o?.group_name || o?.group)) {
+      g.groupName = o.group_name ?? o.group;
+    }
+    g.options.push(o);
+  }
+  return groups;
 }
 
 /**
@@ -534,17 +575,34 @@ export function modelView(status, options = []) {
   const name = (m) => options.find((o) => o.value !== 'default' && optionIs(o, m))?.label ?? modelLabel(m);
   // 选的那项指向的就是回复用的模型（或者还没有回复）：勾选的那项；否则（在终端里切过）按回复用的模型找
   const selOpt = sel ? options.find((o) => o.value === sel) ?? options.find((o) => optionIs(o, sel)) : null;
-  const selIsAct = selOpt && act && (selOpt.model ? baseModel(selOpt.model) === baseModel(act) : modelFamily(selOpt.value) === modelFamily(act));
+  const selIsAct = Boolean(
+    selOpt &&
+      act &&
+      (selOpt.is_group || optionIs(selOpt, act) || (selOpt.model ? baseModel(selOpt.model) === baseModel(act) : modelFamily(selOpt.value) === modelFamily(act))),
+  );
   let checked = null;
   if (selOpt && (pending || !act || selIsAct)) checked = selOpt.value;
   else if (act) checked = options.find((o) => optionIs(o, act))?.value ?? null;
-  const label = pending || !act ? (sel === 'default' ? options.find((o) => o.value === 'default')?.description || 'Default' : sel ? name(sel) : '') : name(act);
+  const label =
+    selOpt?.is_group && checked === selOpt.value
+      ? selOpt.label
+      : pending || !act
+        ? sel === 'default'
+          ? options.find((o) => o.value === 'default')?.description || 'Default'
+          : sel
+            ? name(sel)
+            : ''
+        : name(act);
   let mismatch = null;
   if (status?.model_chosen && !pending && sel && act && sel !== 'default') {
     const o = options.find((x) => x.value === sel);
-    const want = o?.model || sel;
-    const same = ALIASES.includes(want.toLowerCase()) ? modelFamily(act) === want.toLowerCase() : baseModel(want) === baseModel(act);
-    if (!same) mismatch = name(act);
+    // 选的是模型组（实际由服务端在组内路由）：不算模型不匹配
+    if (!o?.is_group) {
+      const want = o?.model || sel;
+      const inGroup = Boolean(o && optionIs(o, act));
+      const same = inGroup || (ALIASES.includes(want.toLowerCase()) ? modelFamily(act) === want.toLowerCase() : baseModel(want) === baseModel(act));
+      if (!same) mismatch = name(act);
+    }
   }
   return { checked, label, pending, mismatch };
 }

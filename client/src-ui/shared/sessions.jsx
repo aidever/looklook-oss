@@ -95,8 +95,8 @@ export const inputAt = (i) => {
 };
 /** 会话列表的顺序：你最近用过的在前（不按在不在运行、不按 AI 最近输出）。 */
 export const bySessionOrder = (a, b) => inputAt(b) - inputAt(a);
-/** 会话显示的名字：agent 自己的会话名为主，没有时用会话名。 */
-export const sessionTitle = (i) => i?.agent_title || i?.name || '';
+/** 会话显示的名字：agent 自己的会话名为主，其次对话标题，没有时用会话名。 */
+export const sessionTitle = (i) => i?.agent_title || i?.chat?.title || i?.name || '';
 /**
  * 给对话会话改名（对话的标题跟会话名一起改，见电脑端 Chat::rename）：弹出输入框，改好返回新名字，取消返回 null。
  * confirm 是 useConfirm()，client 是这个会话所在电脑的 api。
@@ -109,19 +109,24 @@ export async function renameSession({ id, current, client, confirm, t, toast }) 
   return name;
 }
 /** 图标用的类型：现在在跑的 AI 工具（普通终端里手动起的 claude、codex 也算，电脑端 session_probe.rs 认的），否则会话的类型 */
-export const sessionLaunch = (i) => i?.tool || i?.launch;
+export const sessionLaunch = (i) => (i?.launch === 'agy' && i?.chat_ui ? 'agy' : i?.tool || i?.launch);
 /**
  * 会话是怎么用这个 AI 工具的：'chat' 对话界面、'term' 在终端里跑（手动起的、没开对话界面的）、'web' DSH 网页版；
  * 不是 AI 工具（普通终端、自定义命令）为 null。同一个工具两种用法图标一样，靠这个加角标区分。
  */
 export function sessionMode(i) {
+  if (!i) return null;
+  if (i.launch === 'agy' && i.chat_ui) return 'chat';
   const l = sessionLaunch(i);
-  if (!i || !['claude', 'codex', 'opencode', 'dsh', 'agy'].includes(l)) return null;
+  if (!['claude', 'codex', 'opencode', 'dsh', 'agy'].includes(l)) return null;
   if (l === 'dsh' && i.launch === 'dsh' && !i.chat_ui) return 'web';
   return ['claude', 'codex', 'dsh', 'agy'].includes(i.launch) && i.chat_ui && l === i.launch ? 'chat' : 'term';
 }
 /** 用户自己起的名字（和 agent 的会话名不一样时作为次要信息显示）。 */
-export const customName = (i) => (i?.agent_title && i.name_custom && i.name !== i.agent_title ? i.name : null);
+export const customName = (i) => {
+  const title = i?.agent_title || i?.chat?.title;
+  return title && i.name_custom && i.name !== title ? i.name : null;
+};
 /** 会话的目录：容器里的会话是容器里的目录。 */
 export const sessionDir = (i) => i?.container?.dir ?? i?.workdir ?? '';
 /**
@@ -145,7 +150,7 @@ const instDir = (i) => {
 };
 
 /** 能接着以前的对话的工具（客户端 history.rs 的 AGENTS）。 */
-export const AGENTS = ['claude', 'codex', 'opencode'];
+export const AGENTS = ['claude', 'codex', 'opencode', 'agy'];
 /** 项目页的地址。 */
 export const projectPath = (p) => `/project?${new URLSearchParams({ d: p.device ?? '', w: p.workdir })}`;
 

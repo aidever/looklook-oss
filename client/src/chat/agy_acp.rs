@@ -71,7 +71,8 @@ fn rpc_error(e: &Value) -> LocalError {
 
 impl AcpConn {
     /// 起 `agy acp` 并完成 `initialize`
-    pub async fn start(program: &Path, path: Option<&std::ffi::OsStr>, env: &[(String, String)], run: &Path, tx: mpsc::UnboundedSender<Incoming>) -> Result<Arc<Self>, LocalError> {
+    /// `extra`：附加参数（另外的账号：`--gemini-dir <目录>`）
+    pub async fn start(program: &Path, path: Option<&std::ffi::OsStr>, env: &[(String, String)], extra: &[String], run: &Path, tx: mpsc::UnboundedSender<Incoming>) -> Result<Arc<Self>, LocalError> {
         let _ = std::fs::create_dir_all(run);
         let log = std::fs::OpenOptions::new().create(true).append(true).open(run.join("agy-acp.log")).ok();
         let mut cmd = tokio::process::Command::new(program);
@@ -80,6 +81,7 @@ impl AcpConn {
             cmd.env("PATH", p);
         }
         cmd.args(["acp", "--process-per-session"])
+            .args(extra)
             .current_dir(run)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -195,8 +197,7 @@ impl AcpConn {
         self.alive.load(Ordering::SeqCst)
     }
 
-    /// 发请求，等答复（不限时：`session/prompt` 用）
-    pub async fn call_long(&self, method: &str, params: Value) -> Result<Value, LocalError> {
+    fn send_request(&self, method: &str, params: Value) -> Result<(i64, oneshot::Receiver<Result<Value, Value>>), LocalError> {
         if !self.alive() {
             return Err(err("AGY_UNAVAILABLE", "agy acp is not running"));
         }
@@ -204,20 +205,30 @@ impl AcpConn {
         let (tx, rx) = oneshot::channel();
         lock(&self.waiting).insert(id, tx);
         self.send(json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }));
-        match rx.await {
+        Ok((id, rx))
+    }
+
+    fn map_response(r: Result<Result<Value, Value>, oneshot::error::RecvError>) -> Result<Value, LocalError> {
+        match r {
             Ok(Ok(v)) => Ok(v),
             Ok(Err(e)) => Err(rpc_error(&e)),
             Err(_) => Err(err("AGY_UNAVAILABLE", "agy acp exited")),
         }
     }
 
+    /// 发请求，等答复（不限时：`session/prompt` 用）
+    pub async fn call_long(&self, method: &str, params: Value) -> Result<Value, LocalError> {
+        let (_, rx) = self.send_request(method, params)?;
+        Self::map_response(rx.await)
+    }
+
     pub async fn call_timeout(&self, method: &str, params: Value, wait: Duration) -> Result<Value, LocalError> {
-        let id = self.next.load(Ordering::SeqCst);
-        match tokio::time::timeout(wait, self.call_long(method, params)).await {
-            Ok(r) => r,
+        let (id, rx) = self.send_request(method, params)?;
+        match tokio::time::timeout(wait, rx).await {
+            Ok(r) => Self::map_response(r),
             Err(_) => {
-                // 等不到就不等了（之后到的答复丢掉）
-                lock(&self.waiting).retain(|k, _| *k < id);
+                // 等不到就不等了（只移除这一个请求，不影响并发的其他请求）
+                lock(&self.waiting).remove(&id);
                 Err(err("AGY_REQUEST_FAILED", format!("{method}: timed out")))
             }
         }
@@ -280,6 +291,43 @@ mod tests {
         assert_eq!(e.params["detail"], "boom");
     }
 
+    #[tokio::test]
+    async fn call_timeout_does_not_drop_concurrent_waiter() {
+        let (out_tx, _out_rx) = mpsc::unbounded_channel();
+        let (in_tx, _in_rx) = mpsc::unbounded_channel();
+        let conn = Arc::new(AcpConn {
+            out: out_tx,
+            waiting: Mutex::new(HashMap::new()),
+            next: AtomicI64::new(1),
+            alive: AtomicBool::new(true),
+            pid: None,
+            version: Mutex::new(None),
+            child: Mutex::new(None),
+        });
+        // 请求 A（id=1）很快超时；请求 B（id=2）并发等待且 id 更大
+        let c1 = conn.clone();
+        let req_a = tokio::spawn(async move { c1.call_timeout("slow_op", json!({}), Duration::from_millis(40)).await });
+        // 确保 A 先注册 id=1
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let c2 = conn.clone();
+        let req_b = tokio::spawn(async move { c2.call_long("session/prompt", json!({ "sessionId": "s2" })).await });
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        // A 超时失败
+        let err_a = req_a.await.unwrap().unwrap_err();
+        assert_eq!(err_a.code, "AGY_REQUEST_FAILED");
+        assert!(err_a.params["detail"].as_str().unwrap_or("").contains("timed out"));
+        // 只有 id=1 被移除了，id=2 仍然在等答复
+        {
+            let w = lock(&conn.waiting);
+            assert!(!w.contains_key(&1), "超时的请求应被移除");
+            assert!(w.contains_key(&2), "并发的另一个请求不能被误删");
+        }
+        // 分发 id=2 的答复，请求 B 正常完成
+        conn.dispatch(json!({ "jsonrpc": "2.0", "id": 2, "result": { "stopReason": "end_turn" } }), &in_tx);
+        let res_b = req_b.await.unwrap().unwrap();
+        assert_eq!(res_b["stopReason"], "end_turn");
+    }
+
     /// 用一个假的 agy（shell 脚本）走一遍：initialize、请求对号、审批请求、通知、退出
     #[cfg(unix)]
     #[tokio::test]
@@ -306,7 +354,7 @@ echo "$line" > "$(dirname "$0")/perm"
         .unwrap();
         std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let conn = AcpConn::start(&fake, None, &[], dir.path(), tx).await.unwrap();
+        let conn = AcpConn::start(&fake, None, &[], &[], dir.path(), tx).await.unwrap();
         assert_eq!(lock(&conn.version).as_deref(), Some("9.9.9"));
         let r = conn.call("session/new", json!({ "cwd": "/" })).await.unwrap();
         assert_eq!(r["sessionId"], "s1");

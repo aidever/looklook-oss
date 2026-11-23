@@ -240,7 +240,10 @@ export default function PopMenu({ items, className = 'btn btn-ghost btn-icon', i
                 {x.icon && <x.icon size={17} aria-hidden="true" />}
                 {x.checked !== undefined && <Check size={15} aria-hidden="true" style={{ visibility: x.checked ? 'visible' : 'hidden' }} />}
                 <span className="grow">
-                  {x.label}
+                  <span className="menu-pop-label">
+                    {x.label}
+                    {x.badge && <span className="badge menu-pop-badge">{x.badge}</span>}
+                  </span>
                   {x.hint && (
                     <span className="menu-pop-hint" id={`${uid}-${i}-hint`}>
                       {x.hint}

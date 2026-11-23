@@ -15,7 +15,7 @@ import { Link, useRouter } from '../shared/router.jsx';
 import { Button, Card, CopyButton, ErrorNote, Skeleton, Switch, useAction, useLoad, useToast } from '../shared/ui.jsx';
 import { More, PageHead, Row } from '../shared/page.jsx';
 import AgentUpdatesCard from './AgentUpdates.jsx';
-import ClaudeProfilesCard, { CodexProfilesCard } from './ClaudeProfiles.jsx';
+import ClaudeProfilesCard, { AgyProfilesCard, CodexProfilesCard } from './ClaudeProfiles.jsx';
 import GuardCard from './Guard.jsx';
 import NotifySection from './Notify.jsx';
 import McpCard from './PagesMcp.jsx';
@@ -178,6 +178,7 @@ const HUB_ALIAS = {
   model: 'accounts',
   'claude-accounts': 'accounts',
   'codex-profiles': 'accounts',
+  'agy-accounts': 'accounts',
   usage: 'accounts',
   updates: 'accounts',
   'agent-updates': 'accounts',
@@ -202,16 +203,17 @@ function useHubStatus(version) {
   useEffect(() => {
     let alive = true;
     const get = (u) => api.get(u).catch(() => null);
-    Promise.all([get('/claude-profiles'), get('/codex-profiles'), get('/notify'), get('/mcp'), get('/pets/settings'), get('/pets'), get('/skills')]).then(([cp, xp, n, m, ps, pets, sk]) => {
+    Promise.all([get('/claude-profiles'), get('/codex-profiles'), get('/agy-profiles'), get('/notify'), get('/mcp'), get('/pets/settings'), get('/pets'), get('/skills')]).then(([cp, xp, ap, n, m, ps, pets, sk]) => {
       if (!alive) return;
       const c = cp?.profiles?.length ?? 0;
       const x = xp?.profiles?.length ?? 0;
+      const a = ap?.profiles?.length ?? 0;
       const feishu = n?.feishu;
       const hooks = n?.hooks?.length ?? 0;
       const petCount = pets?.items?.length;
       const skillCount = sk?.items?.filter((x) => x.source === 'user').length ?? 0;
       setSt({
-        accounts: cp || xp ? { text: c + x ? t('ai.hub.accounts_n', { claude: c, codex: x }) : t('ai.hub.accounts_none'), ok: c + x > 0 } : null,
+        accounts: cp || xp || ap ? { text: c + x + a ? (a ? t('ai.hub.accounts_n_all', { claude: c, codex: x, agy: a }) : t('ai.hub.accounts_n', { claude: c, codex: x })) : t('ai.hub.accounts_none'), ok: c + x + a > 0 } : null,
         remote: n
           ? feishu?.bound
             ? n.status?.connected === false && n.status?.error
@@ -289,6 +291,7 @@ export default function AiPage() {
           <AgentUpdatesCard />
           <ClaudeProfilesCard />
           <CodexProfilesCard />
+          <AgyProfilesCard />
           <UsageStatsCard />
         </>
       )}

@@ -21,7 +21,7 @@ import { PageHead } from '../shared/page.jsx';
 import { useSessionUi } from './Sessions.jsx';
 import { useNarrow } from './TerminalView.jsx';
 
-const AGENT_NAMES = { claude: 'Claude', codex: 'Codex' };
+const AGENT_NAMES = { claude: 'Claude', codex: 'Codex', agy: 'Antigravity', dsh: 'DSH' };
 
 /** 飞书通知配好了但这台电脑没连上（docs/TASK_BOARD.md §6.6）：看板顶部提示一行。旧版客户端没有这个接口时不提示。 */
 function useFeishuDown() {

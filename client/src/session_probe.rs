@@ -26,6 +26,8 @@ pub struct ProcInfo {
     pub ppid: Option<u32>,
     /// 程序名和命令行前几个参数的文件名（小写，去掉 `.exe`、`.cmd`、`.js`）：认工具用
     names: Vec<String>,
+    /// 完整命令行参数（识别 `--conversation` 等参数用）
+    cmd: Vec<String>,
     /// 启动时间（Unix 秒）
     pub start: u64,
 }
@@ -48,7 +50,8 @@ impl Snapshot {
             .map(|(pid, p)| {
                 // 程序名、argv0；argv0 是解释器（node 跑的 cli.js）时再加上脚本名。别的参数不看（`cat codex` 不算）
                 let mut names = vec![stem(&p.name().to_string_lossy())];
-                let cmd: Vec<String> = p.cmd().iter().take(2).map(|a| stem(&a.to_string_lossy())).collect();
+                let full_cmd: Vec<String> = p.cmd().iter().map(|a| a.to_string_lossy().into_owned()).collect();
+                let cmd: Vec<String> = full_cmd.iter().take(2).map(|a| stem(a)).collect();
                 if let Some(a0) = cmd.first() {
                     names.push(a0.clone());
                     if INTERPRETERS.contains(&a0.as_str()) || INTERPRETERS.contains(&names[0].as_str()) {
@@ -58,7 +61,7 @@ impl Snapshot {
                 if let Some(exe) = p.exe() {
                     names.push(exe.to_string_lossy().to_lowercase().replace('\\', "/"));
                 }
-                (pid.as_u32(), ProcInfo { pid: pid.as_u32(), ppid: p.parent().map(|x| x.as_u32()), names, start: p.start_time() })
+                (pid.as_u32(), ProcInfo { pid: pid.as_u32(), ppid: p.parent().map(|x| x.as_u32()), names, cmd: full_cmd, start: p.start_time() })
             })
             .collect();
         Self::from_procs(procs)
@@ -347,6 +350,9 @@ impl Detector for Dsh {
 
 struct Agy;
 
+/// transcript.jsonl 这么久之内写过就当在忙
+const AGY_BUSY: Duration = Duration::from_secs(4);
+
 impl Detector for Agy {
     fn tool(&self) -> &'static str {
         "agy"
@@ -354,6 +360,118 @@ impl Detector for Agy {
     fn names(&self) -> &'static [&'static str] {
         &["agy"]
     }
+    fn inspect(&self, ctx: &Ctx, procs: &[&ProcInfo]) -> (Option<String>, Option<bool>) {
+        let pids = subtree_pids(ctx.tree, procs);
+        let files = open_files(&pids);
+        let (conv, transcript) = agy_open_conv(&files)
+            .map(|(id, tr)| (Some(id), tr))
+            .unwrap_or_else(|| (procs.iter().rev().find_map(|p| agy_conv_from_cmd(&p.cmd)), None));
+        let busy = conv.as_deref().and_then(|id| {
+            let path = transcript.unwrap_or_else(|| {
+                crate::agents::agy_data_dir()
+                    .join("brain")
+                    .join(id)
+                    .join(".system_generated")
+                    .join("logs")
+                    .join("transcript.jsonl")
+            });
+            std::fs::metadata(&path)
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .map(|t| SystemTime::now().duration_since(t).unwrap_or_default() < AGY_BUSY)
+        });
+        (conv, busy)
+    }
+}
+
+/// 收集 `roots` 及其在 `tree` 里的所有子孙进程号（`agy` 的 worker 子进程可能开着会话文件）
+fn subtree_pids(tree: &[&ProcInfo], roots: &[&ProcInfo]) -> Vec<u32> {
+    let mut pids: std::collections::HashSet<u32> = roots.iter().map(|p| p.pid).collect();
+    loop {
+        let mut added = false;
+        for p in tree {
+            if !pids.contains(&p.pid) && p.ppid.is_some_and(|pp| pids.contains(&pp)) {
+                pids.insert(p.pid);
+                added = true;
+            }
+        }
+        if !added {
+            break;
+        }
+    }
+    pids.into_iter().collect()
+}
+
+fn is_uuid(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() == 36
+        && b[8] == b'-'
+        && b[13] == b'-'
+        && b[18] == b'-'
+        && b[23] == b'-'
+        && b.iter().enumerate().all(|(i, c)| matches!(i, 8 | 13 | 18 | 23) || c.is_ascii_hexdigit())
+}
+
+/// `…/antigravity-cli/brain/<uuid>/…` 或 `…/antigravity-cli/conversations/<uuid>.pb` → 会话 UUID
+fn agy_conv_from_path(path: &Path) -> Option<String> {
+    let s = path.to_string_lossy().replace('\\', "/");
+    if let Some(pos) = s.find("antigravity-cli/brain/") {
+        let rest = &s[pos + "antigravity-cli/brain/".len()..];
+        let id = rest.split('/').next()?;
+        if is_uuid(id) {
+            return Some(id.to_string());
+        }
+    }
+    if let Some(pos) = s.find("antigravity-cli/conversations/") {
+        let rest = &s[pos + "antigravity-cli/conversations/".len()..];
+        let name = rest.split('/').next()?;
+        if let Some(id) = name.strip_suffix(".pb") {
+            if is_uuid(id) {
+                return Some(id.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// 从打开的文件里找出最近活跃的 agy 会话号（如果直接开着 `transcript.jsonl` 一并返回）
+fn agy_open_conv(files: &[PathBuf]) -> Option<(String, Option<PathBuf>)> {
+    let mut best: Option<(SystemTime, String, Option<PathBuf>)> = None;
+    for p in files {
+        let Some(id) = agy_conv_from_path(p) else { continue };
+        let mtime = std::fs::metadata(p).and_then(|m| m.modified()).unwrap_or(SystemTime::UNIX_EPOCH);
+        let is_tr = p.file_name().and_then(|n| n.to_str()) == Some("transcript.jsonl");
+        match &mut best {
+            Some((cur_t, cur_id, cur_tr)) if *cur_id == id => {
+                if mtime > *cur_t {
+                    *cur_t = mtime;
+                }
+                if is_tr {
+                    *cur_tr = Some(p.clone());
+                }
+            }
+            Some((cur_t, _, _)) if mtime <= *cur_t => {}
+            _ => {
+                best = Some((mtime, id, is_tr.then(|| p.clone())));
+            }
+        }
+    }
+    best.map(|(_, id, tr)| (id, tr))
+}
+
+/// 从命令行提取 `--conversation <uuid>` 或 `--conversation=<uuid>`
+fn agy_conv_from_cmd(cmd: &[String]) -> Option<String> {
+    let mut it = cmd.iter();
+    while let Some(arg) = it.next() {
+        if arg == "--conversation" {
+            if let Some(v) = it.next().filter(|s| !s.starts_with('-') && crate::history::valid_id(s)) {
+                return Some(v.clone());
+            }
+        } else if let Some(v) = arg.strip_prefix("--conversation=").filter(|s| !s.starts_with('-') && crate::history::valid_id(s)) {
+            return Some(v.to_string());
+        }
+    }
+    None
 }
 
 struct OpenCode;
@@ -372,7 +490,7 @@ mod tests {
     use super::*;
 
     fn proc(pid: u32, ppid: u32, names: &[&str]) -> ProcInfo {
-        ProcInfo { pid, ppid: Some(ppid), names: names.iter().map(|n| stem(n)).collect(), start: pid as u64 }
+        ProcInfo { pid, ppid: Some(ppid), names: names.iter().map(|n| stem(n)).collect(), cmd: vec![], start: pid as u64 }
     }
 
     #[test]
@@ -395,9 +513,9 @@ mod tests {
     #[test]
     fn claude_native_install_path() {
         // 原生安装：argv0 是 claude，程序本身叫版本号
-        let p = ProcInfo { pid: 9, ppid: Some(1), names: vec!["2.1.317".into(), "claude".into(), "/root/.local/share/claude/versions/2.1.317".into()], start: 0 };
+        let p = ProcInfo { pid: 9, ppid: Some(1), names: vec!["2.1.317".into(), "claude".into(), "/root/.local/share/claude/versions/2.1.317".into()], cmd: vec![], start: 0 };
         assert_eq!(Claude.find(&[&p]).len(), 1);
-        let q = ProcInfo { pid: 9, ppid: Some(1), names: vec!["2.1.317".into(), "/root/.local/share/claude/versions/2.1.317".into()], start: 0 };
+        let q = ProcInfo { pid: 9, ppid: Some(1), names: vec!["2.1.317".into(), "/root/.local/share/claude/versions/2.1.317".into()], cmd: vec![], start: 0 };
         assert_eq!(Claude.find(&[&q]).len(), 1);
         assert!(Codex.find(&[&p]).is_empty());
     }
@@ -415,6 +533,54 @@ mod tests {
         let p = Path::new("/h/.codex/sessions/2026/10/30/rollout-2026-10-30T10-00-00-01a0bab1-b566-7fe2-8fc7-7d0501db4186.jsonl");
         assert_eq!(rollout_thread(p).as_deref(), Some("01a0bab1-b566-7fe2-8fc7-7d0501db4186"));
         assert_eq!(rollout_thread(Path::new("/x/notes.jsonl")), None);
+    }
+
+    #[test]
+    fn agy_conv_from_paths_and_cmdline() {
+        let uuid = "f0ffc67a-1f4c-4d75-9959-75b43979047a";
+        let brain = PathBuf::from(format!("/root/.gemini/antigravity-cli/brain/{uuid}/.system_generated/logs/transcript.jsonl"));
+        let pb = PathBuf::from(format!("/root/.gemini/antigravity-cli/conversations/{uuid}.pb"));
+        let win = PathBuf::from(format!(r"C:\Users\a\.gemini\antigravity-cli\brain\{uuid}\notes.md"));
+        assert_eq!(agy_conv_from_path(&brain).as_deref(), Some(uuid));
+        assert_eq!(agy_conv_from_path(&pb).as_deref(), Some(uuid));
+        assert_eq!(agy_conv_from_path(&win).as_deref(), Some(uuid));
+        assert_eq!(agy_conv_from_path(Path::new("/root/.gemini/antigravity-cli/brain/not-a-uuid/a.txt")), None);
+        assert_eq!(agy_conv_from_path(Path::new("/root/.gemini/antigravity-cli/conversations/other.txt")), None);
+        assert_eq!(agy_conv_from_path(Path::new("/tmp/foo.jsonl")), None);
+
+        let cmd1: Vec<String> = ["agy", "--conversation", uuid].into_iter().map(String::from).collect();
+        let cmd2: Vec<String> = ["agy", &format!("--conversation={uuid}")].into_iter().map(String::from).collect();
+        let cmd3: Vec<String> = ["agy", "--conversation", "--yolo"].into_iter().map(String::from).collect();
+        let cmd4: Vec<String> = ["agy", "--yolo"].into_iter().map(String::from).collect();
+        assert_eq!(agy_conv_from_cmd(&cmd1).as_deref(), Some(uuid));
+        assert_eq!(agy_conv_from_cmd(&cmd2).as_deref(), Some(uuid));
+        assert_eq!(agy_conv_from_cmd(&cmd3), None);
+        assert_eq!(agy_conv_from_cmd(&cmd4), None);
+
+        // agy_open_conv 能识别并带回 transcript.jsonl
+        let dir = tempfile::tempdir().unwrap();
+        let tr = dir.path().join(format!("antigravity-cli/brain/{uuid}/.system_generated/logs/transcript.jsonl"));
+        std::fs::create_dir_all(tr.parent().unwrap()).unwrap();
+        std::fs::write(&tr, "{}\n").unwrap();
+        assert_eq!(agy_open_conv(&[tr.clone()]), Some((uuid.to_string(), Some(tr))));
+    }
+
+    #[test]
+    fn agy_probe_cmdline_fallback() {
+        let uuid = "f0ffc67a-1f4c-4d75-9959-75b43979047a";
+        let sh = proc(1, 0, &["bash"]);
+        let agy = ProcInfo {
+            pid: 999_999_001,
+            ppid: Some(1),
+            names: vec!["agy".into()],
+            cmd: vec!["agy".into(), "--conversation".into(), uuid.into()],
+            start: 42,
+        };
+        let tree = vec![&sh, &agy];
+        let ctx = Ctx { tree: &tree, claude_dirs: &[] };
+        let found = probe(&detectors(), &ctx).unwrap();
+        assert_eq!(found.tool, "agy");
+        assert_eq!(found.conv.as_deref(), Some(uuid));
     }
 
     #[test]

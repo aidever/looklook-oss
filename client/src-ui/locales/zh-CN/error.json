@@ -370,5 +370,11 @@
   "PLUGIN_UNSUPPORTED": "这台电脑的系统还不支持插件",
   "NATIVE_TERM_HERE_ONLY": "只能在这台电脑上用本机终端打开",
   "NATIVE_TERM_FAILED": "没能打开终端：{{error}}",
-  "NOT_RUNNING": "终端没有在运行"
+  "NOT_RUNNING": "终端没有在运行",
+  "HTTPS_UNREACHABLE": "公网直连连不上：浏览器连不上这台电脑上报的直连地址。可能是电脑没运行看看、安全组 / 防火墙没放行这个 TCP 端口、公网 IP 变了，或者浏览器、代理软件拦下了连接。可以在新标签页直接打开这个地址看看",
+  "HTTPS_TIMEOUT": "公网直连超时：这台电脑的直连地址 4 秒没有响应，可能是防火墙丢弃了这个 TCP 端口的包，或者网络太慢",
+  "HTTPS_NO_HELLO": "公网直连已连上，但电脑上的看看没有回应。稍后重试；一直这样请重启它上面的看看",
+  "HTTPS_GRANT": "拿不到直连票据：这台电脑可能刚关掉了公网 HTTPS 直连，或者证书过期了",
+  "HTTPS_CERT_EXPIRED": "这台电脑的公网 HTTPS 直连证书已经过期、还没续上。检查它能不能连到 Let's Encrypt，以及 80 端口是否放行",
+  "HTTPS_FAILED": "和这台电脑的公网 HTTPS 直连没能建立"
 }

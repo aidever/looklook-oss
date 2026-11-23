@@ -351,4 +351,63 @@ test('effortsFor: 目录有就用它；第三方/Haiku 没有；Claude/Codex 没
   assert.deepEqual(effortsFor('codex', { value: 'gpt-x', model: 'gpt-x' }), CODEX_EFFORTS);
   assert.deepEqual(effortsFor('claude', { value: 'glm', section: 'provider', model: 'glm' }), []);
   assert.deepEqual(effortsFor('codex', undefined), CODEX_EFFORTS);
+  assert.deepEqual(effortsFor('agy', { value: 'g3', efforts: ['low', 'high'] }), ['low', 'high']);
+});
+
+test('AGY_COMMANDS and slashAction for agy', async () => {
+  const { AGY_COMMANDS, AGY_ACTIONS } = await import('./chat.js');
+  for (const c of ['/clear', '/new', '/model', '/resume', '/usage', '/context', '/status', '/mcp', '/plugins', '/agents', '/skills', '/hooks', '/permissions', '/diff', '/rename', '/login', '/logout', '/share', '/export', '/compact', '/fast', '/goal', '/planning', '/grill-me', '/schedule', '/tasks', '/add-dir', '/btw']) {
+    assert.ok(AGY_COMMANDS.includes(c), `missing ${c}`);
+  }
+  assert.equal(AGY_ACTIONS['/permissions'], 'mode');
+  // UI-handled commands
+  assert.equal(slashAction('/model', 'agy'), 'model');
+  assert.equal(slashAction('/resume', 'agy'), 'history');
+  assert.equal(slashAction('/usage', 'agy'), 'usage');
+  assert.equal(slashAction('/context', 'agy'), 'usage');
+  assert.equal(slashAction('/status', 'agy'), 'status');
+  assert.equal(slashAction('/mcp', 'agy'), 'config');
+  assert.equal(slashAction('/hooks', 'agy'), 'config');
+  assert.equal(slashAction('/plugins', 'agy'), 'plugins');
+  assert.equal(slashAction('/agents', 'agy'), 'subagents');
+  assert.equal(slashAction('/skills', 'agy'), 'skills');
+  assert.equal(slashAction('/permissions', 'agy'), 'mode');
+  assert.equal(slashAction('/tasks', 'agy'), 'agents');
+  assert.equal(slashAction('/diff', 'agy'), 'git');
+  assert.equal(slashAction('/rename', 'agy'), 'rename');
+  assert.equal(slashAction('/login', 'agy'), 'login');
+  assert.equal(slashAction('/logout', 'agy'), 'login');
+  assert.equal(slashAction('/share', 'agy'), 'share');
+  assert.equal(slashAction('/export', 'agy'), 'outline');
+  // Native agy prompt/workflow commands pass through
+  for (const pass of ['/clear', '/new', '/compact', '/fast', '/goal', '/planning', '/grill-me', '/schedule', '/btw', '/model gemini', '/rename foo']) {
+    assert.equal(slashAction(pass, 'agy'), null, `${pass} should pass through`);
+  }
+  // AGY-only commands are not intercepted for Claude
+  assert.equal(slashAction('/planning', 'claude'), null);
+  assert.equal(slashAction('/worktree', 'agy'), null);
+});
+
+test('groupModelOptions and modelView with model groups', async () => {
+  const { groupModelOptions } = await import('./chat.js');
+  const flat = [{ value: 'a', label: 'A' }, { value: 'b', label: 'B' }];
+  assert.deepEqual(groupModelOptions(flat), [{ group: null, groupName: null, options: flat }]);
+
+  const grouped = [
+    { value: 'group:gemini', label: 'Gemini 3 Pro (Group)', group: 'gemini', group_name: 'Gemini', is_group: true, models: ['gemini-3-pro-high', 'gemini-3-pro-low'] },
+    { value: 'gemini-3-flash', label: 'Gemini 3 Flash', group: 'gemini', group_name: 'Gemini' },
+    { value: 'group:claude', label: 'Claude Pool', group: 'claude', group_name: 'Claude', is_group: true },
+  ];
+  const gs = groupModelOptions(grouped);
+  assert.equal(gs.length, 2);
+  assert.equal(gs[0].groupName, 'Gemini');
+  assert.equal(gs[0].options.length, 2);
+  assert.equal(gs[1].groupName, 'Claude');
+  assert.equal(gs[1].options.length, 1);
+
+  // Selecting a group option doesn't produce a false mismatch when actual_model differs
+  const mv1 = modelView({ model: 'group:gemini', actual_model: 'gemini-3-pro-high', model_chosen: true }, grouped);
+  assert.deepEqual(mv1, { checked: 'group:gemini', label: 'Gemini 3 Pro (Group)', pending: false, mismatch: null });
+  const mv2 = modelView({ model: 'group:claude', actual_model: 'claude-sonnet-4-5', model_chosen: true }, grouped);
+  assert.deepEqual(mv2, { checked: 'group:claude', label: 'Claude Pool', pending: false, mismatch: null });
 });

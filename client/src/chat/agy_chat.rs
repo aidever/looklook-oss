@@ -12,7 +12,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, oneshot};
@@ -26,16 +26,23 @@ use crate::error::LocalError;
 const IMAGE_LIMIT: u64 = 20 << 20;
 /// 运行中最多排几条
 const QUEUE_LIMIT: usize = 20;
+/// 缓存的 configOptions 存在数据库的键（草稿页用）
+const LAST_CONFIG_KEY: &str = "agy.last_config";
+/// 思考强度通用档位（模型选项里没带时兜底）
+pub(super) const EFFORTS: &[&str] = &["low", "medium", "high"];
 
 #[derive(Default)]
 pub struct Hub {
-    conn: tokio::sync::Mutex<Option<Arc<AcpConn>>>,
-    /// 第几个 `agy acp` 进程（0 表示还没起过）；会话只在加载它的那个进程里有效
+    /// 每个账号一个 `agy acp`（另外的账号带 `--gemini-dir`，登录各自独立）：账号 → (进程, 第几个进程)
+    conns: tokio::sync::Mutex<HashMap<String, (Arc<AcpConn>, u64)>>,
+    /// 起过几个 `agy acp` 进程（每个进程一个编号，从 1 开始）；会话只在加载它的那个进程里有效
     generation: AtomicU64,
     /// 会话 → 终端
     sessions: Mutex<HashMap<String, String>>,
     /// agy 更新了：没有会话在跑的时候把 `agy acp` 换成新版本（下次用到时）
     stale: std::sync::atomic::AtomicBool,
+    /// 最近一次看到的 configOptions（草稿页选模型用）
+    last_config: Mutex<Value>,
 }
 
 /// agy 这边每个终端多记的状态
@@ -54,14 +61,59 @@ pub struct AgySt {
     pub window: Option<u64>,
     /// 这一轮开始的时间
     turn_at: Option<Instant>,
+    /// 防止同一个终端并发 attach / load
+    attach_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
-#[derive(Default, Clone, Copy)]
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
 struct Usage {
     input: u64,
     output: u64,
     cache_read: u64,
     cache_write: u64,
+}
+
+impl Usage {
+    fn is_zero(self) -> bool {
+        self.input == 0 && self.output == 0 && self.cache_read == 0 && self.cache_write == 0
+    }
+}
+
+/// `agy_setting` / `draft_remember` 允许的值（兼容含 `/`、`(`、`)`、`+`、空格的 ACP 模型 ID，拒绝控制字符和超长串）
+pub(super) fn valid_setting_value(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && !value.chars().any(char::is_control)
+        && value.chars().all(|c| c.is_ascii_alphanumeric() || "._-:/()+ ".contains(c))
+}
+
+/// agy 本地会话记录文件路径（用于客户端重启后恢复累计用量）
+fn agy_brain_transcript(session: &str) -> Option<std::path::PathBuf> {
+    if !agy_log::valid_session(session) {
+        return None;
+    }
+    Some(dirs::home_dir()?.join(".gemini/antigravity-cli/brain").join(session).join(".system_generated/logs/transcript.jsonl"))
+}
+
+/// 扫描 agy `transcript.jsonl` 里的 `PLANNER_RESPONSE` 行，汇总累计 token 用量
+fn transcript_usage_from(path: &std::path::Path) -> Usage {
+    use std::io::{BufRead, BufReader};
+    let Ok(f) = std::fs::File::open(path) else { return Usage::default() };
+    let mut u = Usage::default();
+    for line in BufReader::new(f).lines().map_while(Result::ok) {
+        if !line.contains("PLANNER_RESPONSE") {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<Value>(&line) else { continue };
+        if v["type"].as_str() != Some("PLANNER_RESPONSE") {
+            continue;
+        }
+        u.input += v["input_tokens"].as_u64().unwrap_or(0);
+        u.output += v["output_tokens"].as_u64().unwrap_or(0) + v["thought_tokens"].as_u64().unwrap_or(0);
+        u.cache_read += v["cache_read_tokens"].as_u64().unwrap_or(0);
+        u.cache_write += v["cache_write_tokens"].as_u64().unwrap_or(0);
+    }
+    u
 }
 
 /// 看看的权限模式 → agy 的模式（`session/set_mode`）。全部权限：agy 的 auto，审批由看看直接放行
@@ -99,26 +151,77 @@ fn config_options(config: &Value, id: &str) -> Vec<Value> {
     config.as_array().and_then(|a| a.iter().find(|o| o["id"] == id)).and_then(|o| o["options"].as_array().cloned()).unwrap_or_default()
 }
 
-/// 模型菜单（和 Claude Code 的同一个格式）：`configOptions` 里的 `model`，思考强度是 `thought_level` 的选项
-fn model_options(config: &Value) -> Vec<Value> {
-    let efforts: Vec<Value> = config_options(config, "thought_level").iter().filter_map(|o| o["value"].as_str().map(|v| json!(v))).collect();
+fn collect_flat_values(items: &[Value], out: &mut Vec<Value>) {
+    for o in items {
+        if let Some(v) = o["value"].as_str() {
+            out.push(json!(v));
+        }
+        if let Some(children) = o["options"].as_array() {
+            collect_flat_values(children, out);
+        }
+    }
+}
+
+/// 模型菜单（和 Claude Code 的同一个格式）：`configOptions` 里的 `model`，思考强度是 `thought_level` 的选项。
+/// 同时支持扁平选项和分组选项（ACP `SessionConfigSelectGroup`），以及本身代表一组模型的选项。
+pub(super) fn model_options(config: &Value) -> Vec<Value> {
+    let mut efforts = vec![];
+    collect_flat_values(&config_options(config, "thought_level"), &mut efforts);
     let current = config_value(config, "model");
-    config_options(config, "model")
-        .iter()
-        .filter_map(|o| {
-            let v = o["value"].as_str()?;
-            Some(json!({
-                "value": v,
-                "label": o["name"].as_str().unwrap_or(v),
-                "description": o["description"].as_str().unwrap_or(""),
-                "section": "main",
-                "model": v,
-                "efforts": efforts,
-                "default_effort": Value::Null,
-                "default": current == Some(v),
-            }))
-        })
-        .collect()
+
+    let make_opt = |o: &Value, group_id: Option<&str>, group_name: Option<&str>, force_group: bool, fallback_models: Option<Vec<Value>>| -> Option<Value> {
+        let v = o["value"].as_str()?;
+        let explicit_group = force_group
+            || o["isGroup"].as_bool() == Some(true)
+            || o["is_group"].as_bool() == Some(true)
+            || o["models"].as_array().is_some_and(|a| !a.is_empty());
+        let g = group_id.or_else(|| o["group"].as_str());
+        let gn = group_name.or_else(|| o["groupName"].as_str()).or_else(|| o["group_name"].as_str());
+        let mut item = json!({
+            "value": v,
+            "label": o["name"].as_str().unwrap_or(v),
+            "description": o["description"].as_str().unwrap_or(""),
+            "section": "main",
+            "model": v,
+            "efforts": efforts,
+            "default_effort": Value::Null,
+            "default": current == Some(v),
+            "group": g,
+            "group_name": gn,
+        });
+        if explicit_group {
+            item["is_group"] = json!(true);
+        }
+        if let Some(ms) = o["models"].as_array().filter(|a| !a.is_empty()) {
+            item["models"] = Value::Array(ms.clone());
+        } else if let Some(ms) = fallback_models.filter(|a| !a.is_empty()) {
+            item["models"] = Value::Array(ms);
+        }
+        Some(item)
+    };
+
+    let mut out = vec![];
+    for entry in config_options(config, "model") {
+        if let Some(children) = entry["options"].as_array() {
+            let group_id = entry["group"].as_str().or_else(|| entry["id"].as_str());
+            let group_name = entry["name"].as_str().or(group_id);
+            let child_values: Vec<Value> = children.iter().filter_map(|c| c["value"].as_str().map(|v| json!(v))).collect();
+            // 分组自身带有可选 `value` 时，把分组也作为一个可选项（标 `is_group: true`）
+            if entry["value"].as_str().is_some() {
+                if let Some(item) = make_opt(&entry, group_id, group_name, true, Some(child_values)) {
+                    out.push(item);
+                }
+            }
+            for child in children {
+                if let Some(item) = make_opt(child, group_id, group_name, false, None) {
+                    out.push(item);
+                }
+            }
+        } else if let Some(item) = make_opt(&entry, None, None, false, None) {
+            out.push(item);
+        }
+    }
+    out
 }
 
 /// 界面的回答 → `session/request_permission` 的结果。`options` 是 agy 给的选项
@@ -143,10 +246,11 @@ fn pick(options: &Value, want: &[&str]) -> Value {
     json!({ "outcome": { "outcome": "cancelled" } })
 }
 
-/// 发给 agy 的内容：文字和图片（base64）
-fn prompt_content(text: &str, images: &[String]) -> Result<Value, LocalError> {
+/// 发给 agy 的内容：文字和图片（base64），同时返回图片原始字节供对话界面看大图
+fn prompt_content_with_images(text: &str, images: &[String]) -> Result<(Value, Vec<(&'static str, Vec<u8>)>), LocalError> {
     use base64::Engine;
     let mut parts = vec![];
+    let mut raw_imgs = vec![];
     if !text.trim().is_empty() || images.is_empty() {
         parts.push(json!({ "type": "text", "text": text }));
     }
@@ -164,9 +268,15 @@ fn prompt_content(text: &str, images: &[String]) -> Result<Value, LocalError> {
             return Err(LocalError::invalid("images", "too_large"));
         }
         let data = std::fs::read(path).map_err(|_| LocalError::invalid("images", "not_found"))?;
-        parts.push(json!({ "type": "image", "mimeType": mime, "data": base64::engine::general_purpose::STANDARD.encode(data) }));
+        parts.push(json!({ "type": "image", "mimeType": mime, "data": base64::engine::general_purpose::STANDARD.encode(&data) }));
+        raw_imgs.push((mime, data));
     }
-    Ok(Value::Array(parts))
+    Ok((Value::Array(parts), raw_imgs))
+}
+
+/// 发给 agy 的内容：文字和图片（base64）
+fn prompt_content(text: &str, images: &[String]) -> Result<Value, LocalError> {
+    Ok(prompt_content_with_images(text, images)?.0)
 }
 
 impl Chat {
@@ -183,32 +293,53 @@ impl Chat {
         lock(&inst.st).binding.as_ref().map(|b| b.session_id.clone())
     }
 
-    /// 连上 `agy acp`（已经起着就直接用）
-    async fn agy_conn(&self) -> Result<Arc<AcpConn>, LocalError> {
-        let mut slot = self.agy.conn.lock().await;
-        if let Some(c) = slot.as_ref().filter(|c| c.alive()) {
+    /// 这个会话用的 agy 账号（agy_profiles.rs；新建时记下的，没记时跟默认）
+    fn agy_profile(&self, id: &str) -> crate::agy_profiles::Profile {
+        crate::agy_profiles::for_instance(&self.store, id)
+    }
+
+    /// 这个会话的账号现在起着的 `agy acp` 和它的编号（没起不去起）
+    async fn agy_live(&self, id: &str) -> Option<(Arc<AcpConn>, u64)> {
+        let profile = self.agy_profile(id).id;
+        self.agy.conns.lock().await.get(&profile).filter(|(c, _)| c.alive()).cloned()
+    }
+
+    /// 这个会话的账号的 `agy acp` 编号（没起是 0）
+    async fn agy_gen_of(&self, id: &str) -> u64 {
+        self.agy_live(id).await.map_or(0, |(_, g)| g)
+    }
+
+    /// 连上这个会话的账号的 `agy acp`（已经起着就直接用），返回进程和它的编号
+    async fn agy_conn(&self, id: &str) -> Result<(Arc<AcpConn>, u64), LocalError> {
+        let profile = self.agy_profile(id);
+        let mut conns = self.agy.conns.lock().await;
+        if let Some((c, g)) = conns.get(&profile.id).filter(|(c, _)| c.alive()) {
             if !self.agy.stale.load(Ordering::SeqCst) || self.agy_busy() {
-                return Ok(c.clone());
+                return Ok((c.clone(), *g));
             }
-            // 装了新版本、现在没有会话在跑：换掉（各会话下次用到时重新加载）
+            // 装了新版本、现在没有会话在跑：都换掉（各会话下次用到时重新加载）
             tracing::info!("agy 更新过了，换成新版本的 agy acp");
-            c.kill();
+            for (c, _) in conns.values() {
+                c.kill();
+            }
+            conns.clear();
         }
         self.agy.stale.store(false, Ordering::SeqCst);
         let shell = crate::shells::login_shell();
         let program = agy_acp::program(&shell).await;
         let path = super::codex_app::launch_path(&shell, &program).await;
         let env = super::codex_app::user_env(&shell).await.unwrap_or_default();
+        let extra = crate::agy_profiles::acp_args(&self.paths.home, &profile);
         let (tx, rx) = mpsc::unbounded_channel();
-        let conn = AcpConn::start(&program, path.as_deref(), &env, &self.paths.home.join("run"), tx).await?;
+        let conn = AcpConn::start(&program, path.as_deref(), &env, &extra, &self.paths.home.join("run"), tx).await?;
         let gen = self.agy.generation.fetch_add(1, Ordering::SeqCst) + 1;
-        *slot = Some(conn.clone());
-        drop(slot);
+        conns.insert(profile.id.clone(), (conn.clone(), gen));
+        drop(conns);
         if let Some(me) = self.me.upgrade() {
             tokio::spawn(me.agy_events(conn.clone(), rx, gen));
         }
-        tracing::info!(pid = ?conn.pid, version = ?lock(&conn.version), "已起 agy acp");
-        Ok(conn)
+        tracing::info!(pid = ?conn.pid, profile = %profile.id, version = ?lock(&conn.version), "已起 agy acp");
+        Ok((conn, gen))
     }
 
     /// 有 agy 会话正在跑一轮（或等确认）
@@ -223,11 +354,140 @@ impl Chat {
         self.agy.stale.store(true, Ordering::SeqCst);
     }
 
+    /// 缓存最近一次看到的带模型选项的 configOptions（草稿页用）
+    fn agy_cache_config(&self, config: &Value) {
+        if config_options(config, "model").is_empty() {
+            return;
+        }
+        *lock(&self.agy.last_config) = config.clone();
+        let _ = self.store.set(LAST_CONFIG_KEY, config);
+    }
+
+    /// 取缓存的 configOptions（内存优先，客户端重启后回退数据库）
+    pub(super) fn agy_cached_config(&self) -> Value {
+        let cached = lock(&self.agy.last_config).clone();
+        if cached.is_array() {
+            return cached;
+        }
+        let stored = self.store.get::<Value>(LAST_CONFIG_KEY).ok().flatten().unwrap_or(Value::Null);
+        if stored.is_array() {
+            *lock(&self.agy.last_config) = stored.clone();
+        }
+        stored
+    }
+
+    /// 打开快照时的 attach：已有绑定且已加载/正在加载时不阻塞；首次加载已有绑定放到后台避免卡住页面
+    pub(super) async fn agy_snapshot_attach(self: &Arc<Self>, id: &str) {
+        let inst = self.inst(id);
+        let gen = self.agy_gen_of(id).await;
+        let (has_binding, ready, attaching) = {
+            let st = lock(&inst.st);
+            let b = st.binding.as_ref();
+            let ready = b.is_some_and(|b| st.agy.generation == gen && gen != 0 && lock(&agy_log::shared(&b.session_id)).loaded);
+            let attaching = st.agy.attach_lock.try_lock().is_err();
+            (b.is_some(), ready, attaching)
+        };
+        if ready || attaching {
+            return;
+        }
+        if has_binding {
+            let (me, id, inst) = (self.clone(), id.to_string(), inst.clone());
+            tokio::spawn(async move {
+                match me.agy_attach(&id).await {
+                    Ok(_) => {
+                        let _ = inst.tx.send(super::Event::Reset);
+                    }
+                    Err(e) => Self::agy_attach_failed(&inst, &e),
+                }
+            });
+        } else if let Err(e) = self.agy_attach(id).await {
+            Self::agy_attach_failed(&inst, &e);
+        }
+    }
+
+    /// 完成会话绑定后的公共收尾：设置版本、configOptions、模式，新建会话恢复记住的模型和思考强度
+    async fn agy_finish_attach(&self, conn: &AcpConn, inst: &Arc<Inst>, session: &str, gen: u64, r: &Value, is_new: bool) {
+        lock(&self.agy.sessions).insert(session.to_string(), inst.id.clone());
+        agy_log::shared(session).lock().unwrap_or_else(|e| e.into_inner()).loaded = true;
+        let conn_ver = lock(&conn.version).clone();
+        let config_opt = r.get("configOptions").filter(|c| c.is_array()).cloned();
+        if let Some(ref c) = config_opt {
+            self.agy_cache_config(c);
+        }
+        {
+            let mut st = lock(&inst.st);
+            st.agy.generation = gen;
+            if let Some(v) = conn_ver {
+                st.version = Some(v);
+            }
+            if let Some(c) = config_opt {
+                Self::agy_config(&mut st, c);
+            }
+            if st.phase == Phase::Detached {
+                Self::set_phase(inst, &mut st, Phase::Idle, None);
+            }
+            st.error = None;
+            Self::emit_status(inst, &st);
+        }
+        // 权限模式：看看记着的（客户端重启后接着用）；没记过时“全部权限”打开的终端用全部权限
+        let mode = self.store.get::<String>(&mode_key(&inst.id)).ok().flatten().or_else(|| self.instances.opts(&inst.id).full_access.then(|| "bypassPermissions".to_string()));
+        if let Some(m) = mode {
+            if let Err(e) = self.agy_set_mode(conn, inst, session, &m).await {
+                tracing::debug!(id = %inst.id, error = ?e, "agy 的权限模式没换上");
+            }
+        }
+        // 新建会话时恢复记住的模型和思考强度（没有显式覆盖过时）
+        if is_new {
+            self.agy_restore_memory(conn, inst, session).await;
+        }
+    }
+
+    async fn agy_restore_memory(&self, conn: &AcpConn, inst: &Arc<Inst>, session: &str) {
+        let (overridden, config, cur_model, cur_effort) = {
+            let st = lock(&inst.st);
+            (st.model_set_at.is_some(), st.agy.config.clone(), st.model.clone(), st.effort.clone())
+        };
+        if overridden {
+            return;
+        }
+        let Some((agent, profile, base)) = self.memory_scope_of(&inst.id) else { return };
+        let Some(last) = super::model_memory::get(&self.store, agent, &profile, &base) else { return };
+        let options = model_options(&config);
+        let Some(usable) = super::model_memory::usable(&last, &options, EFFORTS) else { return };
+        if let Some(m) = usable["model"].as_str().filter(|m| cur_model.as_deref() != Some(*m)) {
+            match conn.call("session/set_config_option", json!({ "sessionId": session, "configId": "model", "value": m })).await {
+                Ok(r) => {
+                    if r["configOptions"].is_array() {
+                        self.agy_cache_config(&r["configOptions"]);
+                        let mut st = lock(&inst.st);
+                        Self::agy_config(&mut st, r["configOptions"].clone());
+                        Self::emit_status(inst, &st);
+                    }
+                }
+                Err(e) => tracing::debug!(id = %inst.id, model = m, error = ?e, "agy 恢复记住的模型失败"),
+            }
+        }
+        if let Some(e) = usable["effort"].as_str().filter(|e| cur_effort.as_deref() != Some(*e)) {
+            match conn.call("session/set_config_option", json!({ "sessionId": session, "configId": "thought_level", "value": e })).await {
+                Ok(r) => {
+                    if r["configOptions"].is_array() {
+                        self.agy_cache_config(&r["configOptions"]);
+                        let mut st = lock(&inst.st);
+                        Self::agy_config(&mut st, r["configOptions"].clone());
+                        Self::emit_status(inst, &st);
+                    }
+                }
+                Err(e2) => tracing::debug!(id = %inst.id, effort = e, error = ?e2, "agy 恢复记住的思考强度失败"),
+            }
+        }
+    }
+
     /// 这个终端的会话在当前的 agy 进程里加载好了（没有会话就新建一个）
     pub(super) async fn agy_attach(&self, id: &str) -> Result<Arc<AcpConn>, LocalError> {
-        let conn = self.agy_conn().await?;
-        let gen = self.agy.generation.load(Ordering::SeqCst);
         let inst = self.inst(id);
+        let attach_lock = lock(&inst.st).agy.attach_lock.clone();
+        let _guard = attach_lock.lock().await;
+        let (conn, gen) = self.agy_conn(id).await?;
         let (session, loaded) = {
             let st = lock(&inst.st);
             (st.binding.as_ref().map(|b| b.session_id.clone()), st.agy.generation == gen)
@@ -236,7 +496,7 @@ impl Chat {
             return Ok(conn);
         }
         let row = self.store.instance(id)?.ok_or_else(LocalError::not_found)?;
-        let r = match session {
+        let loaded_res = match session {
             Some(s) => {
                 // 先对上终端再加载：重放的 `session/update` 才记得进来
                 lock(&self.agy.sessions).insert(s.clone(), id.to_string());
@@ -252,37 +512,28 @@ impl Chat {
             }
             None => None,
         };
-        let r = match r {
-            Some(r) => r,
+        let (r, is_new) = match loaded_res {
+            Some(r) => (r, false),
             None => {
                 let r = conn.call("session/new", json!({ "cwd": row.workdir, "mcpServers": [] })).await?;
                 let sid = r["sessionId"].as_str().filter(|s| agy_log::valid_session(s)).ok_or_else(|| LocalError::new("AGY_REQUEST_FAILED").with("detail", "no sessionId"))?.to_string();
                 self.agy_bind(&inst, &sid);
-                r
+                (r, true)
             }
         };
         let session = Self::agy_session(&inst).ok_or_else(LocalError::not_found)?;
-        lock(&self.agy.sessions).insert(session.clone(), id.to_string());
-        agy_log::shared(&session).lock().unwrap_or_else(|e| e.into_inner()).loaded = true;
-        {
-            let mut st = lock(&inst.st);
-            st.agy.generation = gen;
-            if let Some(c) = r.get("configOptions").filter(|c| c.is_array()) {
-                Self::agy_config(&mut st, c.clone());
-            }
-            if st.phase == Phase::Detached {
-                Self::set_phase(&inst, &mut st, Phase::Idle, None);
-            }
-            st.error = None;
-            Self::emit_status(&inst, &st);
-        }
-        // 权限模式：看看记着的（客户端重启后接着用）；没记过时“全部权限”打开的终端用全部权限
-        let mode = self.store.get::<String>(&mode_key(id)).ok().flatten().or_else(|| self.instances.opts(id).full_access.then(|| "bypassPermissions".to_string()));
-        if let Some(m) = mode {
-            if let Err(e) = self.agy_set_mode(&conn, &inst, &session, &m).await {
-                tracing::debug!(id, error = ?e, "agy 的权限模式没换上");
+        // 客户端重启加载旧会话时，如果累计用量是 0，从本地 transcript.jsonl 回填
+        if !is_new && lock(&inst.st).agy.usage.is_zero() {
+            let sid = session.clone();
+            let recovered = tokio::task::block_in_place(|| agy_brain_transcript(&sid).map(|p| transcript_usage_from(&p))).unwrap_or_default();
+            if !recovered.is_zero() {
+                let mut st = lock(&inst.st);
+                if st.agy.usage.is_zero() {
+                    st.agy.usage = recovered;
+                }
             }
         }
+        self.agy_finish_attach(&conn, &inst, &session, gen, &r, is_new).await;
         Ok(conn)
     }
 
@@ -296,10 +547,12 @@ impl Chat {
                 let _ = self.store.set(&super::binding_key(&inst.id), &b);
                 st.binding = Some(b);
                 let queued = std::mem::take(&mut st.agy.queued);
-                st.agy = AgySt { queued, ..Default::default() };
+                let attach_lock = st.agy.attach_lock.clone();
+                st.agy = AgySt { queued, attach_lock, ..Default::default() };
                 st.title = None;
                 st.context = None;
                 st.error = None;
+                st.model_set_at = None;
                 Self::set_phase(inst, &mut st, Phase::Idle, None);
                 Self::emit_status(inst, &st);
             }
@@ -393,8 +646,12 @@ impl Chat {
             }
             "config_option_update" => {
                 if u["configOptions"].is_array() {
-                    Self::agy_config(&mut st, u["configOptions"].clone());
+                    let cfg = u["configOptions"].clone();
+                    Self::agy_config(&mut st, cfg.clone());
                     Self::emit_status(&inst, &st);
+                    drop(st);
+                    self.agy_cache_config(&cfg);
+                    return;
                 }
             }
             "available_commands_update" => {
@@ -402,10 +659,16 @@ impl Chat {
             }
             "tool_call" | "tool_call_update" if st.phase == Phase::Running => {
                 let done = matches!(u["status"].as_str(), Some("completed" | "failed"));
-                let name = (!done).then(|| u["name"].as_str().map(|n| agy_log::tool_view(n, &Value::Null).0)).flatten();
-                if st.tool != name {
-                    st.tool = name;
-                    Self::emit_status(&inst, &st);
+                let next = if done {
+                    Some(None)
+                } else {
+                    u["name"].as_str().filter(|s| !s.is_empty()).map(|n| Some(agy_log::tool_view(n, &Value::Null).0))
+                };
+                if let Some(name) = next {
+                    if st.tool != name {
+                        st.tool = name;
+                        Self::emit_status(&inst, &st);
+                    }
                 }
             }
             "agent_message_chunk" if st.tool.is_some() => {
@@ -482,20 +745,25 @@ impl Chat {
             if matches!(phase, Phase::Running | Phase::Approval) {
                 return Err(LocalError::new("CHAT_RUNNING"));
             }
-            let conn = self.agy_conn().await?;
+            let (conn, gen) = self.agy_conn(id).await?;
             match resume_to {
-                Some(s) if agy_log::valid_session(s) => self.agy_bind(&inst, s),
+                Some(s) if agy_log::valid_session(s) => {
+                    self.agy_bind(&inst, s);
+                    lock(&inst.st).agy.generation = 0;
+                    self.agy_attach(id).await?;
+                }
                 Some(_) => return Err(LocalError::invalid("resume", "invalid")),
                 None => {
+                    let attach_lock = lock(&inst.st).agy.attach_lock.clone();
+                    let _guard = attach_lock.lock().await;
                     let row = self.store.instance(id)?.ok_or_else(LocalError::not_found)?;
                     let r = conn.call("session/new", json!({ "cwd": row.workdir, "mcpServers": [] })).await?;
-                    let sid = r["sessionId"].as_str().filter(|s| agy_log::valid_session(s)).ok_or_else(|| LocalError::new("AGY_REQUEST_FAILED").with("detail", "no sessionId"))?;
-                    self.agy_bind(&inst, sid);
+                    let sid = r["sessionId"].as_str().filter(|s| agy_log::valid_session(s)).ok_or_else(|| LocalError::new("AGY_REQUEST_FAILED").with("detail", "no sessionId"))?.to_string();
+                    self.agy_bind(&inst, &sid);
+                    // 新建空会话直接应用 configOptions、标记已加载并恢复模式/模型，不再多余地 session/load
+                    self.agy_finish_attach(&conn, &inst, &sid, gen, &r, true).await;
                 }
             }
-            // 新绑的会话还没加载：下面这次 attach 加载（新建的会话也走一遍，拿到设置项）
-            lock(&inst.st).agy.generation = 0;
-            self.agy_attach(id).await?;
             let _ = inst.tx.send(super::Event::Reset);
             return Ok(json!({ "delivered": true }));
         }
@@ -520,12 +788,12 @@ impl Chat {
     /// 发出一轮：在后台等 `session/prompt` 返回，结束后发排着的下一条
     fn agy_start_turn(&self, conn: Arc<AcpConn>, inst: Arc<Inst>, text: String, images: Vec<String>) -> Result<(), LocalError> {
         let session = Self::agy_session(&inst).ok_or_else(LocalError::not_found)?;
-        let content = tokio::task::block_in_place(|| prompt_content(&text, &images))?;
+        let (content, imgs) = tokio::task::block_in_place(|| prompt_content_with_images(&text, &images))?;
         let log = agy_log::shared(&session);
         {
             let mut l = lock(&log);
             l.turn_start();
-            l.user(&text, images.len() as u32);
+            l.user_with_images(&text, imgs.len() as u32, imgs);
         }
         {
             let mut st = lock(&inst.st);
@@ -573,8 +841,9 @@ impl Chat {
             }
             Self::drop_pending(&mut st);
             st.last_reply = lock(&log).last_reply();
-            // 进程没了：排着的先留着，下次发消息时再发
-            let next = if conn.alive() && !st.agy.queued.is_empty() { Some(st.agy.queued.remove(0)) } else { None };
+            let cancelled = matches!(&r, Ok(v) if v["stopReason"].as_str() == Some("cancelled"));
+            // 进程没了或被停止：排着的留着（可在界面上取回或编辑），正常完成才接着发下一条
+            let next = if conn.alive() && !cancelled && !st.agy.queued.is_empty() { Some(st.agy.queued.remove(0)) } else { None };
             if next.is_none() {
                 Self::set_phase(inst, &mut st, Phase::Idle, None);
             }
@@ -611,7 +880,7 @@ impl Chat {
         }
     }
 
-    /// 停止：取消这一轮（agy 那边结束后 `session/prompt` 返回 `cancelled`），排着的也不发了
+    /// 停止：取消这一轮（agy 那边结束后 `session/prompt` 返回 `cancelled`），排着的消息留着供取回
     pub(super) async fn agy_interrupt(&self, id: &str) -> Result<(), LocalError> {
         let inst = self.inst(id);
         let session = {
@@ -619,14 +888,85 @@ impl Chat {
             if !matches!(st.phase, Phase::Running | Phase::Approval) {
                 return Ok(());
             }
-            st.agy.queued.clear();
             Self::drop_pending(&mut st);
             st.binding.as_ref().map(|b| b.session_id.clone())
         };
         let Some(session) = session else { return Ok(()) };
-        let Some(conn) = self.agy.conn.lock().await.clone().filter(|c| c.alive()) else { return Ok(()) };
+        let Some((conn, _)) = self.agy_live(id).await else { return Ok(()) };
         conn.notify("session/cancel", json!({ "sessionId": session }));
         Self::stop_tool(&inst, &mut lock(&inst.st));
+        Ok(())
+    }
+
+    /// 取回排在这一轮之后的第 `n` 条（界面放回输入框）
+    pub fn agy_later_take(&self, id: &str, n: usize) -> Result<Value, LocalError> {
+        let inst = self.inst(id);
+        let mut st = lock(&inst.st);
+        if n >= st.agy.queued.len() {
+            return Err(LocalError::not_found());
+        }
+        let (text, images) = st.agy.queued.remove(n);
+        Self::emit_status(&inst, &st);
+        Ok(json!({ "text": text, "images": images }))
+    }
+
+    /// 强制重启：标记 stale，重新加载当前会话
+    pub(super) async fn agy_restart(&self, id: &str) -> Result<(), LocalError> {
+        let _ = self.agy_interrupt(id).await;
+        self.agy.stale.store(true, Ordering::SeqCst);
+        let inst = self.inst(id);
+        {
+            let mut st = lock(&inst.st);
+            Self::drop_pending(&mut st);
+            st.agy.generation = 0;
+            st.error = None;
+            if matches!(st.phase, Phase::Running | Phase::Approval) {
+                Self::set_phase(&inst, &mut st, Phase::Idle, None);
+            }
+            if st.binding.is_none() {
+                return Ok(());
+            }
+        }
+        self.agy_attach(id).await.map(|_| ())
+    }
+
+    /// 换账号接着同一段对话：记下新账号，在那个账号的 `agy acp` 里重新加载（对话记录各账号共用，见 agy_profiles.rs 的 SHARED）。
+    /// `go_on`：起来后发 continue
+    pub(super) async fn agy_switch_profile(&self, id: &str, profile: &str, go_on: bool) -> Result<(), LocalError> {
+        crate::agy_profiles::get(&self.store, profile).ok_or_else(|| LocalError::invalid("agy_profile", "not_found"))?;
+        if self.instances.container(id).is_some() {
+            return Err(LocalError::new("CHAT_UNAVAILABLE"));
+        }
+        let _ = self.agy_interrupt(id).await;
+        let old = self.agy_live(id).await;
+        crate::agy_profiles::pin(&self.store, id, Some(profile))?;
+        let inst = self.inst(id);
+        // 旧账号进程里的这段对话关掉（换回同一个账号时不关）
+        if let (Some((old, _)), Some(s)) = (old, Self::agy_session(&inst)) {
+            if self.agy_live(id).await.is_none_or(|(c, _)| !Arc::ptr_eq(&c, &old)) {
+                if let Err(e) = old.call_timeout("session/close", json!({ "sessionId": s }), Duration::from_secs(5)).await {
+                    tracing::debug!(error = ?e, "换账号时旧进程里的 agy 会话没关上");
+                }
+            }
+        }
+        let has_binding = {
+            let mut st = lock(&inst.st);
+            Self::drop_pending(&mut st);
+            st.agy.generation = 0;
+            st.error = None;
+            if matches!(st.phase, Phase::Running | Phase::Approval) {
+                Self::set_phase(&inst, &mut st, Phase::Idle, None);
+            }
+            st.binding.is_some()
+        };
+        if !has_binding {
+            return Ok(());
+        }
+        self.agy_attach(id).await?;
+        let _ = inst.tx.send(super::Event::Reset);
+        if go_on {
+            self.agy_input(id, "continue", &[]).await?;
+        }
         Ok(())
     }
 
@@ -644,8 +984,7 @@ impl Chat {
     /// 模型、思考强度、权限模式
     pub(super) async fn agy_setting(&self, id: &str, kind: &str, value: &str) -> Result<(), LocalError> {
         let inst = self.inst(id);
-        let ok = !value.is_empty() && value.len() <= 80 && value.chars().all(|c| c.is_ascii_alphanumeric() || "._-:".contains(c));
-        if !ok {
+        if !valid_setting_value(value) {
             return Err(LocalError::invalid("value", "invalid"));
         }
         let conn = self.agy_attach(id).await?;
@@ -662,9 +1001,13 @@ impl Chat {
             "model" | "effort" => {
                 let config_id = if kind == "model" { "model" } else { "thought_level" };
                 let r = conn.call("session/set_config_option", json!({ "sessionId": session, "configId": config_id, "value": value })).await?;
+                let cfg = r["configOptions"].is_array().then(|| r["configOptions"].clone());
+                if let Some(ref c) = cfg {
+                    self.agy_cache_config(c);
+                }
                 let mut st = lock(&inst.st);
-                if r["configOptions"].is_array() {
-                    Self::agy_config(&mut st, r["configOptions"].clone());
+                if let Some(c) = cfg {
+                    Self::agy_config(&mut st, c);
                 }
                 if kind == "model" {
                     st.model_set_at = Some(st.model_msg.clone());
@@ -697,25 +1040,84 @@ impl Chat {
         Ok(json!({ "items": items }))
     }
 
-    /// 用量栏：累计 token 和上下文占用（agy 没有报订阅额度）
+    /// 用量栏：累计 token、上下文占用、运行版本与已安装版本
     pub(super) fn agy_usage(&self, id: &str) -> Value {
         let inst = self.inst(id);
         let st = lock(&inst.st);
         let u = st.agy.usage;
         let totals = json!({ "input": u.input + u.cache_write, "cache_read": u.cache_read, "output": u.output });
-        json!({ "model": st.model, "context": st.context, "window": st.agy.window, "totals": totals, "limits": null, "version": null })
+        json!({
+            "model": st.model,
+            "context": st.context,
+            "window": st.agy.window,
+            "totals": totals,
+            "limits": null,
+            "version": st.version,
+            "installed": crate::agent_update::installed_version("agy"),
+        })
     }
 
-    /// 排着的消息（界面上显示在输入框上面）
-    pub(super) fn agy_queued(st: &super::State) -> impl Iterator<Item = &String> {
-        st.agy.queued.iter().map(|(t, _)| t)
+    /// `/status`：这段 agy 对话的会话信息、配置和用量
+    pub(super) async fn agy_status(&self, id: &str) -> Result<Value, LocalError> {
+        let _ = self.agy_attach(id).await;
+        let inst = self.inst(id);
+        let (session, model, effort, mode, usage, context, window, version, phase) = {
+            let st = lock(&inst.st);
+            (
+                st.binding.as_ref().map(|b| b.session_id.clone()),
+                st.model.clone(),
+                st.effort.clone(),
+                st.mode.clone(),
+                st.agy.usage,
+                st.context,
+                st.agy.window,
+                st.version.clone(),
+                st.phase,
+            )
+        };
+        let dir = self.store.instance(id).ok().flatten().map(|r| r.workdir);
+        let installed = crate::agent_update::installed_version("agy");
+        let row = |label: &str, value: Option<String>| value.filter(|v| !v.is_empty()).map(|v| json!({ "label": label, "value": v }));
+        let session_rows: Vec<Value> = [
+            row("Version", version.or(installed)),
+            row("Session", session),
+            row("Directory", dir),
+            row("Status", Some(format!("{phase:?}").to_ascii_lowercase())),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        let config_rows: Vec<Value> = [row("Model", model), row("Thought level", effort), row("Permissions", mode)].into_iter().flatten().collect();
+        let total_tokens = usage.input + usage.output + usage.cache_read + usage.cache_write;
+        let usage_rows: Vec<Value> = [
+            row("Context used", context.map(|c| c.to_string())),
+            row("Context window", window.map(|w| w.to_string())),
+            row("Input tokens", (usage.input + usage.cache_write > 0).then(|| (usage.input + usage.cache_write).to_string())),
+            row("Cache read", (usage.cache_read > 0).then(|| usage.cache_read.to_string())),
+            row("Output tokens", (usage.output > 0).then(|| usage.output.to_string())),
+            row("Total tokens", (total_tokens > 0).then(|| total_tokens.to_string())),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        Ok(json!({ "sections": [
+            { "title": "Session", "rows": session_rows },
+            { "title": "Config", "rows": config_rows },
+            { "title": "Usage", "rows": usage_rows },
+        ] }))
+    }
+
+    /// 资源看板：各账号的 `agy acp` 进程号和一共加载着几段对话
+    pub async fn agy_usage_roots(&self) -> (Vec<u32>, usize) {
+        let pids = self.agy.conns.lock().await.values().filter(|(c, _)| c.alive()).filter_map(|(c, _)| c.pid).collect();
+        (pids, lock(&self.agy.sessions).len())
     }
 
     /// 有人看着的时候：agy 进程没了（崩了）就重新起、重新加载
     pub(super) async fn agy_keep(&self, id: &str) {
         let inst = self.inst(id);
-        let gen = self.agy.generation.load(Ordering::SeqCst);
-        if lock(&inst.st).agy.generation == gen && gen != 0 && self.agy.conn.lock().await.as_ref().is_some_and(|c| c.alive()) {
+        let gen = self.agy_gen_of(id).await;
+        if lock(&inst.st).agy.generation == gen && gen != 0 {
             return;
         }
         if let Err(e) = self.agy_attach(id).await {
@@ -735,8 +1137,9 @@ impl Chat {
         let Some(s) = session else { return };
         lock(&self.agy.sessions).remove(&s);
         agy_log::drop_log(&s);
-        let conn = self.agy.conn.lock().await.clone().filter(|c| c.alive());
-        if let Some(c) = conn {
+        // 终端已经删了、不知道是哪个账号的进程：每个起着的都关一下（不是它的会回错，不管）
+        let conns: Vec<Arc<AcpConn>> = self.agy.conns.lock().await.values().filter(|(c, _)| c.alive()).map(|(c, _)| c.clone()).collect();
+        for c in conns {
             c.notify("session/cancel", json!({ "sessionId": s }));
             if let Err(e) = c.call("session/close", json!({ "sessionId": s })).await {
                 tracing::debug!(error = ?e, "agy 会话没关上");
@@ -824,7 +1227,7 @@ mod tests {
         assert!(s["items"].as_array().unwrap().iter().any(|i| i["k"] == "interrupt"), "{}", s["items"]);
         // 进程重启后重新加载：历史重放回来
         let before = s["total"].as_u64().unwrap();
-        chat.agy.conn.lock().await.as_ref().unwrap().kill();
+        chat.agy_live(&id).await.unwrap().0.kill();
         tokio::time::sleep(Duration::from_secs(1)).await;
         chat.relaunch(&id).await.unwrap();
         tokio::time::sleep(Duration::from_secs(2)).await;
@@ -833,7 +1236,7 @@ mod tests {
         assert!(text.contains("PONG") && text.contains("DONE"), "{text}");
         println!("条目 {before} → 重新加载后 {}", s["total"]);
         let session = Chat::agy_session(&chat.inst(&id)).unwrap();
-        let conn = chat.agy.conn.lock().await.clone().unwrap();
+        let conn = chat.agy_live(&id).await.unwrap().0;
         conn.call("session/close", json!({ "sessionId": session })).await.unwrap();
     }
 
@@ -885,10 +1288,149 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let png = dir.path().join("a.png");
         std::fs::write(&png, b"\x89PNG").unwrap();
-        let c = prompt_content("look", &[png.display().to_string()]).unwrap();
+        let (c, imgs) = prompt_content_with_images("look", &[png.display().to_string()]).unwrap();
         assert_eq!(c[0], json!({ "type": "text", "text": "look" }));
         assert_eq!((c[1]["type"].as_str(), c[1]["mimeType"].as_str()), (Some("image"), Some("image/png")));
+        assert_eq!(imgs, vec![("image/png", b"\x89PNG".to_vec())]);
         assert!(prompt_content("x", &[dir.path().join("a.bmp").display().to_string()]).is_err());
         assert_eq!(prompt_content("", &[]).unwrap(), json!([{ "type": "text", "text": "" }]));
+    }
+
+    #[test]
+    fn grouped_model_options_and_validation() {
+        let config = json!([
+            {
+                "id": "model",
+                "currentValue": "auto-group",
+                "options": [
+                    {
+                        "value": "auto-group",
+                        "name": "Auto (Best)",
+                        "description": "Picks best model",
+                        "isGroup": true,
+                        "models": ["gemini-4-neon", "claude-opus-5-5"]
+                    },
+                    {
+                        "group": "google",
+                        "name": "Google Gemini",
+                        "value": "google/auto",
+                        "description": "Any Gemini model",
+                        "options": [
+                            { "value": "gemini-4-neon", "name": "Gemini 4 Neon", "description": "Fast" },
+                            { "value": "gemini-4-pro (preview)", "name": "Gemini 4 Pro" }
+                        ]
+                    },
+                    {
+                        "group": "anthropic",
+                        "name": "Anthropic Claude",
+                        "options": [
+                            { "value": "claude-opus-5-5", "name": "Claude Opus 5.5" }
+                        ]
+                    }
+                ]
+            },
+            {
+                "id": "thought_level",
+                "currentValue": "high",
+                "options": [
+                    { "group": "std", "name": "Standard", "options": [{ "value": "low" }, { "value": "high" }] }
+                ]
+            }
+        ]);
+        let opts = model_options(&config);
+        assert_eq!(opts.len(), 5);
+        // 单独的 group 选项
+        assert_eq!(opts[0]["value"], "auto-group");
+        assert_eq!(opts[0]["is_group"], true);
+        assert_eq!(opts[0]["default"], true);
+        assert_eq!(opts[0]["models"], json!(["gemini-4-neon", "claude-opus-5-5"]));
+        assert_eq!(opts[0]["efforts"], json!(["low", "high"]));
+        // 带可选 value 的分组自身
+        assert_eq!(opts[1]["value"], "google/auto");
+        assert_eq!(opts[1]["is_group"], true);
+        assert_eq!(opts[1]["group"], "google");
+        assert_eq!(opts[1]["group_name"], "Google Gemini");
+        assert_eq!(opts[1]["models"], json!(["gemini-4-neon", "gemini-4-pro (preview)"]));
+        // 分组下的子选项
+        assert_eq!(opts[2]["value"], "gemini-4-neon");
+        assert_eq!(opts[2]["group"], "google");
+        assert_eq!(opts[2]["group_name"], "Google Gemini");
+        assert!(opts[2].get("is_group").is_none());
+        assert_eq!(opts[3]["value"], "gemini-4-pro (preview)");
+        // 不带 value 的纯分组只展开子选项
+        assert_eq!(opts[4]["value"], "claude-opus-5-5");
+        assert_eq!(opts[4]["group"], "anthropic");
+        assert_eq!(opts[4]["group_name"], "Anthropic Claude");
+
+        // 放宽后的值校验
+        assert!(valid_setting_value("google/gemini-4 (preview)+v2"));
+        assert!(valid_setting_value("claude-opus-5-5"));
+        assert!(!valid_setting_value(""));
+        assert!(!valid_setting_value("bad\nmodel"));
+        assert!(!valid_setting_value(&"a".repeat(129)));
+    }
+
+    #[test]
+    fn recovers_usage_from_brain_transcript() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("transcript.jsonl");
+        let lines = [
+            json!({ "type": "USER_MESSAGE", "text": "hi" }).to_string(),
+            json!({ "type": "PLANNER_RESPONSE", "input_tokens": 1200, "cache_read_tokens": 300, "output_tokens": 450 }).to_string(),
+            "not json".to_string(),
+            json!({ "type": "PLANNER_RESPONSE", "input_tokens": 800, "cache_read_tokens": 500, "output_tokens": 150, "thought_tokens": 50 }).to_string(),
+        ];
+        std::fs::write(&file, lines.join("\n")).unwrap();
+        let u = transcript_usage_from(&file);
+        assert_eq!(u, Usage { input: 2000, output: 650, cache_read: 800, cache_write: 0 });
+        assert!(transcript_usage_from(&dir.path().join("missing.jsonl")).is_zero());
+    }
+
+    #[tokio::test]
+    async fn agy_later_take_and_usage_version_and_cache() {
+        use crate::instances::Instances;
+        use crate::paths::Paths;
+        use crate::store::Store;
+        let home = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let paths = Paths::discover(Some(home.path().to_path_buf())).unwrap();
+        let store = Arc::new(Store::memory().unwrap());
+        let instances = Instances::new(store.clone(), paths.clone());
+        let input = crate::instances::Input { name: Some("agy-u".into()), workdir: Some(work.path().display().to_string()), launch: Some("agy".into()), ..Default::default() };
+        let id = instances.create(input).await.unwrap().row.id;
+        let chat = Chat::new(store.clone(), paths.clone(), instances.clone());
+
+        // 排队取回 & status_of 暴露在 later
+        {
+            let inst = chat.inst(&id);
+            let mut st = lock(&inst.st);
+            st.version = Some("1.9.0".into());
+            st.agy.usage = Usage { input: 100, output: 50, cache_read: 20, cache_write: 10 };
+            st.agy.queued.push(("first".into(), vec!["/tmp/a.png".into()]));
+            st.agy.queued.push(("second".into(), vec![]));
+            let status = Chat::status_of(&inst, &st);
+            assert_eq!(status["caps"]["live_settings"], true);
+            assert_eq!(status["caps"]["user_images"], true);
+            assert_eq!(status["later"], json!([{ "text": "first", "images": 1 }, { "text": "second", "images": 0 }]));
+        }
+        let taken = chat.later_take(&id, 0).unwrap();
+        assert_eq!(taken, json!({ "text": "first", "images": ["/tmp/a.png"] }));
+        assert!(chat.later_take(&id, 5).is_err());
+
+        // usage 返回 version 和 installed 字段
+        let u = chat.agy_usage(&id);
+        assert_eq!(u["version"], "1.9.0");
+        assert!(u.get("installed").is_some());
+        assert_eq!(u["totals"], json!({ "input": 110, "cache_read": 20, "output": 50 }));
+
+        // 缓存 configOptions 供 draft_models / draft_remember 使用
+        let cfg = json!([{ "id": "model", "currentValue": "gemini-4-neon", "options": [{ "value": "gemini-4-neon", "name": "Gemini 4" }, { "value": "claude-opus-5-5", "name": "Opus" }] }]);
+        chat.agy_cache_config(&cfg);
+        assert_eq!(chat.agy_cached_config(), cfg);
+        chat.draft_remember("agy", "", Some("claude-opus-5-5"), Some("high")).unwrap();
+        let (agent, profile, base) = chat.memory_scope_of(&id).unwrap();
+        assert_eq!((agent, profile.as_str()), ("agy", crate::agy_profiles::OFFICIAL));
+        let mem = super::super::model_memory::get(&store, agent, &profile, &base).unwrap();
+        assert_eq!((mem.model.as_deref(), mem.effort.as_deref()), (Some("claude-opus-5-5"), Some("high")));
     }
 }

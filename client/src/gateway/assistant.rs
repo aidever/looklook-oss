@@ -85,8 +85,13 @@ fn queue_update<T>(app: &App, f: impl FnOnce(&mut Vec<Queued>) -> T) -> T {
     r
 }
 
-/// 不填引擎时派给谁：装了 Claude Code 用它，否则 Codex（只装了 Codex 的电脑上不能默认派给没装的）
+/// 不填引擎时派给谁：用户在设置里选了、而且装着 → 它；否则装了 Claude Code 用它，再否则 Codex（不能默认派给没装的）
 async fn default_engine(app: &App) -> &'static str {
+    if let Some(e) = core::settings(&app.store).dispatch_engine {
+        if engine_installed(app, e).await {
+            return e.launch();
+        }
+    }
     if engine_installed(app, core::Engine::Claude).await { "claude" } else { "codex" }
 }
 
@@ -519,6 +524,8 @@ async fn open_session(app: &App, project: &str, title: &str, engine: &str, first
         launch: Some(engine.to_string()),
         chat_ui: Some(true),
         full_access: Some(pick.mode == "bypassPermissions" || pick.mode == "fullAccess"),
+        claude_profile: if engine == "claude" { dispatch_account(app, engine) } else { None },
+        codex_profile: if engine == "codex" { dispatch_account(app, engine) } else { None },
         // 第一句话等登记好再送：起进程时要带上找助理的工具（assistant_note）；权限、模型也要先换好
         prompt: None,
         ..Default::default()
@@ -885,7 +892,7 @@ fn tool_defs() -> Value {
               "title": { "type": "string", "description": "A few words for the session list, in the user's language." },
               "brief": { "type": "string", "description": "Background the session needs for this job, as up to four parts: what is already decided / what is still open / hard constraints (including standing agreements) / when to stop and ask. No implementation plan, nothing about other jobs or how to answer on Feishu. May be empty when the user's words say it all." },
               "reason": { "type": "string", "description": "One sentence, in the user's language, shown to the user: why a new session, why here." },
-              "engine": { "type": "string", "enum": ENGINES, "description": "Only when the user named one, or the project is known to use one. Default: claude." },
+              "engine": { "type": "string", "enum": ENGINES, "description": "Only when the user named one for this job. Omitted = the tool the user picked in settings for sessions you start (Claude Code when unset and installed)." },
               "now": { "type": "boolean", "description": "Start right away even though another session is working in the same project. Only when the user asked for that." },
               "quote": { "type": "string", "description": "Only when the user's latest message also talks about other things: the sentences of it that are about THIS job, copied word for word (Looklook checks). Empty string = attach none of it. Omit when the whole message is about this job." },
               "permission": { "type": "string", "enum": ["read_only", "ask", "project", "full"], "description": "How much this session may do without asking. Omit unless the user said something about it for this job or the job is clearly read-only: omitted = the default permission the user set in settings (project when unset). read_only = only read and investigate (reviews, finding causes, answering questions about the code). ask = edits inside the project go ahead, every command asks the user (the user said \"ask me first\"). project = edits and commands inside the project go ahead; leaving the project, network, pushing and deploying ask. full = nothing asks; only when the user said so (\"let it do whatever it needs\"). Dangerous commands still ask at full. Above the user's limit needs the user's approval; while the user is away it never goes above project." },
@@ -1894,6 +1901,9 @@ pub struct SettingsReq {
     /// 派出去的会话的默认权限、模型，按引擎：`{"claude": {"mode": "auto", "model": "opus"}}`；空字符串 = 不设（用工具自己的）
     #[serde(default)]
     defaults: Option<std::collections::BTreeMap<String, DefaultsReq>>,
+    /// 派活默认用哪个工具：claude / codex；空字符串 = 自动
+    #[serde(default)]
+    dispatch_engine: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -1902,6 +1912,22 @@ pub struct DefaultsReq {
     mode: Option<String>,
     #[serde(default)]
     model: Option<String>,
+    /// 账号 id（Claude Code 账号 / Codex 配置）；空字符串 = 跟默认账号
+    #[serde(default)]
+    account: Option<String>,
+}
+
+/// 这个账号还在不在
+fn account_exists(app: &App, engine: &str, id: &str) -> bool {
+    match engine {
+        "claude" => crate::claude_profiles::get(&app.store, id).is_some(),
+        _ => crate::codex_profiles::get(&app.store, id).is_some(),
+    }
+}
+
+/// 派出去的会话用哪个账号：设置里选的（还在的话），否则 None = 当时的默认账号
+fn dispatch_account(app: &App, engine: &str) -> Option<String> {
+    core::settings(&app.store).defaults(engine).account.clone().filter(|id| account_exists(app, engine, id))
 }
 
 fn parse_settings(app: &App, req: &SettingsReq) -> R<core::Settings> {
@@ -1921,6 +1947,12 @@ fn parse_settings(app: &App, req: &SettingsReq) -> R<core::Settings> {
     if let Some(c) = req.ceiling.as_deref() {
         s.ceiling = Some(core::Level::parse(c).ok_or_else(|| LocalError::invalid("ceiling", "invalid"))?);
     }
+    if let Some(e) = req.dispatch_engine.as_deref().map(str::trim) {
+        s.dispatch_engine = match e {
+            "" => None,
+            e => Some(core::Engine::parse(e).ok_or_else(|| LocalError::invalid("dispatch_engine", "invalid"))?),
+        };
+    }
     for (engine, d) in req.defaults.iter().flatten() {
         if !ENGINES.contains(&engine.as_str()) {
             return Err(LocalError::invalid("engine", "invalid"));
@@ -1937,6 +1969,12 @@ fn parse_settings(app: &App, req: &SettingsReq) -> R<core::Settings> {
                 return Err(LocalError::invalid("model", "invalid"));
             }
             to.model = Some(m.to_string()).filter(|m| !m.is_empty());
+        }
+        if let Some(a) = d.account.as_deref().map(str::trim) {
+            if !a.is_empty() && !account_exists(app, engine, a) {
+                return Err(LocalError::invalid("account", "not_found"));
+            }
+            to.account = Some(a.to_string()).filter(|a| !a.is_empty());
         }
     }
     Ok(s)
@@ -2403,7 +2441,8 @@ pub struct LevelReq {
 }
 
 /// `POST /api/assistant/sessions/{session}/level`：用户在活动面板上给助理开的、送过话的会话换权限（调高也行：是用户自己点的），
-/// 可以是四档之一，也可以是这种引擎的任何一种权限模式。Claude Code 马上生效；Codex 下一轮生效
+/// 可以是四档之一，也可以是这种引擎的任何一种权限模式。Claude Code 马上生效；Codex 的审批策略下一轮才换，
+/// 这一轮里来问的（包括正在等的）看看照新模式替用户放
 pub async fn set_session_level(State(app): State<App>, Path(session): Path<String>, Json(req): Json<LevelReq>) -> R<Json<Value>> {
     if !core::watches(&app.store).contains_key(&session) || core::is_gated(&app.store, &session) {
         return Err(LocalError::not_found());

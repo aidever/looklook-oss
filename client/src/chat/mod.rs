@@ -292,6 +292,10 @@ pub struct ProcessRoots {
     /// app-server 里加载着几段对话
     pub codex_loaded: Option<usize>,
     pub codex_bg: Vec<codex_chat::BgTerm>,
+    /// Antigravity `agy acp` 的进程号（每个账号一个）
+    pub agy: Vec<u32>,
+    /// `agy acp` 里加载着几段对话
+    pub agy_loaded: Option<usize>,
 }
 
 pub struct Inst {
@@ -565,6 +569,9 @@ impl Chat {
             // 运行中也能换模型、思考强度（stream-json 随时发控制请求；Codex 下一轮 turn/start 带上）
             caps["live_settings"] = json!(true);
         }
+        if inst.agent.launch() == "agy" {
+            caps["live_settings"] = json!(true);
+        }
         // Codex 的提问工具没有多选字段（答案是数组）：界面上每道题可以自己打开多选
         if inst.agent.launch() == "codex" {
             caps["q_multi_toggle"] = json!(true);
@@ -594,9 +601,9 @@ impl Chat {
             // Codex：这段对话实际在哪个目录（在托管工作树里时和终端的工作目录不同）
             "cwd": st.codex.cwd.as_ref().or(st.dsh.cwd.as_ref()),
             // Claude Code 队列里的（读 transcript）；Codex 是插话（`turn/steer`）发出去、还没进对话的
-            "queued": st.queued.iter().chain(&st.codex.steered).chain(&st.dsh.queued).chain(Self::agy_queued(st)).collect::<Vec<_>>(),
-            // Codex：Tab 排到这一轮之后的（这一轮结束后作为下一轮发出）
-            "later": st.codex.later.iter().map(|(t, i)| json!({ "text": t, "images": i.len() })).collect::<Vec<_>>(),
+            "queued": st.queued.iter().chain(&st.codex.steered).chain(&st.dsh.queued).collect::<Vec<_>>(),
+            // Codex / agy：排到这一轮之后的（这一轮结束后作为下一轮发出，可逐条取回）
+            "later": st.codex.later.iter().chain(&st.agy.queued).map(|(t, i)| json!({ "text": t, "images": i.len() })).collect::<Vec<_>>(),
             "limit": (st.limit_wait.is_some() || st.limit_auto_at.is_some() || st.sdk.limit_resume.is_some())
                 .then(|| json!({ "waiting": st.limit_wait, "auto_at": st.limit_auto_at, "resume_at": st.sdk.limit_resume, "guess": st.sdk.limit_guess })),
             "effort": st.effort,
@@ -1209,9 +1216,7 @@ impl Chat {
             }
         }
         if inst.agent.launch() == "agy" {
-            if let Err(e) = self.agy_attach(id).await {
-                Self::agy_attach_failed(&inst, &e);
-            }
+            self.agy_snapshot_attach(id).await;
         }
         if inst.agent.launch() == "dsh" {
             if let Err(e) = self.dsh_attach(id).await {
@@ -1280,6 +1285,11 @@ impl Chat {
         if self.is_dsh(id) {
             let rec = self.item(id, key).await?;
             return self.dsh_user_image(id, &rec, n).await;
+        }
+        if self.is_agy(id) {
+            let inst = self.inst(id);
+            let session = lock(&inst.st).binding.as_ref().map(|b| b.session_id.clone()).ok_or_else(LocalError::not_found)?;
+            return agy_log::user_image(&session, key, n).ok_or_else(LocalError::not_found);
         }
         if self.is_codex(id) {
             let inst = self.inst(id);
@@ -1564,7 +1574,9 @@ impl Chat {
             Some((pid, n, bg)) => (Some(pid), Some(n), bg),
             None => (None, None, vec![]),
         };
-        ProcessRoots { sdk, codex, codex_loaded, codex_bg }
+        let (agy, n) = self.agy_usage_roots().await;
+        let agy_loaded = (!agy.is_empty()).then_some(n);
+        ProcessRoots { sdk, codex, codex_loaded, codex_bg, agy, agy_loaded }
     }
 
     /// 带对话界面的会话（通知按它们逐个检查）
@@ -1734,6 +1746,7 @@ impl Chat {
         match agent {
             "claude" => Ok(json!({ "items": tokio::task::block_in_place(|| commands::scan(&dir)) })),
             "codex" => self.codex_commands_at(workdir.to_string()).await,
+            "agy" => Ok(json!({ "items": tokio::task::block_in_place(|| manage::agy_draft_commands(&dir)) })),
             _ => Ok(json!({ "items": [] })),
         }
     }
@@ -1865,6 +1878,9 @@ impl Chat {
 
     pub fn later_take(&self, id: &str, n: usize) -> Result<Value, LocalError> {
         self.require(id)?;
+        if self.is_agy(id) {
+            return self.agy_later_take(id, n);
+        }
         self.codex_later_take(id, n)
     }
 
@@ -1899,6 +1915,11 @@ impl Chat {
                     st.title = Some(name.clone());
                     Self::emit_status(&inst, &st);
                 }
+            }
+            "agy" => {
+                let mut st = lock(&inst.st);
+                st.title = Some(name.clone());
+                Self::emit_status(&inst, &st);
             }
             _ => {}
         }
@@ -2398,6 +2419,9 @@ impl Chat {
     /// 接着同一段对话重新启动（各账号的对话记录是共用的）。`go_on`（额度用完、账号用不了时）起来后发一句 `continue`。
     pub async fn switch_profile(self: &Arc<Self>, id: &str, profile: &str, go_on: bool) -> Result<(), LocalError> {
         self.require(id)?;
+        if self.is_agy(id) {
+            return self.agy_switch_profile(id, profile, go_on).await;
+        }
         if !self.profile_switchable(id)? {
             return Err(LocalError::new("CHAT_UNAVAILABLE"));
         }
@@ -2512,6 +2536,7 @@ impl Chat {
         match self.inst(id).agent.launch() {
             "claude" if self.is_sdk(id) => self.sdk_fresh(id).await,
             "codex" => self.codex_input(id, "/new", &[]).await.map(|_| ()),
+            "agy" => self.agy_input(id, "/new", &[]).await.map(|_| ()),
             _ => Err(LocalError::new("CHAT_UNAVAILABLE")),
         }
     }
@@ -2543,6 +2568,7 @@ impl Chat {
                 }
                 self.codex_attach(id).await.map(|_| ())
             }
+            "agy" => self.agy_restart(id).await,
             _ => Err(LocalError::new("CHAT_UNAVAILABLE")),
         }
     }
@@ -2660,7 +2686,7 @@ impl Chat {
     }
 
     /// 会话用的工具、账号 / 配置的 ID、配置里现在的默认值
-    fn memory_scope_of(&self, id: &str) -> Option<(&'static str, String, String)> {
+    pub(super) fn memory_scope_of(&self, id: &str) -> Option<(&'static str, String, String)> {
         match self.inst(id).agent.launch() {
             "claude" => {
                 let p = crate::claude_profiles::for_instance(&self.store, id);
@@ -2671,6 +2697,10 @@ impl Chat {
                 let p = crate::codex_profiles::for_instance(&self.store, id);
                 let base = model_memory::codex_base(&crate::agents::codex_home(), &p);
                 Some(("codex", p.id, base))
+            }
+            "agy" => {
+                let dir = dirs::home_dir().unwrap_or_default().join(".gemini/antigravity-cli");
+                Some(("agy", crate::agy_profiles::for_instance(&self.store, id).id, model_memory::agy_base(&dir)))
             }
             _ => None,
         }
@@ -2844,6 +2874,18 @@ impl Chat {
                     .and_then(|l| model_memory::usable(&l, &opts, &codex_chat::EFFORTS));
                 Ok(json!({ "installed": true, "options": options, "provider": provider, "profile": p.id, "last": last }))
             }
+            "agy" => {
+                if found.agy.is_none() && crate::agents::agy_fallback().is_none() {
+                    return Ok(json!({ "installed": false, "options": [] }));
+                }
+                let config = self.agy_cached_config();
+                let options = agy_chat::model_options(&config);
+                let dir = dirs::home_dir().unwrap_or_default().join(".gemini/antigravity-cli");
+                let p = crate::agy_profiles::get(&self.store, profile).unwrap_or_else(|| crate::agy_profiles::for_instance(&self.store, ""));
+                let last = model_memory::get(&self.store, "agy", &p.id, &model_memory::agy_base(&dir))
+                    .and_then(|l| model_memory::usable(&l, &options, agy_chat::EFFORTS));
+                Ok(json!({ "installed": true, "options": options, "provider": null, "profile": p.id, "last": last }))
+            }
             _ => Err(LocalError::invalid("agent", "one_of")),
         }
     }
@@ -2851,7 +2893,14 @@ impl Chat {
     /// 草稿页点过模型菜单：这次的选择记下来（None = 选的默认，忘掉记住的）。会话起来后设模型时还会再记一次（setting）
     pub fn draft_remember(&self, agent: &str, profile: &str, model: Option<&str>, effort: Option<&str>) -> Result<(), LocalError> {
         let model = model.filter(|m| !m.is_empty() && *m != "default");
-        if model.is_some_and(|m| m.len() > 64 || !m.chars().all(|c| c.is_ascii_alphanumeric() || "._-[]:/".contains(c))) {
+        let model_bad = model.is_some_and(|m| {
+            if agent == "agy" {
+                !agy_chat::valid_setting_value(m)
+            } else {
+                m.len() > 64 || !m.chars().all(|c| c.is_ascii_alphanumeric() || "._-[]:/".contains(c))
+            }
+        });
+        if model_bad {
             return Err(LocalError::invalid("model", "invalid"));
         }
         let effort = effort.filter(|e| !e.is_empty());
@@ -2873,6 +2922,14 @@ impl Chat {
                 let p = xp::get(&self.store, profile).unwrap_or_else(|| xp::for_instance(&self.store, ""));
                 let base = model_memory::codex_base(&crate::agents::codex_home(), &p);
                 (p.id, base)
+            }
+            "agy" => {
+                if effort.is_some_and(|e| !agy_chat::valid_setting_value(e)) {
+                    return Err(LocalError::invalid("effort", "invalid"));
+                }
+                let dir = dirs::home_dir().unwrap_or_default().join(".gemini/antigravity-cli");
+                let p = crate::agy_profiles::get(&self.store, profile).unwrap_or_else(|| crate::agy_profiles::for_instance(&self.store, ""));
+                (p.id, model_memory::agy_base(&dir))
             }
             _ => return Err(LocalError::invalid("agent", "one_of")),
         };
@@ -3079,6 +3136,9 @@ impl Chat {
     /// 不为了看这一页起进程
     pub async fn config(self: &Arc<Self>, id: &str) -> Result<Value, LocalError> {
         self.require(id)?;
+        if self.is_agy(id) {
+            return self.agy_manage_config(id).await;
+        }
         let row = self.store.instance(id)?.ok_or_else(LocalError::not_found)?;
         let workdir = PathBuf::from(&row.workdir);
         let (config_dir, state_file) = self.claude_paths(id);
@@ -3103,6 +3163,12 @@ impl Chat {
     /// MCP 服务器：开关（`toggle`）、重新连接（`reconnect`）、登录（`auth` / `callback` / `clear_auth`）。
     /// 只有 stream-json 的 Claude；进程没在跑时先起
     pub async fn mcp_op(self: &Arc<Self>, id: &str, name: &str, op: &str, enabled: bool, url: Option<&str>) -> Result<Value, LocalError> {
+        if self.is_agy(id) {
+            return match op {
+                "toggle" => self.agy_mcp_toggle(id, name, enabled).await,
+                _ => Err(LocalError::invalid("op", "invalid")),
+            };
+        }
         if !self.is_sdk(id) {
             return Err(LocalError::new("CHAT_UNAVAILABLE"));
         }
@@ -3116,6 +3182,8 @@ impl Chat {
             self.sdk_status(id).await
         } else if self.is_codex(id) {
             self.codex_status(id).await
+        } else if self.is_agy(id) {
+            self.agy_status(id).await
         } else {
             Err(LocalError::new("CHAT_UNAVAILABLE"))
         }

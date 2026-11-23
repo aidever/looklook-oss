@@ -417,7 +417,7 @@ impl Agent for Agy {
 
     /// 能选模型和思考强度、换权限模式、发图片；“本会话都允许”要 agy 给了 `allow_always` 才有，界面上不单独显示
     fn caps(&self) -> Value {
-        json!({ "allow_session": false, "allow_dirs": false, "images": true, "user_images": false, "plan": false, "questions": false, "models": true, "usage": true, "mode": true })
+        json!({ "allow_session": false, "allow_dirs": false, "images": true, "user_images": true, "plan": false, "questions": false, "models": true, "usage": true, "mode": true })
     }
 
     fn session_starts_on_prompt(&self) -> bool {
