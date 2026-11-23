@@ -126,11 +126,12 @@ impl Paths {
         {
             let p = self.home.join("run").join("termd.sock");
             let s = p.to_string_lossy().into_owned();
-            // sun_path 长度限制（macOS 104 / Linux 108），超长数据目录退回短路径
-            if s.len() <= 96 {
+            // sun_path 长度限制（macOS 104 / Linux 108）；数据目录在不支持 socket 的文件系统上
+            // （WSL /mnt/*、NFS、FUSE 网盘等，bind 报 os error 95）也退回短路径
+            if s.len() <= 96 && unix_sockets_supported(&self.home.join("run")) {
                 s
             } else {
-                format!("/tmp/ll-termd-{:016x}.sock", fnv1a64(self.home.to_string_lossy().as_bytes()))
+                format!("/tmp/ll-termd-{}-{:016x}.sock", unsafe { libc::geteuid() }, fnv1a64(self.home.to_string_lossy().as_bytes()))
             }
         }
         #[cfg(windows)]
@@ -166,6 +167,29 @@ impl Paths {
 /// 没有指定（`--home` / `LOOKLOOK_HOME`）时的数据目录。启动时跳转版本（`versions::jump`）也按这个规则找，不能各写一套。
 pub fn default_home() -> Option<PathBuf> {
     dirs::data_dir().map(|d| d.join("looklook"))
+}
+
+/// 在 `dir` 里试建一个 unix socket，看这个文件系统支不支持（结果按目录缓存）。
+#[cfg(unix)]
+fn unix_sockets_supported(dir: &Path) -> bool {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, bool>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(&ok) = cache.lock().unwrap().get(dir) {
+        return ok;
+    }
+    let _ = std::fs::create_dir_all(dir);
+    let probe = dir.join(format!(".sock-probe-{}", std::process::id()));
+    let _ = std::fs::remove_file(&probe);
+    let ok = match std::os::unix::net::UnixListener::bind(&probe) {
+        Ok(_) => true,
+        // 只有“文件系统不支持”才换地方；其它错误（权限、目录不存在等）照旧用原路径，让 termd 报真实原因
+        Err(e) => !e.raw_os_error().is_some_and(|c| c == libc::EOPNOTSUPP || c == libc::ENOTSUP || c == libc::EPERM),
+    };
+    let _ = std::fs::remove_file(&probe);
+    cache.lock().unwrap().insert(dir.to_path_buf(), ok);
+    ok
 }
 
 fn fnv1a64(bytes: &[u8]) -> u64 {
@@ -209,4 +233,16 @@ fn resource_dirs() -> Vec<PathBuf> {
         v.push(vendor);
     }
     v
+}
+
+#[cfg(all(test, unix))]
+mod sock_tests {
+    use super::*;
+
+    #[test]
+    fn socket_probe_ok_on_normal_dir() {
+        let d = tempfile::tempdir().unwrap();
+        assert!(unix_sockets_supported(&d.path().join("run")));
+        assert!(std::fs::read_dir(d.path().join("run")).unwrap().next().is_none(), "probe left behind");
+    }
 }
