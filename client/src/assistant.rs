@@ -40,6 +40,8 @@ const SAID_KEY: &str = "assistant.said";
 pub const MCP_SERVER: &str = "looklook_assistant";
 /// 送进大脑的会话结果、排队通知以这个开头（界面上画成卡片，不当成用户说的话）
 pub const EVENT_OPEN: &str = "<looklook-event";
+/// 只记进对话、没起一轮的事件（`chat::note`）开头标签里带的标记：Codex 记录里靠它认出来显示（codex_rollout.rs `injected_event`）
+pub const NOTE_ATTR: &str = " via=\"note\"";
 /// Claude 大脑默认用的模型：分派判断错一次比省下的额度贵，默认用好的（Codex 用它自己配置里的默认模型）
 pub const DEFAULT_MODEL: &str = "opus";
 /// 用户原话最多附多长
@@ -166,41 +168,96 @@ impl Level {
     }
 }
 
-/// 一种引擎能切的全部权限模式（和对话页设置栏同一套写法），派出去的会话可以手动换成其中任何一个。
-/// Claude Code：五种；Codex：界面上的三档 + 助理派活用的两档（`codex_chat::ASK_COMMANDS`、`FULL_GUARDED`）
-pub fn engine_modes(engine: &str) -> &'static [&'static str] {
-    match engine {
-        "codex" => &["readOnly", "askCommands", "workspaceWrite", "fullGuarded", "fullAccess"],
-        _ => &["plan", "default", "acceptEdits", "auto", "bypassPermissions"],
-    }
+/// 一种工具在助理这里能做什么（借 t3code 的能力表）：派活、权限档位、换引擎带话、沙箱按这张表查，不在各处按名字分支。
+/// 加一种工具 = 在 [`TOOLS`] 里加一行（再加上它自己的对话模式实现）
+#[derive(Debug)]
+pub struct Tool {
+    /// 会话的启动类型（`launch`）
+    pub launch: &'static str,
+    /// 给人看的名字
+    pub name: &'static str,
+    /// 能当大脑（助理工具接得进去、闸门拦得住）
+    pub brain: Option<Engine>,
+    /// 能切的全部权限模式（和对话页设置栏同一套写法）和各算哪一档；派出去的会话可以手动换成其中任何一个
+    pub modes: &'static [(&'static str, Level)],
+    /// 四档（只看、动手前问、项目内放手、全权）各用哪个模式
+    pub by_level: [&'static str; 4],
+    /// 派出去的会话拿得到找助理的工具（`assistant_note`）：要能接 HTTP 的 MCP
+    pub worker_tools: bool,
+    /// 不起一轮就能把一段话记进对话（换引擎带话用，[`crate::chat::ChatManager::note`]）
+    pub silent_note: bool,
+    /// 只看不动时能再加一层工具自带的系统沙箱（[`claude_sandbox`]）；Codex 本来就在它自己的沙箱里
+    pub os_sandbox: bool,
+    /// 模式要等下一轮才生效（界面提示“下一轮生效”）
+    pub mode_next_turn: bool,
 }
 
-/// 一档 → 这种引擎的权限模式（[`Level`] 的说明）
+const CLAUDE_MODES: &[(&str, Level)] =
+    &[("plan", Level::ReadOnly), ("default", Level::Ask), ("acceptEdits", Level::Ask), ("auto", Level::Project), ("bypassPermissions", Level::Full)];
+
+/// 助理能用的工具。Claude Code 五种模式；Codex 界面上的三档 + 助理派活用的两档（`codex_chat::ASK_COMMANDS`、`FULL_GUARDED`）；
+/// Antigravity（agy）和 Claude Code 同一套五种（`agy_chat::acp_mode`：全部权限在 agy 那边也是 auto，审批由看看替它放、命令规则照样拦）
+pub const TOOLS: &[Tool] = &[
+    Tool {
+        launch: "claude",
+        name: "Claude Code",
+        brain: Some(Engine::Claude),
+        modes: CLAUDE_MODES,
+        by_level: ["plan", "acceptEdits", "auto", "bypassPermissions"],
+        worker_tools: true,
+        silent_note: true,
+        os_sandbox: true,
+        mode_next_turn: false,
+    },
+    Tool {
+        launch: "codex",
+        name: "Codex",
+        brain: Some(Engine::Codex),
+        modes: &[("readOnly", Level::ReadOnly), ("askCommands", Level::Ask), ("workspaceWrite", Level::Project), ("fullGuarded", Level::Full), ("fullAccess", Level::Full)],
+        by_level: ["readOnly", "askCommands", "workspaceWrite", "fullGuarded"],
+        worker_tools: true,
+        silent_note: true,
+        os_sandbox: false,
+        mode_next_turn: true,
+    },
+    // agy 1.5 的 ACP 只收 stdio 的 MCP（initialize 里没报 mcpCapabilities.http），找助理的工具接不进去：做完了照样按会话结果叫醒大脑
+    Tool {
+        launch: "agy",
+        name: "Antigravity",
+        brain: None,
+        modes: CLAUDE_MODES,
+        by_level: ["plan", "acceptEdits", "auto", "bypassPermissions"],
+        worker_tools: false,
+        silent_note: false,
+        os_sandbox: false,
+        mode_next_turn: false,
+    },
+];
+
+/// 这种启动类型的能力表（不是助理能用的工具 None）
+pub fn tool(launch: &str) -> Option<&'static Tool> {
+    TOOLS.iter().find(|t| t.launch == launch)
+}
+
+/// 能派活的工具（启动类型）
+pub fn dispatch_tools() -> Vec<&'static str> {
+    TOOLS.iter().map(|t| t.launch).collect()
+}
+
+/// 一种工具能切的全部权限模式；不认得的工具按 Claude Code 的
+pub fn engine_modes(engine: &str) -> Vec<&'static str> {
+    tool(engine).map_or(CLAUDE_MODES, |t| t.modes).iter().map(|(m, _)| *m).collect()
+}
+
+/// 一档 → 这种工具的权限模式（[`Level`] 的说明）
 pub fn native_mode(engine: &str, level: Level) -> &'static str {
-    match (engine, level) {
-        ("codex", Level::ReadOnly) => "readOnly",
-        ("codex", Level::Ask) => "askCommands",
-        ("codex", Level::Project) => "workspaceWrite",
-        ("codex", Level::Full) => "fullGuarded",
-        (_, Level::ReadOnly) => "plan",
-        (_, Level::Ask) => "acceptEdits",
-        (_, Level::Project) => "auto",
-        (_, Level::Full) => "bypassPermissions",
-    }
+    tool(engine).unwrap_or(&TOOLS[0]).by_level[level as usize]
 }
 
 /// 权限模式算哪一档（上限、闸门按档比）；不认得的 None。Claude Code 的“逐项确认”比 acceptEdits 还严，也算动手前问；
 /// Codex 的完全访问（什么都不问）算全权
 pub fn level_of(engine: &str, mode: &str) -> Option<Level> {
-    if !engine_modes(engine).contains(&mode) {
-        return None;
-    }
-    Some(match mode {
-        "plan" | "readOnly" => Level::ReadOnly,
-        "default" | "acceptEdits" | "askCommands" => Level::Ask,
-        "auto" | "workspaceWrite" => Level::Project,
-        _ => Level::Full,
-    })
+    tool(engine)?.modes.iter().find(|(m, _)| *m == mode).map(|(_, l)| *l)
 }
 
 /// 派出去的会话的默认（助理页“设置”里按引擎设）：权限模式、模型。没设 = 权限按 [`Level::Project`]、模型按工具自己的配置
@@ -258,17 +315,28 @@ pub struct Settings {
     pub claude: EngineDefaults,
     #[serde(default, skip_serializing_if = "EngineDefaults::is_empty")]
     pub codex: EngineDefaults,
-    /// 派活默认用哪个工具（大脑没按用户的话指定时）；None = 自动：装了 Claude Code 用它，否则 Codex。设的那个没装时也退回自动
+    #[serde(default, skip_serializing_if = "EngineDefaults::is_empty")]
+    pub agy: EngineDefaults,
+    /// 派活默认用哪个工具（[`TOOLS`] 的启动类型；大脑没按用户的话指定时）；None = 自动：装了 Claude Code 用它，否则 Codex。
+    /// 设的那个没装时也退回自动
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub dispatch_engine: Option<Engine>,
+    pub dispatch_engine: Option<String>,
 }
 
 impl Settings {
     pub fn defaults(&self, engine: &str) -> &EngineDefaults {
-        if engine == "codex" { &self.codex } else { &self.claude }
+        match engine {
+            "codex" => &self.codex,
+            "agy" => &self.agy,
+            _ => &self.claude,
+        }
     }
     pub fn defaults_mut(&mut self, engine: &str) -> &mut EngineDefaults {
-        if engine == "codex" { &mut self.codex } else { &mut self.claude }
+        match engine {
+            "codex" => &mut self.codex,
+            "agy" => &mut self.agy,
+            _ => &mut self.claude,
+        }
     }
 }
 
@@ -278,7 +346,7 @@ fn yes() -> bool {
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { engine: Engine::default(), mode: Mode::default(), feishu: true, inherit: true, ceiling: None, claude: EngineDefaults::default(), codex: EngineDefaults::default(), dispatch_engine: None }
+        Settings { engine: Engine::default(), mode: Mode::default(), feishu: true, inherit: true, ceiling: None, claude: EngineDefaults::default(), codex: EngineDefaults::default(), agy: EngineDefaults::default(), dispatch_engine: None }
     }
 }
 
@@ -546,7 +614,7 @@ pub const RULES: &str = r#"# 你是看看（Looklook）里的助理
 - 它要权限审批：不用你管，看看会把卡片直接给用户。
 - **你不能主动叫干活的停下、撤回、改方向**，除非用户刚刚这么说了。
 - 没事可做就结束这一轮，不要轮询。会话有进展时你会被叫醒。
-- `type="handoff"` 的事件：用户换了引擎或模型服务，看看把你之前的对话带过来了。当成你自己说过的话接着用；没写要接着答的，回一句“接上了”就行。
+- `type="handoff"` 的事件：用户换了引擎或模型服务，看看把你之前的对话带过来了。当成你自己说过的话接着用；它一般只是记进对话、不用回，写了要接着答的才接着答。
 - 事件里“看看从 git 看到的”是事实：转告做了什么时照它说（几个提交、哪些文件没提交），它说的和事实对不上时把事实告诉用户。
 - `type="note"`：干活的会话一边干一边主动找你。`blocked`（卡在外面的人或事上）→ 告诉用户，要等就 `wait_add` 绑定那个会话；`decision` → 把问题转给用户，答了 `session_send` 回去；`fyi` → 简短转告。
 - `type="waiting_approval"` / `type="stalled"`：审批等了很久、会话很久没动静。简短提醒用户一句，不替他批，不自己叫停。
@@ -1269,6 +1337,31 @@ fn data_file(paths: &Paths, p: &Path) -> bool {
     p == agreements_path(paths) || p == dispatch_path(paths) || p.parent() == Some(dir(paths).as_path()) && p.file_name().is_some_and(|n| n.to_string_lossy().ends_with(".tmp"))
 }
 
+/// Claude Code 的大脑、跑腿在“只看不动”时多带的设置：打开 Claude Code 自己的系统沙箱（Linux bubblewrap、macOS Seatbelt）。
+/// 命令先过 [`gate`]（只读命令白名单），沙箱是系统层面的第二道：白名单漏掉的写操作也写不进工作目录以外，看看的记录、记忆目录也写不了。
+/// 学 t3code「不模拟权限模式」：能用工具自己的强制手段就用，模拟的那层只当补充。
+/// - 不让命令跳出沙箱（`allowUnsandboxedCommands: false`），也不因为在沙箱里就不问（`autoAllowBashIfSandboxed: false`，照样过闸门）；
+/// - 起不来（Windows、没装 bubblewrap、容器里不能建用户命名空间）不报错（`failIfUnavailable: false`），照旧只靠闸门——助理页如实显示；
+/// - 联网：只读也要 `git fetch`，常见的代码托管直接放；本机的 Unix socket 放开（`docker ps`、`systemctl status` 要用），只读管的是写。
+/// 只在只读时开：动手前问 / 放手做时用户批了的命令要能改项目，沙箱会挡住。
+pub fn claude_sandbox(paths: &Paths, mode: Mode) -> Option<Value> {
+    if mode != Mode::ReadOnly {
+        return None;
+    }
+    let deny: Vec<String> = [crate::assistant_memory::root(paths), agreements_path(paths), dispatch_path(paths)].iter().map(|p| p.display().to_string()).collect();
+    Some(json!({
+        "enabled": true,
+        "failIfUnavailable": false,
+        "autoAllowBashIfSandboxed": false,
+        "allowUnsandboxedCommands": false,
+        "filesystem": { "denyWrite": deny },
+        "network": {
+            "allowAllUnixSockets": true,
+            "allowedDomains": ["github.com", "*.github.com", "gitlab.com", "*.gitlab.com", "bitbucket.org", "gitee.com", "*.gitee.com"],
+        },
+    }))
+}
+
 /// 闸门拒绝的理由都以这个开头
 pub const DENY_PREFIX: &str = "[Looklook] ";
 
@@ -1746,7 +1839,7 @@ mod tests {
         store.set(SETTINGS_KEY, &json!({ "engine": "claude" })).unwrap();
         assert!(settings(&store).feishu);
         assert_eq!(settings(&store).dispatch_engine, None);
-        save_settings(&store, Settings { dispatch_engine: Some(Engine::Codex), ..Settings::default() }).unwrap();
+        save_settings(&store, Settings { dispatch_engine: Some("codex".into()), ..Settings::default() }).unwrap();
         assert_eq!(serde_json::to_value(settings(&store)).unwrap()["dispatch_engine"], "codex");
         let mut s = settings(&store);
         s.claude.account = Some("p1".into());

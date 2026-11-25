@@ -983,6 +983,11 @@ pub fn ver() -> u64 {
     *ver_tx().borrow()
 }
 
+/// 订阅版本号（页面的 `/api/live/ws`）
+pub fn subscribe() -> tokio::sync::watch::Receiver<u64> {
+    ver_tx().subscribe()
+}
+
 /// 宠物相关的东西变了
 pub fn changed() {
     ver_tx().send_modify(|v| *v += 1);

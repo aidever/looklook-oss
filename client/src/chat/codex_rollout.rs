@@ -22,7 +22,18 @@ use super::transcript::{truncate, Block, Body, Change, Item, Stats, TEXT_LIMIT};
 
 /// 记录里认识、但对话界面不显示的类型
 const SKIPPED: &[&str] = &["response_item", "turn_context", "token_usage_record", "world_state", "compacted", "inter_agent_communication_metadata"];
-const SKIPPED_EVENTS: &[&str] = &["token_count", "task_started", "thread_settings_applied", "user_message", "agent_message", "patch_apply_end", "web_search_end", "exec_command_end"];
+const SKIPPED_EVENTS: &[&str] = &[
+    "token_count",
+    "task_started",
+    "thread_settings_applied",
+    "thread_goal_updated",
+    "thread_goal_cleared",
+    "user_message",
+    "agent_message",
+    "patch_apply_end",
+    "web_search_end",
+    "exec_command_end",
+];
 const SKIPPED_ITEMS: &[&str] = &["SubAgentActivity", "CollabAgentToolCall", "Extension"];
 /// 子代理交回给主线的消息（`response_item` 的 `agent_message`）里，最终答复是这样开头的；`MESSAGE` 类的内容是加密的
 const FINAL_ANSWER: &str = "Message Type: FINAL_ANSWER";
@@ -112,6 +123,10 @@ impl Rollout {
                 _ => self.stats.unknown += 1,
             },
             "response_item" if p["type"] == "agent_message" => self.agent_message(line, p, ts),
+            "response_item" if injected_event(p).is_some() => {
+                let (text, truncated) = truncate(injected_event(p).unwrap_or_default(), TEXT_LIMIT);
+                self.push(line, 0, ts, Body::User { text, images: 0, truncated, mid: false });
+            }
             t if SKIPPED.contains(&t) => {}
             _ => self.stats.unknown += 1,
         }
@@ -542,6 +557,18 @@ pub fn find_rollout(main: &Path, thread: &str) -> Option<PathBuf> {
 }
 
 /// 用户消息 `key`（`r:<行号>:0`）里的第 `n` 张图片：类型和内容（对话界面上的小图、大图）。
+/// 看看用 `thread/inject_items` 记进对话的事件（助理换引擎带过来的对话）：没有对应的 `UserMessage`，只有这条 `response_item`。
+/// 普通发送的每条消息也都有一条 `response_item`（界面用 `UserMessage` 那条），所以只认开头标签里带
+/// [`crate::assistant::NOTE_ATTR`] 的——只有记进对话时才加
+fn injected_event(p: &Value) -> Option<&str> {
+    if p["type"] != "message" || p["role"] != "user" {
+        return None;
+    }
+    let text = p["content"].as_array()?.iter().find(|c| c["type"] == "input_text")?["text"].as_str()?;
+    let head = text.strip_prefix(crate::assistant::EVENT_OPEN)?.split('>').next()?;
+    head.contains(crate::assistant::NOTE_ATTR).then_some(text)
+}
+
 /// `UserMessage` 里只有附件的路径（`local_image`），图片本身在它前面那条用户的 `response_item`（`input_image` 是 data URL）里，
 /// 从那里取，不去读路径指向的文件：附件可能已经清掉了，能读哪个文件也不该由记录里的路径决定。
 pub fn user_image(path: &Path, key: &str, n: usize) -> Option<(&'static str, Vec<u8>)> {
@@ -790,6 +817,18 @@ mod tests {
     }
 
     #[test]
+    fn injected_note_shows_once() {
+        let msg = |text: &str| json!({ "type": "message", "role": "user", "content": [{ "type": "input_text", "text": text }] });
+        let note = format!("{} type=\"handoff\"{}>\n带过来的\n</looklook-event>", crate::assistant::EVENT_OPEN, crate::assistant::NOTE_ATTR);
+        assert!(injected_event(&msg(&note)).is_some());
+        // 普通发送的事件（另有 UserMessage）、Codex 自己的环境说明：不重复显示
+        let sent = format!("{} type=\"done\">\n做完了\n</looklook-event>", crate::assistant::EVENT_OPEN);
+        assert!(injected_event(&msg(&sent)).is_none());
+        assert!(injected_event(&msg("<environment_context>\n</environment_context>")).is_none());
+        assert!(injected_event(&json!({ "type": "message", "role": "developer", "content": [{ "type": "input_text", "text": note }] })).is_none());
+    }
+
+    #[test]
     fn user_image_from_response_item() {
         let dir = std::env::temp_dir().join(format!("ll-codex-img-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -876,6 +915,8 @@ mod tests {
             done(json!({ "type": "UserMessage", "id": "u", "content": [{ "type": "text", "text": "hi" }] })),
             line(json!({ "type": "event_msg", "payload": { "type": "task_complete", "duration_ms": 3000, "last_agent_message": null,
                 "error": { "message": "unexpected status 503 Service Unavailable" } } })),
+            line(json!({ "type": "event_msg", "payload": { "type": "thread_goal_updated", "goal": { "status": "active" } } })),
+            line(json!({ "type": "event_msg", "payload": { "type": "thread_goal_cleared" } })),
             line(json!({ "type": "event_msg", "payload": { "type": "error", "message": "stream disconnected" } })),
         ]
         .concat();

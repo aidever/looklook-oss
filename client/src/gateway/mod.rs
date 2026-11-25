@@ -16,6 +16,7 @@ mod assets;
 mod chat;
 mod chat_mux;
 mod input_tap;
+mod live_ws;
 mod notify;
 pub mod assistant;
 pub mod mcp;

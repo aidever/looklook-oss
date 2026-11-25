@@ -4881,3 +4881,7 @@ button.arc-row:hover { background: var(--panel-2); }
 .fb-preview-head > b.grow { min-width: 5em; }
 @container fbpv (max-width: 620px) { .fb-preview-head .fv-size, .fb-preview-head .fv-enc { display: none; } }
 .chat-file-dock:focus { outline: none; }
+.ep-notes h4 { margin: 12px 0 4px; font-size: 13.5px; }
+.ep-notes ul { margin: 0; padding-left: 1.2em; }
+.ep-notes li { margin: 4px 0; }
+.ep-notes p { margin: 6px 0; }

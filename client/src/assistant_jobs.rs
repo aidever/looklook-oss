@@ -127,6 +127,7 @@ pub async fn ask(app: &App, prompt: &str) -> Result<String, String> {
             }
             cmd.env_remove(crate::chat::hooks::INSTANCE_ENV).env_remove("TMUX").env_remove("TMUX_PANE");
             cmd.env("CLAUDE_CODE_DISABLE_CLAUDE_MDS", "1").env("CLAUDE_CODE_DISABLE_AUTO_MEMORY", "1");
+            crate::chat::claude_sdk::apply_identity(&mut cmd, &app.store);
             if let Some(e) = &env {
                 e.apply(&mut cmd);
             }
@@ -151,7 +152,7 @@ pub async fn ask(app: &App, prompt: &str) -> Result<String, String> {
             let dir = tempfile::tempdir().map_err(|e| e.to_string())?;
             let out = dir.path().join("last.txt");
             let args: Vec<String> = ["exec", "--ephemeral", "--skip-git-repo-check", "-s", "read-only", "-c", "model_reasoning_effort=\"low\"", "-o"].into_iter().map(String::from).chain([out.display().to_string()]).collect();
-            crate::pet_lines::by_cli(exe, &args, prompt, Some(&out), &shell, env.as_ref()).await.map_err(|e| e.params.get("detail").and_then(Value::as_str).unwrap_or(&e.code).to_string())
+            crate::pet_lines::by_cli(exe, &args, prompt, Some(&out), &shell, env.as_ref(), &[]).await.map_err(|e| e.params.get("detail").and_then(Value::as_str).unwrap_or(&e.code).to_string())
         }
     }
 }

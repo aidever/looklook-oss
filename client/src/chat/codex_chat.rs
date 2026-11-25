@@ -7,7 +7,7 @@
 //! - 发消息是 `turn/start`（这一轮还在跑时是 `turn/steer`）；停止是 `turn/interrupt`；模型和思考强度随下一轮带上。
 //! - 终端标签和对话没有关系（不同步、不交接）：里面跑着什么（包括用户自己开的 Codex）对话都不管。
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -138,6 +138,14 @@ pub struct CodexSt {
     pub generation: u64,
     /// 正在跑的这一轮
     pub turn: Option<String>,
+    /// app-server 最近报的这段对话是不是 `active`（`thread/status/changed`、`thread/start`、`thread/resume`）
+    pub thread_active: bool,
+    /// 这段对话收到过几次状态 / 轮次变化：后台 `thread/resume` 回来得晚时，不拿旧快照盖掉新状态
+    status_seq: u64,
+    /// 结束过几次轮次（`turn/completed` 或 `thread/status/changed` 变成非 active）：`turn/start` 等请求晚返回时不把已结束的一轮重新标成运行中
+    done_seq: u64,
+    /// 最近已经 `turn/completed` 的 turn id（防晚到的 `turn/start` 答复或迟到的 `item/started` 把空闲对话重新改成处理中）
+    completed_turns: VecDeque<String>,
     pub window: Option<u64>,
     /// 这个会话累计的 token（app-server 的 `tokenUsage.total`）
     pub totals: Option<Value>,
@@ -161,11 +169,60 @@ pub struct CodexSt {
     used_at: Option<Instant>,
     /// 这段对话的目标（`/goal`，app-server 的 ThreadGoal）：设了以后 Codex 自己一轮轮接着做，直到完成、暂停或用完预算
     pub goal: Option<Value>,
+    /// 最近一次更新 `goal` 对应的 app-server WebSocket 帧序号（防止 `oneshot` 请求答复之后被队列里更早的通知盖回旧状态）
+    goal_seq: u64,
     /// 这段对话现在的速度档（app-server 的 `serviceTier`：`thread/start`、`thread/resume` 的答复、`thread/settings/updated`）。
     /// None / `default` = 标准速度；`priority`（模型目录里叫 Fast）= 快速模式；`flex` = 慢而便宜
     pub tier: Option<String>,
     /// 界面上（设置栏的开关、`/fast`）选的速度档：之后每一轮 `turn/start` 都带上；没选过是 None，照 Codex 自己的配置（`service_tier`）
     pub tier_set: Option<String>,
+}
+
+const COMPLETED_TURNS_CAP: usize = 32;
+const STATUS_IDLE_SETTLE: Duration = Duration::from_millis(500);
+
+impl CodexSt {
+    /// 换到另一段对话时清掉上一段对话的运行态与 `/goal`，避免串到新对话上
+    fn reset_thread(&mut self) {
+        self.turn = None;
+        self.thread_active = false;
+        self.status_seq = self.status_seq.wrapping_add(1);
+        self.done_seq = self.done_seq.wrapping_add(1);
+        self.completed_turns.clear();
+        self.steered.clear();
+        self.retrying = false;
+        self.goal = None;
+        self.goal_seq = 0;
+    }
+
+    fn set_goal(&mut self, seq: u64, goal: Option<Value>) -> bool {
+        if seq != 0 && seq < self.goal_seq {
+            return false;
+        }
+        self.goal_seq = self.goal_seq.max(seq);
+        let changed = self.goal != goal;
+        self.goal = goal;
+        changed
+    }
+
+    fn mark_turn_completed(&mut self, turn_id: Option<&str>) {
+        if let Some(tid) = turn_id.filter(|s| !s.is_empty()) {
+            if !self.completed_turns.iter().any(|x| x == tid) {
+                if self.completed_turns.len() >= COMPLETED_TURNS_CAP {
+                    self.completed_turns.pop_front();
+                }
+                self.completed_turns.push_back(tid.to_string());
+            }
+        }
+    }
+
+    fn is_turn_completed(&self, turn_id: &str) -> bool {
+        self.completed_turns.iter().any(|x| x == turn_id)
+    }
+}
+
+fn goal_active(st: &CodexSt) -> bool {
+    st.goal.as_ref().is_some_and(|g| g["status"] == "active")
 }
 
 /// 快速模式开着：这段对话的速度档不是标准、也不是 flex（`priority`、`fast`、`ultrafast`…）
@@ -752,13 +809,15 @@ impl Chat {
         }
         match thread {
             Some(t) => {
+                let seq_before = lock(&inst.st).codex.status_seq;
                 let mut params = json!({ "threadId": t, "cwd": self.codex_thread_cwd(&t, &row.workdir), "excludeTurns": true });
                 merge(&mut params, self.codex_thread_opts(id));
                 let r = resume_thread(&server, &t, params).await.map_err(|e| match e.code.as_str() {
                     "CODEX_REQUEST_FAILED" => LocalError::new("CODEX_RESUME_FAILED").with("detail", e.params.get("detail").cloned().unwrap_or(Value::Null)),
                     _ => e,
                 })?;
-                self.codex_loaded(&inst, &r, gen);
+                self.codex_loaded(&inst, &r, gen, Some(seq_before));
+                self.codex_sync_resumed_goal(&inst, &server, &t, r["thread"]["status"]["type"] == "idle").await;
             }
             None => {
                 let mut st = lock(&inst.st);
@@ -771,14 +830,68 @@ impl Chat {
         Ok(server)
     }
 
+    /// 重新接上一段对话时顺便同步 `/goal`；对话本身已经是 `idle`、数据库里的 goal 却还挂着 `active`
+    /// （上次在 TUI 按 Esc 停下、或者 app-server 重启过）时，跟 TUI 中断一样改成 `paused`，免得用户发下一条普通任务做完后突然接着跑旧目标
+    async fn codex_sync_resumed_goal(&self, inst: &Inst, server: &AppServer, tid: &str, resumed_idle: bool) {
+        let Ok((mut seq, r)) = server.call_seq("thread/goal/get", json!({ "threadId": tid })).await else { return };
+        let mut goal = Some(r["goal"].clone()).filter(|g| !g.is_null());
+        let still_idle = {
+            let st = lock(&inst.st);
+            st.binding.as_ref().map(|b| b.session_id.as_str()) == Some(tid) && st.phase == Phase::Idle && !st.codex.thread_active && st.codex.turn.is_none()
+        };
+        if resumed_idle && still_idle && goal.as_ref().is_some_and(|g| g["status"] == "active") {
+            if let Ok((s2, paused)) = server.call_seq("thread/goal/set", json!({ "threadId": tid, "status": "paused", "origin": "user" })).await {
+                seq = s2;
+                if !paused["goal"].is_null() {
+                    goal = Some(paused["goal"].clone());
+                }
+            }
+        }
+        let mut st = lock(&inst.st);
+        if st.binding.as_ref().map(|b| b.session_id.as_str()) == Some(tid) && st.codex.set_goal(seq, goal) {
+            Self::emit_status(inst, &st);
+        }
+    }
+
+    /// 把这段对话里还在 `active` 的 `/goal` 改成 `paused`（点停止、收到 `interrupted` 时用，和 Codex TUI 的 `thread_goal_actions.rs` 一致）
+    async fn codex_pause_active_goal(&self, inst: &Inst, server: &AppServer, tid: &str, check_remote: bool) {
+        let (known_active, unknown) = {
+            let st = lock(&inst.st);
+            (goal_active(&st.codex), st.codex.goal.is_none())
+        };
+        let active = if known_active {
+            true
+        } else if check_remote && unknown {
+            server.call("thread/goal/get", json!({ "threadId": tid })).await.is_ok_and(|r| r["goal"]["status"] == "active")
+        } else {
+            false
+        };
+        if !active {
+            return;
+        }
+        if let Ok((seq, r)) = server.call_seq("thread/goal/set", json!({ "threadId": tid, "status": "paused", "origin": "user" })).await {
+            if !r["goal"].is_null() {
+                let mut st = lock(&inst.st);
+                if st.binding.as_ref().map(|b| b.session_id.as_str()) == Some(tid) && st.codex.set_goal(seq, Some(r["goal"].clone())) {
+                    Self::emit_status(inst, &st);
+                }
+            }
+        }
+    }
+
     /// `thread/start`、`thread/resume` 的答复：记下会话、记录文件、模型；按 thread 的状态设好空闲 / 运行中。
-    fn codex_loaded(&self, inst: &Inst, r: &Value, gen: u64) {
+    fn codex_loaded(&self, inst: &Inst, r: &Value, gen: u64, seq_before: Option<u64>) {
         let t = &r["thread"];
         let Some(tid) = t["id"].as_str() else { return };
         lock(&self.codex.threads).insert(tid.to_string(), inst.id.clone());
         let path = t["path"].as_str().map(PathBuf::from).filter(|p| inst.agent.valid_transcript(p));
         let mut st = lock(&inst.st);
-        let old_path = st.binding.as_ref().map(|b| b.transcript_path.clone()).filter(|p| !p.as_os_str().is_empty());
+        let switched = st.binding.as_ref().is_none_or(|b| b.session_id != tid);
+        if switched {
+            Self::drop_pending(&mut st);
+            st.codex.reset_thread();
+        }
+        let old_path = (!switched).then(|| st.binding.as_ref().map(|b| b.transcript_path.clone())).flatten().filter(|p| !p.as_os_str().is_empty());
         let b = Binding { session_id: tid.to_string(), transcript_path: path.or(old_path).unwrap_or_default() };
         if st.binding.as_ref() != Some(&b) {
             let _ = self.store.set(&super::binding_key(&inst.id), &b);
@@ -797,8 +910,15 @@ impl Chat {
         st.codex.cwd = t["cwd"].as_str().map(String::from).or(st.codex.cwd.take());
         st.mode = st.codex.perm.clone().or_else(|| perm_of(&r["approvalPolicy"], &r["sandbox"]));
         st.error = None;
-        let active = t["status"]["type"] == "active";
-        Self::set_phase(inst, &mut st, if active { Phase::Running } else { Phase::Idle }, None);
+        // 后台 resume 在路上时，如果这段对话已经收到了更新的实时状态（比如刚跑完发了 turn/completed），不再拿旧快照盖回去
+        let fresh_snapshot = switched || seq_before.is_none_or(|s| s == st.codex.status_seq);
+        if fresh_snapshot {
+            let active = t["status"]["type"] == "active";
+            st.codex.thread_active = active;
+            if st.phase != Phase::Approval || st.pending.is_none() {
+                Self::set_phase(inst, &mut st, if active { Phase::Running } else { Phase::Idle }, None);
+            }
+        }
         Self::emit_status(inst, &st);
         // 上下文用量：app-server 要等下一轮才发，先从记录文件里最后一次的用量填上（输入框旁的小圆环、“用量”栏）
         let seed = st.context.is_none().then(|| st.binding.as_ref().map(|b| b.transcript_path.clone())).flatten().filter(|p| !p.as_os_str().is_empty());
@@ -831,7 +951,7 @@ impl Chat {
         merge(&mut params, self.codex_thread_opts(&inst.id));
         let r = server.call("thread/start", params).await?;
         let tid = r["thread"]["id"].as_str().ok_or_else(|| LocalError::new("CODEX_REQUEST_FAILED"))?.to_string();
-        self.codex_loaded(inst, &r, self.codex.generation.load(Ordering::SeqCst));
+        self.codex_loaded(inst, &r, self.codex.generation.load(Ordering::SeqCst), None);
         let _ = inst.tx.send(super::Event::Reset);
         Ok(tid)
     }
@@ -845,6 +965,8 @@ impl Chat {
             let mut st = lock(&inst.st);
             st.title = None;
             st.context = None;
+            Self::drop_pending(&mut st);
+            st.codex.reset_thread();
         }
         self.codex_attach(id).await?;
         *inst.tr.lock().await = None;
@@ -878,7 +1000,7 @@ impl Chat {
         let gen = self.codex.generation.load(Ordering::SeqCst);
         while let Some(m) = rx.recv().await {
             match m {
-                Incoming::Notification { method, params } => self.codex_note(&method, &params).await,
+                Incoming::Notification { seq, method, params } => self.codex_note_seq(seq, &method, &params).await,
                 Incoming::Request { id, method, params } => {
                     let me = self.clone();
                     tokio::spawn(async move { me.codex_request(id, &method, params).await });
@@ -897,6 +1019,10 @@ impl Chat {
             Self::drop_pending(&mut st);
             st.codex.generation = 0;
             st.codex.turn = None;
+            st.codex.thread_active = false;
+            st.codex.goal_seq = 0;
+            st.codex.status_seq = st.codex.status_seq.wrapping_add(1);
+            st.codex.done_seq = st.codex.done_seq.wrapping_add(1);
             if st.phase != Phase::Idle {
                 st.error = Some("Codex app-server exited".into());
                 Self::set_phase(&inst, &mut st, Phase::Idle, None);
@@ -905,7 +1031,12 @@ impl Chat {
         }
     }
 
+    #[cfg(test)]
     async fn codex_note(&self, method: &str, p: &Value) {
+        self.codex_note_seq(0, method, p).await;
+    }
+
+    async fn codex_note_seq(&self, seq: u64, method: &str, p: &Value) {
         if self.codex_title_note(method, p) {
             return;
         }
@@ -927,16 +1058,67 @@ impl Chat {
         // 之后逐条输出、审批才会推给看看（这里直接调 codex_attach 会让 async 的类型绕回自己）
         if method == "thread/status/changed" {
             let gen = self.codex.generation.load(Ordering::SeqCst);
-            let late = {
-                let st = lock(&inst.st);
-                st.codex.generation != gen && has_rollout(&st)
-            };
-            if late {
-                let _ = inst.tx.send(super::Event::Reset);
+            let mut settle_seq = None;
+            {
+                let mut st = lock(&inst.st);
+                if st.codex.generation != gen {
+                    if has_rollout(&st) {
+                        let _ = inst.tx.send(super::Event::Reset);
+                    }
+                    return;
+                }
+                let kind = p["status"]["type"].as_str().unwrap_or("");
+                let active = kind == "active";
+                st.active_at = crate::util::system_ms();
+                st.codex.used_at = Some(Instant::now());
+                st.codex.status_seq = st.codex.status_seq.wrapping_add(1);
+                st.codex.thread_active = active;
+                if !active {
+                    st.codex.done_seq = st.codex.done_seq.wrapping_add(1);
+                    if kind == "notLoaded" {
+                        st.codex.generation = 0;
+                        st.codex.turn = None;
+                        st.codex.retrying = false;
+                        Self::drop_pending(&mut st);
+                        Self::set_phase(&inst, &mut st, Phase::Idle, None);
+                    } else if st.codex.turn.is_none() && st.phase != Phase::Idle {
+                        // 没有正在等的 turn/completed，但状态还挂在运行中 / 审批中：按权威状态立即收回空闲
+                        st.codex.retrying = false;
+                        Self::drop_pending(&mut st);
+                        Self::set_phase(&inst, &mut st, Phase::Idle, None);
+                    } else if st.codex.turn.is_some() && st.phase != Phase::Idle {
+                        // 正常结束时 turn/completed 紧跟在 idle / systemError 后面（带着 failed / interrupted 原因）；
+                        // 万一 turn/completed 没来或被竞态错过，兜底收回空闲，不让界面永远停在“正在处理…”
+                        settle_seq = Some(st.codex.status_seq);
+                    }
+                }
+            }
+            if let (Some(seq), Some(me)) = (settle_seq, self.me.upgrade()) {
+                let inst = inst.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(STATUS_IDLE_SETTLE).await;
+                    let settled = {
+                        let mut st = lock(&inst.st);
+                        if st.codex.status_seq == seq && !st.codex.thread_active && st.codex.sending == 0 && st.phase != Phase::Idle {
+                            st.codex.turn = None;
+                            st.codex.retrying = false;
+                            Self::drop_pending(&mut st);
+                            Self::set_phase(&inst, &mut st, Phase::Idle, None);
+                            true
+                        } else {
+                            false
+                        }
+                    };
+                    if settled {
+                        me.codex_fill_path(&inst).await;
+                        me.poll(&inst).await;
+                    }
+                });
             }
             return;
         }
         let mut poll = false;
+        let mut pause_goal_tid: Option<String> = None;
         {
             let mut st = lock(&inst.st);
             st.active_at = crate::util::system_ms();
@@ -948,7 +1130,13 @@ impl Chat {
                         let id = inst.id.clone();
                         tokio::spawn(async move { me.checkpoint_turn(&id, "", false).await });
                     }
-                    st.codex.turn = p["turn"]["id"].as_str().map(String::from);
+                    let tid = p["turn"]["id"].as_str().map(String::from);
+                    if let Some(t) = &tid {
+                        st.codex.completed_turns.retain(|x| x != t);
+                    }
+                    st.codex.status_seq = st.codex.status_seq.wrapping_add(1);
+                    st.codex.thread_active = true;
+                    st.codex.turn = tid;
                     st.codex.retrying = false;
                     st.error = None;
                     inst.prompts.send_modify(|n| *n += 1);
@@ -970,6 +1158,10 @@ impl Chat {
                     }
                 }
                 "turn/completed" => {
+                    st.codex.status_seq = st.codex.status_seq.wrapping_add(1);
+                    st.codex.done_seq = st.codex.done_seq.wrapping_add(1);
+                    st.codex.thread_active = false;
+                    st.codex.mark_turn_completed(p["turn"]["id"].as_str());
                     st.codex.turn = None;
                     st.codex.steered.clear();
                     st.codex.retrying = false;
@@ -979,6 +1171,9 @@ impl Chat {
                     }
                     if p["turn"]["status"] == "interrupted" {
                         st.end_hint = Some(super::board::Outcome::Interrupted);
+                        if goal_active(&st.codex) {
+                            pause_goal_tid = p["threadId"].as_str().map(String::from);
+                        }
                     }
                     Self::set_phase(&inst, &mut st, Phase::Idle, None);
                     // Tab 排在这一轮之后的：发出第一条（下一轮结束时再发下一条）
@@ -1000,39 +1195,48 @@ impl Chat {
                 }
                 "item/started" => {
                     let item = &p["item"];
-                    let (tool, activity) = match item["type"].as_str() {
-                        Some("commandExecution") => (Some("Bash"), command_shown(item)),
-                        Some("fileChange") => (Some("Edit"), None),
-                        Some("mcpToolCall") => (Some("mcp"), item["tool"].as_str().map(String::from)),
-                        Some("webSearch") => (Some("WebSearch"), None),
-                        Some("reasoning") => (None, Some("thinking".to_string())),
-                        // 压缩（手动 /compact 和一轮当中自动压缩都是这个条目）
-                        Some("contextCompaction") => (None, Some("compacting".to_string())),
-                        // 等子代理交回结果
-                        Some("collabAgentToolCall") if item["tool"] == "wait" => (Some("Agent"), Some("waiting_agents".to_string())),
-                        _ => (None, None),
-                    };
-                    st.codex.retrying = false;
-                    // 新的一段回复：正在输出的从头来。运行中插话时 Codex 会丢掉写了一半的那段（没有 item/completed）重新写
-                    if item["type"] == "agentMessage" {
-                        st.live.text = None;
+                    let item_turn = p["turnId"].as_str();
+                    let stale_turn = item_turn.is_some_and(|t| st.codex.is_turn_completed(t));
+                    let wrong_turn = matches!((st.codex.turn.as_deref(), item_turn), (Some(cur), Some(it)) if cur != it);
+                    if st.codex.turn.is_none() && st.codex.thread_active && !stale_turn {
+                        st.codex.turn = item_turn.map(String::from);
                     }
-                    if st.phase != Phase::Approval {
-                        st.tool = tool.map(String::from);
-                        if let Some(t) = tool {
-                            let detail = match t {
-                                "Edit" => super::board::changed_files(&item["changes"]),
-                                _ => activity.clone(),
-                            };
-                            st.doing = Some(json!({ "tool": t, "detail": detail }));
+                    let has_active_turn = !stale_turn && !wrong_turn && (st.codex.turn.is_some() || st.codex.thread_active);
+                    if has_active_turn {
+                        let (tool, activity) = match item["type"].as_str() {
+                            Some("commandExecution") => (Some("Bash"), command_shown(item)),
+                            Some("fileChange") => (Some("Edit"), None),
+                            Some("mcpToolCall") => (Some("mcp"), item["tool"].as_str().map(String::from)),
+                            Some("webSearch") => (Some("WebSearch"), None),
+                            Some("reasoning") => (None, Some("thinking".to_string())),
+                            // 压缩（手动 /compact 和一轮当中自动压缩都是这个条目）
+                            Some("contextCompaction") => (None, Some("compacting".to_string())),
+                            // 等子代理交回结果
+                            Some("collabAgentToolCall") if item["tool"] == "wait" => (Some("Agent"), Some("waiting_agents".to_string())),
+                            _ => (None, None),
+                        };
+                        st.codex.retrying = false;
+                        // 新的一段回复：正在输出的从头来。运行中插话时 Codex 会丢掉写了一半的那段（没有 item/completed）重新写
+                        if item["type"] == "agentMessage" {
+                            st.live.text = None;
                         }
-                        st.live.activity = activity;
-                        if st.phase != Phase::Running {
-                            Self::enter(&mut st, Phase::Running);
-                            st.phase = Phase::Running;
-                            st.reason = None;
+                        if st.phase != Phase::Approval {
+                            st.tool = tool.map(String::from);
+                            if let Some(t) = tool {
+                                let detail = match t {
+                                    "Edit" => super::board::changed_files(&item["changes"]),
+                                    _ => activity.clone(),
+                                };
+                                st.doing = Some(json!({ "tool": t, "detail": detail }));
+                            }
+                            st.live.activity = activity;
+                            if st.phase != Phase::Running {
+                                Self::enter(&mut st, Phase::Running);
+                                st.phase = Phase::Running;
+                                st.reason = None;
+                            }
+                            Self::emit_status(&inst, &st);
                         }
-                        Self::emit_status(&inst, &st);
                     }
                 }
                 "item/agentMessage/delta" => {
@@ -1081,7 +1285,8 @@ impl Chat {
                     // 审批在别处答了（或者这一轮被停了）
                     if st.phase == Phase::Approval {
                         Self::drop_pending(&mut st);
-                        Self::set_phase(&inst, &mut st, Phase::Running, None);
+                        let next = if st.codex.turn.is_some() || st.codex.thread_active { Phase::Running } else { Phase::Idle };
+                        Self::set_phase(&inst, &mut st, next, None);
                     }
                 }
                 "thread/tokenUsage/updated" => {
@@ -1089,12 +1294,14 @@ impl Chat {
                     Self::emit_status(&inst, &st);
                 }
                 "thread/goal/updated" => {
-                    st.codex.goal = Some(p["goal"].clone());
-                    Self::emit_status(&inst, &st);
+                    if st.codex.set_goal(seq, Some(p["goal"].clone())) {
+                        Self::emit_status(&inst, &st);
+                    }
                 }
                 "thread/goal/cleared" => {
-                    st.codex.goal = None;
-                    Self::emit_status(&inst, &st);
+                    if st.codex.set_goal(seq, None) {
+                        Self::emit_status(&inst, &st);
+                    }
                 }
                 "thread/name/updated" => {
                     st.title = p["threadName"].as_str().or_else(|| p["name"].as_str()).map(String::from);
@@ -1121,6 +1328,14 @@ impl Chat {
                 }
                 _ => {}
             }
+        }
+        if let (Some(tid), Some(me)) = (pause_goal_tid, self.me.upgrade()) {
+            let inst = inst.clone();
+            tokio::spawn(async move {
+                if let Some(server) = me.codex.server.lock().await.clone() {
+                    me.codex_pause_active_goal(&inst, &server, &tid, false).await;
+                }
+            });
         }
         if poll {
             self.codex_fill_path(&inst).await;
@@ -1278,10 +1493,49 @@ impl Chat {
         Ok(json!({ "text": text, "images": images }))
     }
 
+    /// `turn/start`、`review/start` 返回后：如果通知通道里这轮已经 `turn/completed`（极短一轮或立刻报错），不再把它重新设回 Running
+    fn codex_apply_started_turn(inst: &Inst, st: &mut super::State, r: &Value, done_before: u64) {
+        let tid = r["turn"]["id"].as_str();
+        let status_done = matches!(r["turn"]["status"].as_str(), Some("completed" | "failed" | "interrupted"));
+        let already_done = status_done
+            || tid.is_some_and(|id| st.codex.is_turn_completed(id))
+            || (tid.is_none() && st.codex.done_seq != done_before && !st.codex.thread_active);
+        if already_done {
+            return;
+        }
+        if let Some(id) = tid {
+            st.codex.turn = Some(id.to_string());
+        }
+        st.error = None;
+        if st.phase != Phase::Approval {
+            Self::set_phase(inst, st, Phase::Running, None);
+        }
+    }
+
+    /// 只记进对话、不起一轮（`thread/inject_items`，0.172 起有）：下一轮模型看得到。记录里是一条 `response_item` 的用户消息，
+    /// 界面只显示看看自己的事件（codex_rollout.rs `injected_event`）。老版本不认、或者请求失败：返回 false，调用方改成普通发送
+    pub(super) async fn codex_inject(&self, id: &str, text: &str) -> Result<bool, LocalError> {
+        let inst = self.inst(id);
+        let server = self.codex_attach(id).await?;
+        let thread = lock(&inst.st).binding.as_ref().map(|b| b.session_id.clone());
+        let thread = match thread {
+            Some(t) => t,
+            None => self.codex_new_thread(&server, &inst).await?,
+        };
+        let items = json!([{ "type": "message", "role": "user", "content": [{ "type": "input_text", "text": text }] }]);
+        if let Err(e) = server.call("thread/inject_items", json!({ "threadId": thread, "items": items })).await {
+            tracing::info!(id, error = ?e, "Codex 记进对话失败（可能是老版本），改成普通发送");
+            return Ok(false);
+        }
+        self.poll(&inst).await;
+        Ok(true)
+    }
+
     pub(super) async fn codex_input(&self, id: &str, text: &str, images: &[String]) -> Result<Value, LocalError> {
         let inst = self.inst(id);
+        let non_starting_goal = images.is_empty() && matches!(slash_arg(text.trim(), "/goal"), Some("" | "pause" | "clear"));
         let phase = lock(&inst.st).phase;
-        if phase == Phase::Approval {
+        if phase == Phase::Approval && !non_starting_goal {
             return Err(LocalError::new("CHAT_BUSY"));
         }
         // 换走现在的会话：不用先把它加载上（它接不上时，用户就靠这两个离开）
@@ -1330,7 +1584,7 @@ impl Chat {
             let current = st.model.clone().or(st.actual_model.clone());
             (st.binding.as_ref().map(|b| b.session_id.clone()), st.codex.turn.clone(), st.phase, st.model.clone().filter(|_| chosen), st.effort.clone(), current)
         };
-        if phase == Phase::Approval {
+        if phase == Phase::Approval && !non_starting_goal {
             return Err(LocalError::new("CHAT_BUSY"));
         }
         let thread = match thread {
@@ -1348,9 +1602,10 @@ impl Chat {
         lock(&inst.st).codex.prompted = Some(thread.clone());
         // 界面上的“压缩上下文”
         if text.trim() == "/compact" && images.is_empty() {
-            server.call("thread/compact/start", json!({ "threadId": thread })).await?;
+            let done_before = lock(&inst.st).codex.done_seq;
+            let r = server.call("thread/compact/start", json!({ "threadId": thread })).await?;
             let mut st = lock(&inst.st);
-            Self::set_phase(&inst, &mut st, Phase::Running, None);
+            Self::codex_apply_started_turn(&inst, &mut st, &r, done_before);
             return Ok(json!({ "delivered": true }));
         }
         // TUI 里的 /review、/goal、/fork、/init（docs/CODEX_UI.md §20）
@@ -1361,29 +1616,35 @@ impl Chat {
                     return Err(LocalError::new("CHAT_BUSY"));
                 }
                 self.checkpoint_turn(id, text, true).await;
+                let done_before = lock(&inst.st).codex.done_seq;
                 let r = server.call("review/start", json!({ "threadId": thread, "target": review_target(arg) })).await?;
                 let mut st = lock(&inst.st);
-                st.codex.turn = r["turn"]["id"].as_str().map(String::from).or(st.codex.turn.take());
-                st.error = None;
-                Self::set_phase(&inst, &mut st, Phase::Running, None);
+                Self::codex_apply_started_turn(&inst, &mut st, &r, done_before);
                 return Ok(json!({ "delivered": true }));
             }
             if let Some(arg) = slash_arg(t, "/goal") {
-                let goal = match arg {
-                    "" => server.call("thread/goal/get", json!({ "threadId": thread })).await?["goal"].clone(),
+                let (seq, goal) = match arg {
+                    "" => {
+                        let (s, r) = server.call_seq("thread/goal/get", json!({ "threadId": thread })).await?;
+                        (s, r["goal"].clone())
+                    }
                     "clear" => {
-                        server.call("thread/goal/clear", json!({ "threadId": thread })).await?;
-                        Value::Null
+                        let (s, _) = server.call_seq("thread/goal/clear", json!({ "threadId": thread })).await?;
+                        (s, Value::Null)
                     }
                     "pause" | "resume" => {
                         let status = if arg == "pause" { "paused" } else { "active" };
-                        server.call("thread/goal/set", json!({ "threadId": thread, "status": status, "origin": "user" })).await?["goal"].clone()
+                        let (s, r) = server.call_seq("thread/goal/set", json!({ "threadId": thread, "status": status, "origin": "user" })).await?;
+                        (s, r["goal"].clone())
                     }
                     // 设了目标 Codex 自己开始做（空闲时马上开一轮）
-                    objective => server.call("thread/goal/set", json!({ "threadId": thread, "objective": objective, "status": "active", "origin": "user" })).await?["goal"].clone(),
+                    objective => {
+                        let (s, r) = server.call_seq("thread/goal/set", json!({ "threadId": thread, "objective": objective, "status": "active", "origin": "user" })).await?;
+                        (s, r["goal"].clone())
+                    }
                 };
                 let mut st = lock(&inst.st);
-                st.codex.goal = (!goal.is_null()).then_some(goal);
+                st.codex.set_goal(seq, (!goal.is_null()).then_some(goal));
                 Self::emit_status(&inst, &st);
                 return Ok(json!({ "delivered": true }));
             }
@@ -1519,11 +1780,10 @@ impl Chat {
             params["sandboxPolicy"] = sandbox;
         }
         self.checkpoint_turn(id, text, true).await;
+        let done_before = lock(&inst.st).codex.done_seq;
         let r = server.call("turn/start", params).await?;
         let mut st = lock(&inst.st);
-        st.codex.turn = r["turn"]["id"].as_str().map(String::from).or(st.codex.turn.take());
-        st.error = None;
-        Self::set_phase(&inst, &mut st, Phase::Running, None);
+        Self::codex_apply_started_turn(&inst, &mut st, &r, done_before);
         Ok(json!({ "delivered": true }))
     }
 
@@ -1612,7 +1872,7 @@ impl Chat {
                 let r = server.call("thread/fork", params).await?;
                 let tid = r["thread"]["id"].as_str().ok_or_else(|| LocalError::new("CODEX_REQUEST_FAILED"))?.to_string();
                 self.codex_forget(thread).await;
-                self.codex_loaded(&inst, &r, self.codex.generation.load(Ordering::SeqCst));
+                self.codex_loaded(&inst, &r, self.codex.generation.load(Ordering::SeqCst), None);
                 let _ = inst.tx.send(super::Event::Reset);
                 Ok(tid)
             }
@@ -1653,7 +1913,7 @@ impl Chat {
                 let r = server.call("thread/fork", params).await?;
                 let tid = r["thread"]["id"].as_str().ok_or_else(|| LocalError::new("CODEX_REQUEST_FAILED"))?.to_string();
                 self.codex_forget(Some(thread)).await;
-                self.codex_loaded(&inst, &r, self.codex.generation.load(Ordering::SeqCst));
+                self.codex_loaded(&inst, &r, self.codex.generation.load(Ordering::SeqCst), None);
                 let _ = inst.tx.send(super::Event::Reset);
                 tid
             }
@@ -1664,18 +1924,47 @@ impl Chat {
 
     pub(super) async fn codex_interrupt(&self, id: &str) -> Result<(), LocalError> {
         let inst = self.inst(id);
-        // 没有在跑的一轮：不用去加载会话（会话接不上时“停止”也不报错）
-        if lock(&inst.st).codex.turn.is_none() {
+        // 没有在跑的一轮、也没有进行中的 /goal：不用去加载会话（会话接不上时“停止”也不报错）
+        let idle = {
+            let st = lock(&inst.st);
+            st.codex.turn.is_none() && matches!(st.phase, Phase::Idle | Phase::Detached) && !goal_active(&st.codex)
+        };
+        if idle {
             return Ok(());
         }
         let server = self.codex_attach(id).await?;
-        let (thread, turn) = {
+        let (thread, mut turn, busy) = {
             let st = lock(&inst.st);
-            (st.binding.as_ref().map(|b| b.session_id.clone()), st.codex.turn.clone())
+            (
+                st.binding.as_ref().map(|b| b.session_id.clone()),
+                st.codex.turn.clone(),
+                matches!(st.phase, Phase::Running | Phase::Approval),
+            )
         };
-        let (Some(thread), Some(turn)) = (thread, turn) else { return Ok(()) };
-        server.call("turn/interrupt", json!({ "threadId": thread, "turnId": turn })).await?;
-        Self::stop_tool(&inst, &mut lock(&inst.st));
+        let Some(thread) = thread else { return Ok(()) };
+        // 先把进行中的 /goal 暂停，再停当前这轮：避免 turn/interrupt 刚发出前这一轮恰好自然结束、app-server 抢先拉起下一轮自动续跑
+        self.codex_pause_active_goal(&inst, &server, &thread, true).await;
+        // 半途接上的会话（resume 时已在跑）可能还没记下 turn id：向 app-server 查当前在跑的那一轮
+        if turn.is_none() && busy {
+            turn = codex_active_turn_id(&server, &thread).await;
+        }
+        if let Some(turn) = turn {
+            if let Err(e) = server.call("turn/interrupt", json!({ "threadId": thread, "turnId": turn })).await {
+                // 刚好在发请求前这一轮已经跑完了：不算错
+                let still_running = {
+                    let st = lock(&inst.st);
+                    st.codex.turn.is_some() && st.phase != Phase::Idle
+                };
+                if still_running {
+                    return Err(e);
+                }
+            }
+        }
+        {
+            let mut st = lock(&inst.st);
+            Self::drop_pending(&mut st);
+            Self::stop_tool(&inst, &mut st);
+        }
         Ok(())
     }
 
@@ -1994,6 +2283,10 @@ impl Chat {
         let _ = self.store.set(&super::binding_key(id), &b);
         if let Some(inst) = lock(&self.insts).get(id).cloned() {
             let mut st = lock(&inst.st);
+            if st.binding.as_ref().is_none_or(|old| old.session_id != thread) {
+                Self::drop_pending(&mut st);
+                st.codex.reset_thread();
+            }
             st.binding = Some(b);
             st.codex.generation = 0;
         }
@@ -2009,7 +2302,7 @@ impl Chat {
                     let mut params = json!({ "threadId": r.id, "cwd": row.workdir });
                     merge(&mut params, self.codex_thread_opts(id));
                     let res = server.call("thread/fork", params).await?;
-                    self.codex_loaded(&self.inst(id), &res, self.codex.generation.load(Ordering::SeqCst));
+                    self.codex_loaded(&self.inst(id), &res, self.codex.generation.load(Ordering::SeqCst), None);
                 } else {
                     self.codex_bind(id, &r.id);
                 }
@@ -2343,11 +2636,10 @@ impl Chat {
         let inst = self.inst(id);
         let thread = lock(&inst.st).binding.as_ref().map(|b| b.session_id.clone());
         if let Some(tid) = thread {
-            if let Ok(r) = server.call("thread/goal/get", json!({ "threadId": tid })).await {
+            if let Ok((seq, r)) = server.call_seq("thread/goal/get", json!({ "threadId": tid })).await {
                 let mut st = lock(&inst.st);
                 let goal = Some(r["goal"].clone()).filter(|g| !g.is_null());
-                if st.codex.goal != goal {
-                    st.codex.goal = goal;
+                if st.binding.as_ref().map(|b| b.session_id.as_str()) == Some(tid.as_str()) && st.codex.set_goal(seq, goal) {
                     Self::emit_status(&inst, &st);
                 }
             }
@@ -2634,6 +2926,17 @@ fn has_trust_level(projects: &Value, workdir: &str) -> bool {
     projects.as_object().is_some_and(|m| {
         m.iter().any(|(k, v)| (k == workdir || windows && k.eq_ignore_ascii_case(workdir)) && v["trust_level"].is_string())
     })
+}
+
+/// 查询一段对话当前正在运行的轮次 id：0.157+ 分页对话走 `thread/turns/list`（`thread/read` 的 `turns` 为空），老版本回退 `thread/read`
+async fn codex_active_turn_id(server: &AppServer, thread: &str) -> Option<String> {
+    if let Ok(r) = server.call("thread/turns/list", json!({ "threadId": thread, "limit": 5, "itemsView": "notLoaded" })).await {
+        if let Some(id) = r["data"].as_array().and_then(|a| a.iter().find(|t| t["status"] == "inProgress")).and_then(|t| t["id"].as_str()) {
+            return Some(id.to_string());
+        }
+    }
+    let r = server.call("thread/read", json!({ "threadId": thread, "includeTurns": true })).await.ok()?;
+    r["thread"]["turns"].as_array()?.iter().rev().find(|t| t["status"] == "inProgress")?.get("id")?.as_str().map(String::from)
 }
 
 /// `thread/resume`；会话被归档了（在 TUI 里 `/archive`、Codex 桌面版里归档）就先取消归档再接：
@@ -3028,6 +3331,307 @@ mod tests {
         assert!(side_thread(&json!({ "ephemeral": true })));
         assert!(side_thread(&json!({ "threadSource": "thread_title" })));
         assert!(!side_thread(&json!({ "threadSource": "user", "source": "vscode" })));
+    }
+
+    /// 回放真录的 Codex app-server 通知（testdata/replay/codex_*.json）：喂进真的 Chat → 看板 → 助理的看守判断 → 送进大脑的事件。
+    /// 最后说的话从同一次录下的 rollout 里读（和对话页同一个读法）
+    #[tokio::test(flavor = "multi_thread")]
+    async fn replay_codex_dispatch_fixtures() {
+        for name in ["codex_done.json", "codex_failed_503.json", "codex_failed_unauthorized.json"] {
+            let f = crate::gateway::assistant::replay::fixture(name);
+            let home = tempfile::tempdir().unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            let workdir = dir.path().display().to_string();
+            let paths = crate::paths::Paths::discover(Some(home.path().to_path_buf())).unwrap();
+            let store = Arc::new(crate::store::Store::memory().unwrap());
+            let instances = crate::instances::Instances::new(store.clone(), paths.clone());
+            let input = crate::instances::Input { name: Some("c".into()), workdir: Some(workdir.clone()), launch: Some("codex".into()), chat_ui: Some(true), ..Default::default() };
+            let id = instances.create(input).await.unwrap().row.id;
+            let chat = Chat::new(store, paths, instances);
+            chat.codex.generation.store(1, Ordering::SeqCst);
+            let inst = chat.inst(&id);
+            let tid = f["thread"]["id"].as_str().unwrap();
+            chat.codex_loaded(&inst, &json!({ "thread": { "id": tid, "cwd": workdir, "status": { "type": "idle" } }, "model": "gpt-5.5" }), 1, None);
+
+            let mut ro = super::super::codex_rollout::Rollout::new(dir.path().join("rollout.jsonl"));
+            let lines: String = f["rollout"].as_array().unwrap().iter().map(|l| format!("{l}\n")).collect();
+            let items = match ro.feed(lines.as_bytes()) {
+                super::super::transcript::Change::Upsert { items, .. } => items.iter().map(|i| serde_json::to_value(i).unwrap()).collect::<Vec<_>>(),
+                _ => vec![],
+            };
+            let reply = crate::gateway::assistant::replay::reply(&items);
+
+            let mut r = crate::gateway::assistant::replay::Replayer::default();
+            let mut now = crate::util::system_ms();
+            for n in f["notes"].as_array().unwrap() {
+                chat.codex_note(n[0].as_str().unwrap(), &n[1]).await;
+                now += 200;
+                r.tick(now, &chat.brief(&id).unwrap(), &reply);
+            }
+            // 结束后看守循环再转几圈（等记录写完、确认不再重复）
+            for _ in 0..4 {
+                now += 2000;
+                r.tick(now, &chat.brief(&id).unwrap(), &reply);
+            }
+            r.check(name, &f["expect"]);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn codex_state_sync_races_stay_idle() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let workdir = dir.path().display().to_string();
+        let paths = crate::paths::Paths::discover(Some(home.path().to_path_buf())).unwrap();
+        let store = Arc::new(crate::store::Store::memory().unwrap());
+        let instances = crate::instances::Instances::new(store.clone(), paths.clone());
+        let input = crate::instances::Input { name: Some("c".into()), workdir: Some(workdir.clone()), launch: Some("codex".into()), chat_ui: Some(true), ..Default::default() };
+        let id = instances.create(input).await.unwrap().row.id;
+        let chat = Chat::new(store, paths, instances);
+        chat.codex.generation.store(1, Ordering::SeqCst);
+        let inst = chat.inst(&id);
+        let tid = "019a0000-0000-7000-8000-000000000001";
+        chat.codex_loaded(&inst, &json!({ "thread": { "id": tid, "cwd": workdir, "status": { "type": "idle" } }, "model": "gpt-5.4" }), 1, None);
+        assert_eq!(lock(&inst.st).phase, Phase::Idle);
+
+        // 1. 空闲、没有进行中轮次时收到迟到 / 异步的 item/started，不能把会话卡进 Running（“正在处理…”）
+        chat.codex_note("item/started", &json!({ "threadId": tid, "turnId": "t-stray", "item": { "id": "i1", "type": "agentMessage", "text": "" } })).await;
+        assert_eq!(lock(&inst.st).phase, Phase::Idle);
+
+        // 2. 正常一轮：status active → turn/started → status idle → turn/completed（failed 原因保留在看板结果里）
+        let seq_before = lock(&inst.st).codex.status_seq;
+        chat.codex_note("thread/status/changed", &json!({ "threadId": tid, "status": { "type": "active", "activeFlags": [] } })).await;
+        chat.codex_note("turn/started", &json!({ "threadId": tid, "turn": { "id": "t1", "status": "inProgress" } })).await;
+        assert_eq!(lock(&inst.st).phase, Phase::Running);
+        let done_before = lock(&inst.st).codex.done_seq;
+        chat.codex_note("thread/status/changed", &json!({ "threadId": tid, "status": { "type": "systemError" } })).await;
+        // turn/completed 紧跟其后：等它带上失败原因再进 Idle
+        assert_eq!(lock(&inst.st).phase, Phase::Running);
+        chat.codex_note("turn/completed", &json!({ "threadId": tid, "turn": { "id": "t1", "status": "failed", "error": { "message": "boom" } } })).await;
+        assert_eq!(lock(&inst.st).phase, Phase::Idle);
+        assert_eq!(lock(&inst.st).error.as_deref(), Some("boom"));
+        assert_eq!(lock(&inst.st).board.turn.as_ref().and_then(|t| t.outcome), Some(super::super::board::Outcome::Failed));
+
+        // 3. turn/start 答复比 turn/completed 晚拿锁：不能把刚结束的 t1 重新标成 Running，也不能冲掉报错
+        {
+            let mut st = lock(&inst.st);
+            Chat::codex_apply_started_turn(&inst, &mut st, &json!({ "turn": { "id": "t1", "status": "inProgress" } }), done_before);
+            assert_eq!(st.phase, Phase::Idle);
+            assert_eq!(st.codex.turn, None);
+            assert_eq!(st.error.as_deref(), Some("boom"));
+        }
+        // 已完成的轮次再来迟到的 item/started 也不能变回 Running
+        chat.codex_note("item/started", &json!({ "threadId": tid, "turnId": "t1", "item": { "id": "i2", "type": "agentMessage", "text": "" } })).await;
+        assert_eq!(lock(&inst.st).phase, Phase::Idle);
+
+        // 4. 后台 thread/resume 带着旧的 active 快照晚返回：期间已经有过实时状态变化，不能把 Idle 盖回 Running
+        chat.codex_loaded(&inst, &json!({ "thread": { "id": tid, "cwd": workdir, "status": { "type": "active" } }, "model": "gpt-5.4" }), 1, Some(seq_before));
+        assert_eq!(lock(&inst.st).phase, Phase::Idle);
+
+        // 5. 万一 turn/completed 丢失，只收到了 thread/status/changed(idle)：兜底定时器收回 Idle
+        chat.codex_note("turn/started", &json!({ "threadId": tid, "turn": { "id": "t2", "status": "inProgress" } })).await;
+        assert_eq!(lock(&inst.st).phase, Phase::Running);
+        chat.codex_note("thread/status/changed", &json!({ "threadId": tid, "status": { "type": "idle" } })).await;
+        tokio::time::sleep(STATUS_IDLE_SETTLE + Duration::from_millis(120)).await;
+        assert_eq!(lock(&inst.st).phase, Phase::Idle);
+        assert_eq!(lock(&inst.st).codex.turn, None);
+
+        // 6. 请求答复已经把 goal 更新到更高帧序号时，队列里更早帧的通知不能把 goal 闪回旧状态
+        lock(&inst.st).codex.set_goal(20, Some(json!({ "objective": "g", "status": "paused" })));
+        chat.codex_note_seq(15, "thread/goal/updated", &json!({ "threadId": tid, "goal": { "objective": "g", "status": "active" } })).await;
+        assert_eq!(lock(&inst.st).codex.goal.as_ref().and_then(|g| g["status"].as_str()), Some("paused"));
+        chat.codex_note_seq(21, "thread/goal/updated", &json!({ "threadId": tid, "goal": { "objective": "g", "status": "complete" } })).await;
+        assert_eq!(lock(&inst.st).codex.goal.as_ref().and_then(|g| g["status"].as_str()), Some("complete"));
+
+        // 7. 换到新对话（/new、/fork 等）：旧对话的 /goal、排队插话清掉
+        {
+            let mut st = lock(&inst.st);
+            st.codex.goal = Some(json!({ "objective": "old", "status": "active" }));
+            st.codex.steered.push("queued".into());
+        }
+        let tid2 = "019a0000-0000-7000-8000-000000000002";
+        chat.codex_loaded(&inst, &json!({ "thread": { "id": tid2, "cwd": workdir, "status": { "type": "idle" } }, "model": "gpt-5.4" }), 1, None);
+        let st = lock(&inst.st);
+        assert!(st.codex.goal.is_none());
+        assert!(st.codex.steered.is_empty());
+        assert_eq!(st.phase, Phase::Idle);
+    }
+
+    /// 端到端回归：使用 `/goal` 后点停止（或残留 active goal 重新接上），再发后面的普通任务，普通任务完成后必须回到 `Idle`，不再自动拉起旧 goal 显示“正在处理…”
+    #[tokio::test(flavor = "multi_thread")]
+    async fn goal_stop_and_subsequent_task_settle_idle() {
+        if std::process::Command::new("codex").arg("--version").output().is_err() {
+            return;
+        }
+        use std::sync::atomic::AtomicBool;
+
+        let slow = Arc::new(AtomicBool::new(false));
+        let calls = Arc::new(AtomicU64::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let slow2 = slow.clone();
+        let calls2 = calls.clone();
+        let app = axum::Router::new().route(
+            "/v1/responses",
+            axum::routing::post(move |body: axum::body::Bytes| {
+                let slow = slow2.clone();
+                let calls = calls2.clone();
+                async move {
+                    let is_title = String::from_utf8_lossy(&body).contains("Generate a concise, single-line task title");
+                    let n = if is_title { 0 } else { calls.fetch_add(1, Ordering::SeqCst) + 1 };
+                    if !is_title && slow.load(Ordering::SeqCst) {
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                    }
+                    let text = if is_title { r#"{"title":"Test"}"#.to_string() } else { format!("Done #{n}") };
+                    let created = json!({ "type": "response.created", "response": { "id": format!("r_{n}"), "status": "in_progress", "output": [] } });
+                    let msg = json!({
+                        "id": format!("m_{n}"),
+                        "type": "message",
+                        "role": "assistant",
+                        "status": "completed",
+                        "content": [{ "type": "output_text", "text": text, "annotations": [] }],
+                    });
+                    let added = json!({ "type": "response.output_item.added", "output_index": 0, "item": { "id": format!("m_{n}"), "type": "message", "role": "assistant", "status": "in_progress", "content": [] } });
+                    let done = json!({ "type": "response.output_item.done", "output_index": 0, "item": msg });
+                    let completed = json!({ "type": "response.completed", "response": { "id": format!("r_{n}"), "status": "completed", "output": [msg], "usage": { "input_tokens": 10, "input_tokens_details": { "cached_tokens": 0 }, "output_tokens": 5, "output_tokens_details": { "reasoning_tokens": 0 }, "total_tokens": 15 } } });
+                    let sse = format!(
+                        "event: response.created\ndata: {created}\n\nevent: response.output_item.added\ndata: {added}\n\nevent: response.output_item.done\ndata: {done}\n\nevent: response.completed\ndata: {completed}\n\n"
+                    );
+                    ([(axum::http::header::CONTENT_TYPE, "text/event-stream")], sse)
+                }
+            }),
+        );
+        let api = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let home = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let workdir = dir.path().display().to_string();
+        let paths = crate::paths::Paths::discover(Some(home.path().to_path_buf())).unwrap();
+        let store = Arc::new(crate::store::Store::memory().unwrap());
+        let profile = crate::codex_profiles::add(
+            &store,
+            &paths.home,
+            crate::codex_profiles::Input {
+                name: Some("Mock".into()),
+                base_url: Some(format!("http://127.0.0.1:{port}/v1")),
+                api_key: Some("sk-mock".into()),
+                model: Some("gpt-5.4".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let instances = crate::instances::Instances::new(store.clone(), paths.clone());
+        let input = crate::instances::Input {
+            name: Some("c".into()),
+            workdir: Some(workdir),
+            launch: Some("codex".into()),
+            chat_ui: Some(true),
+            full_access: Some(true),
+            codex_profile: Some(profile.id),
+            ..Default::default()
+        };
+        let id = instances.create(input).await.unwrap().row.id;
+        let chat = Chat::new(store, paths, instances);
+        let inst = chat.inst(&id);
+
+        // 先聊一句建好记录文件
+        chat.codex_input(&id, "hi", &[]).await.unwrap();
+        for _ in 0..100 {
+            if lock(&inst.st).phase == Phase::Idle && calls.load(Ordering::SeqCst) >= 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(lock(&inst.st).phase, Phase::Idle);
+
+        // 开启 `/goal`，在它运行时点停止：goal 应变成 paused，停止后回到 Idle
+        slow.store(true, Ordering::SeqCst);
+        chat.codex_input(&id, "/goal keep working", &[]).await.unwrap();
+        for _ in 0..100 {
+            if lock(&inst.st).phase == Phase::Running && lock(&inst.st).codex.turn.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        chat.codex_interrupt(&id).await.unwrap();
+        for _ in 0..100 {
+            if lock(&inst.st).phase == Phase::Idle {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(lock(&inst.st).phase, Phase::Idle);
+        assert_eq!(lock(&inst.st).codex.goal.as_ref().and_then(|g| g["status"].as_str()), Some("paused"), "点停止后 /goal 应暂停");
+
+        // 发后面的普通任务：做完后应稳定停在 Idle，不再因为残留 active goal 自动续跑而显示“正在处理…”
+        slow.store(false, Ordering::SeqCst);
+        let before = calls.load(Ordering::SeqCst);
+        chat.codex_input(&id, "subsequent normal task", &[]).await.unwrap();
+        for _ in 0..100 {
+            if calls.load(Ordering::SeqCst) > before && lock(&inst.st).phase == Phase::Idle {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert_eq!(lock(&inst.st).phase, Phase::Idle, "后面的任务完成后不应继续显示处理中");
+        assert_eq!(calls.load(Ordering::SeqCst), before + 1, "不应自动多跑一轮旧 goal");
+
+        // 模拟外部（如 TUI 按 Esc 或进程重启前）只中断了轮次、数据库里 goal 仍残留 active：重新 attach 后应自动暂停，后续任务完成后仍为 Idle
+        let server = chat.codex_server().await.unwrap();
+        let tid = lock(&inst.st).binding.as_ref().unwrap().session_id.clone();
+        lock(&chat.codex.threads).remove(&tid);
+        {
+            let mut st = lock(&inst.st);
+            st.codex.generation = 0;
+            st.codex.goal = None;
+            st.codex.turn = None;
+            st.codex.thread_active = false;
+            st.phase = Phase::Idle;
+        }
+        slow.store(true, Ordering::SeqCst);
+        server.call("thread/goal/set", json!({ "threadId": tid, "objective": "stranded goal", "status": "active", "origin": "user" })).await.unwrap();
+        let mut running_turn = None;
+        for _ in 0..100 {
+            running_turn = codex_active_turn_id(&server, &tid).await;
+            if running_turn.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let running_turn = running_turn.expect("查到分页对话当前在跑的 turn");
+        server.call("turn/interrupt", json!({ "threadId": tid, "turnId": running_turn })).await.unwrap();
+        for _ in 0..60 {
+            if server.call("thread/read", json!({ "threadId": tid })).await.unwrap()["thread"]["status"]["type"] == "idle" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(server.call("thread/goal/get", json!({ "threadId": tid })).await.unwrap()["goal"]["status"], "active");
+
+        chat.codex_attach(&id).await.unwrap();
+        assert_eq!(lock(&inst.st).codex.goal.as_ref().and_then(|g| g["status"].as_str()), Some("paused"), "重连空闲会话时残留 active goal 应自动暂停");
+
+        slow.store(false, Ordering::SeqCst);
+        let before2 = calls.load(Ordering::SeqCst);
+        chat.codex_input(&id, "another normal task", &[]).await.unwrap();
+        for _ in 0..100 {
+            if calls.load(Ordering::SeqCst) > before2 && lock(&inst.st).phase == Phase::Idle {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert_eq!(lock(&inst.st).phase, Phase::Idle);
+        assert_eq!(calls.load(Ordering::SeqCst), before2 + 1);
+
+        if let Some(s) = chat.codex.server.lock().await.take() {
+            s.kill();
+        }
+        api.abort();
     }
 }
 

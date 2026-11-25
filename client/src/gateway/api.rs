@@ -118,6 +118,7 @@ pub fn routes(app: App) -> Router<App> {
         .route("/instances/{id}/chat", get(super::chat::snapshot))
         .route("/instances/{id}/chat/events", get(super::chat::events))
         .route("/chat/ws", get(super::chat_mux::ws))
+        .route("/live/ws", get(super::live_ws::ws))
         .route("/instances/{id}/chat/history", get(super::chat::history))
         .route("/instances/{id}/chat/item", get(super::chat::item))
         .route("/instances/{id}/chat/image", get(super::chat::image))
@@ -4017,7 +4018,7 @@ async fn desk_pet_get(Extension(access): Extension<Access>, Query(q): Query<Vers
     Json(v)
 }
 
-fn desk_view(s: &crate::desk_pet::State) -> Value {
+pub(super) fn desk_view(s: &crate::desk_pet::State) -> Value {
     let k = |i: usize| s.screens.get(i).map(|x| if x.scale > 0.0 { x.scale } else { 1.0 }).unwrap_or(1.0);
     // 每块屏幕左右还有没有屏幕（宠物能不能走过去）
     let edges: Vec<Value> = s

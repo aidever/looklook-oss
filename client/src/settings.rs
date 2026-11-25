@@ -53,6 +53,10 @@ pub struct Settings {
     /// 在这台电脑上打开终端会话用哪个终端（native_term.rs 的 id，如 `ghostty`、`wt`）；空 = 看看内置
     #[serde(default)]
     pub native_terminal: String,
+    /// 对话模式、助理等看看直接起的 `claude -p` 报给 Anthropic 的入口名用 `looklook`（默认关 = Claude Code 自己的 `sdk-cli`）。
+    /// 社区实测 `sdk-*` 入口的 5 小时额度扣得更快（anthropics/claude-code#97074），官方没有表态，所以让用户自己选。见 docs/CLAUDE_SDK.md「入口名」
+    #[serde(default)]
+    pub claude_entrypoint: bool,
 }
 
 impl Default for Settings {
@@ -72,6 +76,7 @@ impl Default for Settings {
             termd: true,
             termd_rev: TERMD_REV,
             native_terminal: String::new(),
+            claude_entrypoint: false,
         }
     }
 }

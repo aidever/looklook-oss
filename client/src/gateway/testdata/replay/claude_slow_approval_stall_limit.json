@@ -1,0 +1,239 @@
+{
+ "about": "审批 10 分钟没人点 → 叫醒一次；之后 20 分钟没进展 → 叫醒一次；额度用完这一轮失败（接着盯），重置后自动接着跑完 → 再收到 done",
+ "engine": "claude",
+ "frames": [
+  {
+   "t": 1000,
+   "brief": {
+    "phase": "approval",
+    "board": "attn",
+    "since": 1000,
+    "active_at": 1000,
+    "turn": {
+     "started_at": 1000
+    },
+    "attn": {
+     "kind": "permission",
+     "pending_id": 3,
+     "tool": "Bash",
+     "detail": "npm publish"
+    }
+   }
+  },
+  {
+   "t": 300000,
+   "brief": {
+    "phase": "approval",
+    "board": "attn",
+    "since": 1000,
+    "active_at": 1000,
+    "turn": {
+     "started_at": 1000
+    },
+    "attn": {
+     "kind": "permission",
+     "pending_id": 3,
+     "tool": "Bash",
+     "detail": "npm publish"
+    }
+   }
+  },
+  {
+   "t": 601000,
+   "brief": {
+    "phase": "approval",
+    "board": "attn",
+    "since": 1000,
+    "active_at": 1000,
+    "turn": {
+     "started_at": 1000
+    },
+    "attn": {
+     "kind": "permission",
+     "pending_id": 3,
+     "tool": "Bash",
+     "detail": "npm publish"
+    }
+   }
+  },
+  {
+   "t": 700000,
+   "brief": {
+    "phase": "approval",
+    "board": "attn",
+    "since": 1000,
+    "active_at": 1000,
+    "turn": {
+     "started_at": 1000
+    },
+    "attn": {
+     "kind": "permission",
+     "pending_id": 3,
+     "tool": "Bash",
+     "detail": "npm publish"
+    }
+   }
+  },
+  {
+   "t": 800000,
+   "brief": {
+    "phase": "running",
+    "board": "working",
+    "since": 1000,
+    "active_at": 800000,
+    "attn": null,
+    "turn": {
+     "started_at": 1000
+    }
+   }
+  },
+  {
+   "t": 1500000,
+   "brief": {
+    "phase": "running",
+    "board": "working",
+    "since": 1000,
+    "active_at": 800000,
+    "attn": null,
+    "turn": {
+     "started_at": 1000
+    }
+   }
+  },
+  {
+   "t": 2001000,
+   "brief": {
+    "phase": "running",
+    "board": "working",
+    "since": 1000,
+    "active_at": 800000,
+    "attn": null,
+    "turn": {
+     "started_at": 1000
+    }
+   }
+  },
+  {
+   "t": 2100000,
+   "brief": {
+    "phase": "running",
+    "board": "working",
+    "since": 1000,
+    "active_at": 800000,
+    "attn": null,
+    "turn": {
+     "started_at": 1000
+    }
+   }
+  },
+  {
+   "t": 2200000,
+   "brief": {
+    "phase": "idle",
+    "board": "ended",
+    "since": 2200000,
+    "active_at": 2200000,
+    "attn": null,
+    "turn": {
+     "started_at": 1000,
+     "ended_at": 2200000,
+     "outcome": "failed",
+     "error": "You've hit your limit · resets 3am"
+    }
+   },
+   "reply": ""
+  },
+  {
+   "t": 2205000,
+   "brief": {
+    "phase": "idle",
+    "board": "ended",
+    "since": 2200000,
+    "active_at": 2200000,
+    "attn": null,
+    "turn": {
+     "started_at": 1000,
+     "ended_at": 2200000,
+     "outcome": "failed",
+     "error": "You've hit your limit · resets 3am"
+    }
+   },
+   "reply": ""
+  },
+  {
+   "t": 9000000,
+   "brief": {
+    "phase": "running",
+    "board": "working",
+    "since": 9000000,
+    "active_at": 9000000,
+    "attn": null,
+    "turn": {
+     "started_at": 9000000
+    }
+   }
+  },
+  {
+   "t": 9100000,
+   "brief": {
+    "phase": "idle",
+    "board": "ended",
+    "since": 9100000,
+    "active_at": 9100000,
+    "attn": null,
+    "turn": {
+     "started_at": 9000000,
+     "ended_at": 9100000,
+     "outcome": "done",
+     "error": null
+    }
+   }
+  },
+  {
+   "t": 9104000,
+   "brief": {
+    "phase": "idle",
+    "board": "ended",
+    "since": 9100000,
+    "active_at": 9100000,
+    "attn": null,
+    "turn": {
+     "started_at": 9000000,
+     "ended_at": 9100000,
+     "outcome": "done",
+     "error": null
+    }
+   }
+  }
+ ],
+ "reply": "发布好了：1.4.2 已经在 npm 上。",
+ "expect": [
+  {
+   "type": "waiting_approval",
+   "has": [
+    "审批只有用户能点"
+   ]
+  },
+  {
+   "type": "stalled",
+   "has": [
+    "可能卡住了"
+   ]
+  },
+  {
+   "type": "turn_end",
+   "attrs": "outcome=\"failed\"",
+   "has": [
+    "这一轮出错了",
+    "hit your limit"
+   ]
+  },
+  {
+   "type": "turn_end",
+   "attrs": "outcome=\"done\"",
+   "has": [
+    "1.4.2"
+   ]
+  }
+ ]
+}

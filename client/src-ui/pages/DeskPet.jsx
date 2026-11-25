@@ -8,6 +8,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { localApi as api } from '../shared/api.js';
 import { LivePet, PETS_CHANGED, useInstancePet, usePeerChat, usePetsLive } from '../shared/ChatPet.jsx';
+import { onDeskState } from '../shared/live.js';
 import { Seg } from '../shared/ui.jsx';
 import { useChat } from './ChatView.jsx';
 
@@ -22,24 +23,7 @@ const SCREEN = (() => {
 function useDeskState() {
   const [st, setSt] = useState(null);
   useEffect(() => {
-    let dead = false;
-    let seq = null;
-    const loop = () => {
-      if (dead) return;
-      api.get(`/desktop/pet${seq == null ? '' : `?since=${seq}`}`).then(
-        (r) => {
-          if (dead) return;
-          seq = r?.seq ?? seq;
-          setSt(r);
-          setTimeout(loop, 50);
-        },
-        () => setTimeout(loop, 3000),
-      );
-    };
-    loop();
-    return () => {
-      dead = true;
-    };
+    return onDeskState(setSt);
   }, []);
   return st;
 }

@@ -24,8 +24,15 @@ import { AssistantOpen, useOpenSession } from '../shared/assistantOpen.js';
 import AttnPeek from '../shared/AttnPeek.jsx';
 
 // 引擎：大脑底下用的工具（界面、工具、规矩都一样，只是接法不同）
+// 能当大脑的引擎
 const ENGINES = ['claude', 'codex'];
-const ENGINE_NAMES = { claude: 'Claude Code', codex: 'Codex' };
+const ENGINE_NAMES = { claude: 'Claude Code', codex: 'Codex', agy: 'Antigravity' };
+// 能派活的工具（assistant.rs 的 TOOLS；/assistant 的 tools 到了以后照它更新，见 syncTools）
+let DISPATCH_TOOLS = ['claude', 'codex', 'agy'];
+// 权限模式下一轮才生效的工具
+const NEXT_TURN = new Set(['codex']);
+// 各工具的账号接口
+const ACCOUNTS = { claude: ['/claude-profiles', 'cprof.builtin'], codex: ['/codex-profiles', 'xprof.builtin'], agy: ['/agy-profiles', 'aprof.builtin'] };
 // 权限模式：助理自己动手（跑命令、改文件）时怎么办
 const MODES = ['read_only', 'ask', 'auto'];
 const MODE_ICON = { read_only: Eye, ask: Hand, auto: Zap };
@@ -44,6 +51,7 @@ function useAssistant() {
           const dev = selectedDevice();
           // 助理和它派的会话都在这台电脑上：记下来，对话接口才会发到这台
           if (dev) rememberTerminals(dev, [d.brain, ...d.tasks.map((x) => x.session), ...d.dispatches.map((x) => x.session)].filter(Boolean).map((id) => ({ id })));
+          syncTools(d.tools);
           setState(d);
           setError(null);
         },
@@ -717,16 +725,32 @@ function CeilingPick({ state, onChange }) {
   );
 }
 
-/** 每种引擎能切的全部权限模式（assistant.rs 的 engine_modes）和各自算哪一档 */
+/** 每种工具能切的全部权限模式（assistant.rs 的 TOOLS）和各自算哪一档；这里是还没拿到 /assistant 时的底 */
+const CLAUDE_MODES = [['plan', 'read_only'], ['default', 'ask'], ['acceptEdits', 'ask'], ['auto', 'project'], ['bypassPermissions', 'full']];
+const CLAUDE_LEVELS = { read_only: 'plan', ask: 'acceptEdits', project: 'auto', full: 'bypassPermissions' };
 const ENGINE_MODES = {
-  claude: [['plan', 'read_only'], ['default', 'ask'], ['acceptEdits', 'ask'], ['auto', 'project'], ['bypassPermissions', 'full']],
+  claude: CLAUDE_MODES,
   codex: [['readOnly', 'read_only'], ['askCommands', 'ask'], ['workspaceWrite', 'project'], ['fullGuarded', 'full'], ['fullAccess', 'full']],
+  agy: CLAUDE_MODES,
 };
-// 一档在这种引擎上默认用的模式（assistant.rs 的 native_mode）
+// 一档在这种工具上默认用的模式（assistant.rs 的 native_mode）
 const LEVEL_MODE = {
-  claude: { read_only: 'plan', ask: 'acceptEdits', project: 'auto', full: 'bypassPermissions' },
+  claude: CLAUDE_LEVELS,
   codex: { read_only: 'readOnly', ask: 'askCommands', project: 'workspaceWrite', full: 'fullGuarded' },
+  agy: CLAUDE_LEVELS,
 };
+/** 后端的能力表到了：工具、名字、模式照它的 */
+function syncTools(tools) {
+  if (!Array.isArray(tools) || tools.length === 0) return;
+  DISPATCH_TOOLS = tools.map((x) => x.id);
+  for (const x of tools) {
+    if (x.name) ENGINE_NAMES[x.id] = x.name;
+    if (Array.isArray(x.modes) && x.modes.length) ENGINE_MODES[x.id] = x.modes;
+    if (x.by_level) LEVEL_MODE[x.id] = x.by_level;
+    if (x.mode_next_turn) NEXT_TURN.add(x.id);
+    else NEXT_TURN.delete(x.id);
+  }
+}
 const modeName = (t, engine, m) => (engine === 'codex' && m === 'workspaceWrite' ? t('asst.mode_workspaceWrite') : t(`chat.mode_${m}`));
 /** 这种引擎的全部权限模式，图标按它算的那一档 */
 const engineModeOptions = (t, engine) =>
@@ -738,7 +762,7 @@ const engineModeOptions = (t, engine) =>
         <Icon size={14} aria-hidden="true" />
         {modeName(t, engine, m)}
       </span>,
-      { hint: `${t(`asst.level.${level}`)} · ${t(`chat.mode_hint_${m}`)}` },
+      { hint: `${t(`asst.level.${level}`)} · ${t(engine === 'agy' && m === 'auto' ? 'asst.mode_hint_agy_auto' : `chat.mode_hint_${m}`)}` },
     ];
   });
 const levelOfMode = (engine, m) => (ENGINE_MODES[engine] ?? []).find(([x]) => x === m)?.[1];
@@ -758,7 +782,7 @@ function LevelPick({ x, onChange }) {
       .post(`/assistant/sessions/${x.session}/level`, { mode })
       .then(
         (r) => {
-          toast(t(engine === 'codex' ? 'asst.level_switched_next' : 'asst.level_switched', { name: modeName(t, engine, r?.mode ?? mode) }), 'success');
+          toast(t(NEXT_TURN.has(engine) ? 'asst.level_switched_next' : 'asst.level_switched', { name: modeName(t, engine, r?.mode ?? mode) }), 'success');
           onChange?.();
         },
         (e) => toast(errorText(t, e), 'error'),
@@ -788,7 +812,7 @@ function LevelPick({ x, onChange }) {
  */
 function DispatchDefaults({ state, onChange }) {
   const { t } = useTranslation();
-  const engines = (state.engines ?? []).filter((e) => e.installed).map((e) => e.id);
+  const engines = (state.tools ?? state.engines ?? []).filter((e) => e.installed).map((e) => e.id);
   const list = engines.length ? engines : ENGINES;
   return (
     <section>
@@ -812,7 +836,7 @@ function DispatchEngine({ state, installed, onChange }) {
   const cur = state.settings?.dispatch_engine ?? '';
   const opts = [
     ['', t('asst.dispatch_engine_auto'), { hint: t('asst.dispatch_engine_auto_hint') }],
-    ...ENGINES.filter((e) => installed.includes(e) || e === cur).map((e) => [
+    ...DISPATCH_TOOLS.filter((e) => installed.includes(e) || e === cur).map((e) => [
       e,
       <span key={e} className="asst-opt">
         <LaunchIcon launch={e} size={14} />
@@ -848,7 +872,7 @@ function EngineDefaults({ engine, cur, onChange }) {
   const account = cur.account ?? '';
   useEffect(() => {
     let live = true;
-    api.get(engine === 'codex' ? '/codex-profiles' : '/claude-profiles').then(
+    api.get((ACCOUNTS[engine] ?? ACCOUNTS.claude)[0]).then(
       (r) => live && setAccounts(r ?? { profiles: [] }),
       () => live && setAccounts({ profiles: [] }),
     );
@@ -869,7 +893,7 @@ function EngineDefaults({ engine, cur, onChange }) {
     };
   }, [engine, account]);
   const name = ENGINE_NAMES[engine];
-  const acctName = (x) => x.name || t(engine === 'codex' ? 'xprof.builtin' : 'cprof.builtin');
+  const acctName = (x) => x.name || t((ACCOUNTS[engine] ?? ACCOUNTS.claude)[1]);
   const acctList = accounts?.profiles ?? [];
   const defAcct = acctList.find((x) => x.id === accounts?.default);
   const acctNone = t('asst.defaults_account_none', { name: defAcct ? acctName(defAcct) : '' });
@@ -1164,6 +1188,29 @@ function AgreementsTab({ state, onChange }) {
 }
 
 /** 设置：派出去的会话的权限、重启、飞书 */
+/** 助理自己动手时靠什么挡住（gateway/assistant.rs `protect`）：Codex 是它自己的沙箱；Claude Code 是看看的检查，只读时另开系统沙箱，如实写开没开起来 */
+function Protect({ protect }) {
+  const { t } = useTranslation();
+  if (!protect) return null;
+  const sb = protect.sandbox;
+  let text;
+  if (protect.engine === 'codex') text = t('asst.protect.codex');
+  else if (protect.mode !== 'read_only') text = t('asst.protect.claude_gate');
+  else if (!sb) text = t('asst.protect.claude_ro_unknown');
+  else if (!sb.requested) text = t('asst.protect.claude_ro_pending');
+  else if (sb.active) text = t('asst.protect.claude_ro_on');
+  else text = t('asst.protect.claude_ro_off', { reason: sb.reason || t('asst.protect.unknown_reason') });
+  return (
+    <section>
+      <h3 className="asst-h asst-h-sm">
+        <ShieldCheck size={14} aria-hidden="true" />
+        {t('asst.protect.title')}
+      </h3>
+      <p className="muted asst-small">{text}</p>
+    </section>
+  );
+}
+
 function SettingsTab({ state, onChange }) {
   const { t } = useTranslation();
   return (
@@ -1179,6 +1226,7 @@ function SettingsTab({ state, onChange }) {
         </div>
         <p className="muted asst-small">{t('asst.restart_hint')}</p>
       </section>
+      <Protect protect={state.protect} />
       <DispatchDefaults state={state} onChange={onChange} />
       <FeishuBot state={state} onChange={onChange} />
       <p className="muted asst-small asst-foot">

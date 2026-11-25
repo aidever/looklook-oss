@@ -263,7 +263,7 @@ pub async fn generate(
             if let Ok(f) = crate::chat::hooks::ensure_terminal_settings(paths, flag.as_ref().map(|e| (profile.id.as_str(), e))) {
                 args.extend(["--settings".into(), f.display().to_string()]);
             }
-            by_cli(exe, &args, &p, None, shell, env.as_ref()).await?
+            by_cli(exe, &args, &p, None, shell, env.as_ref(), &crate::chat::claude_sdk::identity_env(store)).await?
         }
         "codex" => {
             let dir = tempfile::tempdir().map_err(LocalError::from)?;
@@ -279,7 +279,7 @@ pub async fn generate(
             }
             let profile = crate::codex_profiles::get(store, &cfg.profile).unwrap_or_else(|| crate::codex_profiles::for_instance(store, ""));
             let env = crate::codex_profiles::launch_env(&paths.home, &profile);
-            by_cli(exe, &args, &p, Some(&out), shell, env.as_ref()).await?
+            by_cli(exe, &args, &p, Some(&out), shell, env.as_ref(), &[]).await?
         }
         _ => return Err(LocalError::invalid("via", "one_of")),
     };
@@ -366,7 +366,8 @@ fn answer_text(protocol: &str, v: &Value) -> Option<String> {
 }
 
 /// 在空的临时目录里跑一次，提示词走标准输入（命令行有长度限制），等它说完
-pub(crate) async fn by_cli(exe: String, args: &[String], prompt: &str, out_file: Option<&Path>, shell: &str, env: Option<&crate::model::LaunchEnv>) -> Result<String, LocalError> {
+/// `extra`：再加的环境变量（起 claude 时是 [`crate::chat::claude_sdk::identity_env`]）
+pub(crate) async fn by_cli(exe: String, args: &[String], prompt: &str, out_file: Option<&Path>, shell: &str, env: Option<&crate::model::LaunchEnv>, extra: &[(String, String)]) -> Result<String, LocalError> {
     use tokio::io::AsyncWriteExt;
     let dir = tempfile::tempdir().map_err(LocalError::from)?;
     let mut cmd = tokio::process::Command::new(&exe);
@@ -380,6 +381,10 @@ pub(crate) async fn by_cli(exe: String, args: &[String], prompt: &str, out_file:
     }
     // 不要套进看看自己的 hook / 会话里
     cmd.env_remove("TMUX").env("LOOKLOOK_PET_GEN", "1");
+    if !extra.is_empty() {
+        cmd.env_remove("CLAUDE_CODE_ENTRYPOINT");
+        cmd.envs(extra.iter().map(|(k, v)| (k, v)));
+    }
     // 账号的配置目录 / 服务商地址和 Key / 模型设置（Codex 的还有 -c）
     if let Some(e) = env {
         e.apply(&mut cmd);

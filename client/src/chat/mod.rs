@@ -901,12 +901,56 @@ impl Chat {
         s
     }
 
+    /// 大脑、跑腿现在按哪种模式。跑腿最多“动手前问”（它会读网页这类外面的东西，只查不改不能只靠规矩）
+    pub(super) fn assistant_mode(&self, id: &str) -> crate::assistant::Mode {
+        let mode = crate::assistant::settings(&self.store).mode;
+        if crate::assistant::is_errand(&self.store, id) { mode.for_errand() } else { mode }
+    }
+
+    /// 助理换了模式：对话模式 Claude Code 的大脑带的系统沙箱（只读时才有）和现在要的不一样了，就重起（接着同一段对话）。
+    /// 在跑的等这一轮做完（最多半小时）；闸门本来就按现在的模式判，这里只换沙箱
+    pub fn assistant_mode_changed(self: &Arc<Self>, brain: &str) {
+        let (me, id) = (self.clone(), brain.to_string());
+        tokio::spawn(async move {
+            let until = Instant::now() + Duration::from_secs(1800);
+            loop {
+                let stale = {
+                    let inst = me.inst(&id);
+                    let st = lock(&inst.st);
+                    let want = crate::assistant::claude_sandbox(&me.paths, me.assistant_mode(&id)).is_some();
+                    st.sdk.proc.as_ref().is_some_and(|p| p.alive()) && st.sdk.sandboxed != want
+                };
+                if !stale {
+                    return;
+                }
+                if !me.busy(&id) {
+                    tracing::info!(id, "助理换了模式，重起大脑换系统沙箱");
+                    if let Err(e) = me.restart(&id).await {
+                        tracing::warn!(id, error = ?e, "助理换模式后没能重起大脑");
+                    }
+                    return;
+                }
+                if Instant::now() > until {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+        });
+    }
+
+    /// 大脑的系统沙箱现在怎么样（助理页显示）：Claude Code 对话模式的才有；没在跑时 None
+    pub async fn sandbox_status(&self, id: &str) -> Option<Value> {
+        if self.require(id).is_err() || self.inst(id).agent.launch() != "claude" || !self.is_sdk(id) {
+            return None;
+        }
+        self.sdk_sandbox(id).await
+    }
+
     /// 大脑要用工具：按助理的权限模式过闸门（Claude Code 的 PreToolUse、Codex 的审批请求都走这里）
     pub(super) fn assistant_gate(&self, id: &str, tool: &str, input: &Value) -> crate::assistant::Verdict {
         let busy = |p: &std::path::Path| self.project_busy(p, id);
         let settings = crate::assistant::settings(&self.store);
-        // 跑腿最多“动手前问”（它会读网页这类外面的东西，只查不改不能只靠规矩）
-        let mode = if crate::assistant::is_errand(&self.store, id) { settings.mode.for_errand() } else { settings.mode };
+        let mode = self.assistant_mode(id);
         crate::assistant::gate(&self.paths, mode, crate::assistant::ceiling(&settings), &crate::guard::load(&self.store), tool, input, &busy)
     }
 
@@ -1795,6 +1839,23 @@ impl Chat {
     /// Codex 的 Tab：不插话，排到这一轮之后作为下一轮发出（别的工具、没在跑时同普通发送）
     pub async fn send_later(self: &Arc<Self>, id: &str, text: &str, images: &[String]) -> Result<Value, LocalError> {
         self.submit(id, text, images, false, true).await
+    }
+
+    /// 只记进对话、不让 AI 回这一句（下一轮它看得到），比如助理换引擎时带过去的对话。
+    /// 返回 false：这个会话做不到（终端里的、Antigravity、老版本 Codex），或者正在跑——调用方改成普通发送
+    pub async fn note(self: &Arc<Self>, id: &str, text: &str) -> Result<bool, LocalError> {
+        self.require(id)?;
+        let inst = self.inst(id);
+        if matches!(lock(&inst.st).phase, Phase::Running | Phase::Approval) {
+            return Ok(false);
+        }
+        if self.is_codex(id) {
+            return self.codex_inject(id, text).await;
+        }
+        if inst.agent.launch() == "claude" && inst.sdk.load(Ordering::Relaxed) {
+            return self.sdk_inject(id, text).await;
+        }
+        Ok(false)
     }
 
     /// `/btw`：顺带问一句（只有对话模式的 Claude Code 有，见 `claude_chat::sdk_btw`）

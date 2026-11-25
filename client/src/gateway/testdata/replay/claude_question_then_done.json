@@ -1,0 +1,187 @@
+{
+ "about": "派出去的 Claude Code 会话：中途提问（AskUserQuestion），大脑只收到一次 question；做完收到 turn_end（done）；之后用户自己接着用，不再叫醒大脑",
+ "engine": "claude",
+ "frames": [
+  {
+   "t": 1000,
+   "brief": {
+    "phase": "running",
+    "board": "working",
+    "since": 1000,
+    "active_at": 1000,
+    "attn": null,
+    "turn": {
+     "started_at": 1000
+    }
+   }
+  },
+  {
+   "t": 5000,
+   "brief": {
+    "phase": "approval",
+    "board": "attn",
+    "since": 5000,
+    "active_at": 5000,
+    "turn": {
+     "started_at": 1000
+    },
+    "attn": {
+     "kind": "question",
+     "pending_id": 7,
+     "tool": "AskUserQuestion",
+     "question": "数据库用哪个？",
+     "options": [
+      "Postgres",
+      "SQLite"
+     ]
+    }
+   }
+  },
+  {
+   "t": 8000,
+   "brief": {
+    "phase": "approval",
+    "board": "attn",
+    "since": 5000,
+    "active_at": 5000,
+    "turn": {
+     "started_at": 1000
+    },
+    "attn": {
+     "kind": "question",
+     "pending_id": 7,
+     "tool": "AskUserQuestion",
+     "question": "数据库用哪个？",
+     "options": [
+      "Postgres",
+      "SQLite"
+     ]
+    }
+   }
+  },
+  {
+   "t": 9000,
+   "brief": {
+    "phase": "running",
+    "board": "working",
+    "since": 1000,
+    "active_at": 9000,
+    "attn": null,
+    "turn": {
+     "started_at": 1000
+    }
+   }
+  },
+  {
+   "t": 60000,
+   "brief": {
+    "phase": "idle",
+    "board": "ended",
+    "since": 60000,
+    "active_at": 60000,
+    "attn": null,
+    "turn": {
+     "started_at": 1000,
+     "ended_at": 60000,
+     "outcome": "done",
+     "error": null
+    }
+   }
+  },
+  {
+   "t": 61000,
+   "brief": {
+    "phase": "idle",
+    "board": "ended",
+    "since": 60000,
+    "active_at": 60000,
+    "attn": null,
+    "turn": {
+     "started_at": 1000,
+     "ended_at": 60000,
+     "outcome": "done",
+     "error": null
+    }
+   }
+  },
+  {
+   "t": 64000,
+   "brief": {
+    "phase": "idle",
+    "board": "ended",
+    "since": 60000,
+    "active_at": 60000,
+    "attn": null,
+    "turn": {
+     "started_at": 1000,
+     "ended_at": 60000,
+     "outcome": "done",
+     "error": null
+    }
+   }
+  },
+  {
+   "t": 90000,
+   "brief": {
+    "phase": "running",
+    "board": "working",
+    "since": 90000,
+    "active_at": 90000,
+    "attn": null,
+    "turn": {
+     "started_at": 90000
+    }
+   }
+  },
+  {
+   "t": 120000,
+   "brief": {
+    "phase": "idle",
+    "board": "ended",
+    "since": 120000,
+    "active_at": 120000,
+    "attn": null,
+    "turn": {
+     "started_at": 90000,
+     "ended_at": 120000,
+     "outcome": "done",
+     "error": null
+    }
+   }
+  },
+  {
+   "t": 130000,
+   "brief": {
+    "phase": "idle",
+    "board": "ended",
+    "since": 120000,
+    "active_at": 120000,
+    "attn": null,
+    "turn": {
+     "started_at": 90000,
+     "ended_at": 120000,
+     "outcome": "done",
+     "error": null
+    }
+   }
+  }
+ ],
+ "reply": "改好了：换成 Postgres，迁移脚本在 db/001_init.sql，测试都过了。",
+ "expect": [
+  {
+   "type": "question",
+   "has": [
+    "数据库用哪个？",
+    "Postgres / SQLite"
+   ]
+  },
+  {
+   "type": "turn_end",
+   "attrs": "outcome=\"done\"",
+   "has": [
+    "它最后说的",
+    "db/001_init.sql"
+   ]
+  }
+ ]
+}

@@ -273,6 +273,33 @@ impl Proc {
     }
 }
 
+/// 打开“入口名用 looklook”（[`crate::settings::Settings::claude_entrypoint`]）时报的入口名
+pub const ENTRYPOINT: &str = "looklook";
+
+/// 看看直接起的 `claude -p` 报的身份（docs/CLAUDE_SDK.md「入口名」）：
+/// - `CLAUDE_AGENT_SDK_CLIENT_APP`：一直带，只在请求头里写明是看看起的（`x-client-app`），不改计量；
+/// - `CLAUDE_CODE_ENTRYPOINT`：用户在设置里打开时才设成 `looklook`，否则不设、claude 自己报 `sdk-cli`。
+///   外层带进来的（客户端本身在 Claude Code 里跑时）调用方要先去掉（[`crate::instances::apply_env`] 已经去了）。
+pub fn identity_env(store: &crate::store::Store) -> Vec<(String, String)> {
+    identity_env_with(crate::settings::Settings::load(store).claude_entrypoint)
+}
+
+fn identity_env_with(entrypoint: bool) -> Vec<(String, String)> {
+    let mut v = vec![("CLAUDE_AGENT_SDK_CLIENT_APP".to_string(), format!("looklook/{}", env!("CARGO_PKG_VERSION")))];
+    if entrypoint {
+        v.push(("CLAUDE_CODE_ENTRYPOINT".to_string(), ENTRYPOINT.to_string()));
+    }
+    v
+}
+
+/// 同上，直接设到命令上（先去掉外层带进来的入口名）
+pub fn apply_identity(cmd: &mut tokio::process::Command, store: &crate::store::Store) {
+    cmd.env_remove("CLAUDE_CODE_ENTRYPOINT");
+    for (k, v) in identity_env(store) {
+        cmd.env(k, v);
+    }
+}
+
 /// Windows 上 npm 装的是 `claude.cmd`：要经 cmd 运行
 pub(crate) fn command(program: &std::path::Path) -> tokio::process::Command {
     let ext = program.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase);
@@ -357,6 +384,14 @@ pub fn find_transcript(config_dirs: &[PathBuf], session: &str) -> Option<PathBuf
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn identity_default_keeps_sdk_entrypoint() {
+        let off = identity_env_with(false);
+        assert!(off.iter().any(|(k, v)| k == "CLAUDE_AGENT_SDK_CLIENT_APP" && v.starts_with("looklook/")));
+        assert!(!off.iter().any(|(k, _)| k == "CLAUDE_CODE_ENTRYPOINT"), "默认不改入口名");
+        assert!(identity_env_with(true).iter().any(|(k, v)| k == "CLAUDE_CODE_ENTRYPOINT" && v == "looklook"));
+    }
 
     #[test]
     fn hooks_cover_events() {

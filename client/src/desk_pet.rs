@@ -162,6 +162,11 @@ fn seq_tx() -> &'static watch::Sender<u64> {
     SEQ.get_or_init(|| watch::channel(0).0)
 }
 
+/// 订阅状态的序号（页面的 `/api/live/ws`）
+pub fn subscribe() -> watch::Receiver<u64> {
+    seq_tx().subscribe()
+}
+
 /// 等状态变（`seq` 不再是 `since`），最多 `max`
 pub async fn wait_change(since: u64, max: std::time::Duration) -> State {
     let mut rx = seq_tx().subscribe();

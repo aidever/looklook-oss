@@ -132,6 +132,13 @@ pub fn ensure_terminal_settings(paths: &Paths, env: ProfileEnv) -> std::io::Resu
     write_changed(path, serde_json::to_string_pretty(&v)?)
 }
 
+/// 同 [`ensure_terminal_settings`]，再带上 Claude Code 的系统沙箱设置（助理只读时，见 `assistant::claude_sandbox`）。
+/// 放在看看自己的目录里：大脑只能写它的工作目录，改不到这个文件
+pub fn ensure_sandboxed_settings(paths: &Paths, env: ProfileEnv, sandbox: &Value) -> std::io::Result<PathBuf> {
+    let (v, path) = with_env(json!({ "skipDangerousModePermissionPrompt": true, "sandbox": sandbox }), paths.home.join("run").join("claude-sandboxed.json"), env);
+    write_changed(path, serde_json::to_string_pretty(&v)?)
+}
+
 fn write_changed(path: PathBuf, text: String) -> std::io::Result<PathBuf> {
     if std::fs::read_to_string(&path).ok().as_deref() != Some(text.as_str()) {
         if let Some(dir) = path.parent() {

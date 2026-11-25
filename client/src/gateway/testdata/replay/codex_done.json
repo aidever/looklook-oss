@@ -1,0 +1,236 @@
+{
+ "about": "派出去的 Codex 会话正常做完：大脑收到一次 turn_end（done），正文是它最后说的话，之后不再盯",
+ "recorded": "照 codex_failed_503.json 的真录改的：出错重连那几条换成一条回复和正常结束（录的时候没有能用的账号跑完一轮）",
+ "thread": {
+  "id": "01a213e2-bda5-78a0-a332-22f058820434",
+  "cwd": "/w/app"
+ },
+ "notes": [
+  [
+   "thread/status/changed",
+   {
+    "threadId": "01a213e2-bda5-78a0-a332-22f058820434",
+    "status": {
+     "type": "active",
+     "activeFlags": []
+    }
+   }
+  ],
+  [
+   "turn/started",
+   {
+    "threadId": "01a213e2-bda5-78a0-a332-22f058820434",
+    "turn": {
+     "id": "01a213e2-bed7-7821-9e31-83b73136f68d",
+     "rootTurnId": "01a213e2-bed7-7821-9e31-83b73136f68d",
+     "items": [],
+     "itemsView": "notLoaded",
+     "status": "inProgress",
+     "error": null,
+     "startedAt": 1795629956,
+     "completedAt": null,
+     "durationMs": null
+    }
+   }
+  ],
+  [
+   "item/started",
+   {
+    "item": {
+     "type": "userMessage",
+     "id": "01a213e2-ca0e-7150-b48a-2a505524ea55",
+     "clientId": null,
+     "content": [
+      {
+       "type": "text",
+       "text": "只回一句：查完了，登录页的问题在 src/login.js 第 12 行少了 await。不要运行任何命令。",
+       "text_elements": []
+      }
+     ],
+     "startedAtMs": 1795629959695,
+     "completedAtMs": null
+    },
+    "threadId": "01a213e2-bda5-78a0-a332-22f058820434",
+    "turnId": "01a213e2-bed7-7821-9e31-83b73136f68d",
+    "startedAtMs": 1795629959695
+   }
+  ],
+  [
+   "item/completed",
+   {
+    "item": {
+     "type": "userMessage",
+     "id": "01a213e2-ca0e-7150-b48a-2a505524ea55",
+     "clientId": null,
+     "content": [
+      {
+       "type": "text",
+       "text": "只回一句：查完了，登录页的问题在 src/login.js 第 12 行少了 await。不要运行任何命令。",
+       "text_elements": []
+      }
+     ],
+     "startedAtMs": 1795629959695,
+     "completedAtMs": 1795629959695
+    },
+    "threadId": "01a213e2-bda5-78a0-a332-22f058820434",
+    "turnId": "01a213e2-bed7-7821-9e31-83b73136f68d",
+    "contentTokenCount": null,
+    "completedAtMs": 1795629959695
+   }
+  ],
+  [
+   "item/started",
+   {
+    "item": {
+     "type": "agentMessage",
+     "id": "01a213e2-cb00-7000-8000-000000000001",
+     "text": "",
+     "phase": null
+    },
+    "threadId": "01a213e2-bda5-78a0-a332-22f058820434",
+    "turnId": "01a213e2-bed7-7821-9e31-83b73136f68d"
+   }
+  ],
+  [
+   "item/completed",
+   {
+    "item": {
+     "type": "agentMessage",
+     "id": "01a213e2-cb00-7000-8000-000000000001",
+     "text": "查完了，登录页的问题在 src/login.js 第 12 行少了 await。",
+     "phase": null
+    },
+    "threadId": "01a213e2-bda5-78a0-a332-22f058820434",
+    "turnId": "01a213e2-bed7-7821-9e31-83b73136f68d"
+   }
+  ],
+  [
+   "thread/status/changed",
+   {
+    "threadId": "01a213e2-bda5-78a0-a332-22f058820434",
+    "status": {
+     "type": "idle"
+    }
+   }
+  ],
+  [
+   "turn/completed",
+   {
+    "threadId": "01a213e2-bda5-78a0-a332-22f058820434",
+    "turn": {
+     "id": "01a213e2-bed7-7821-9e31-83b73136f68d",
+     "rootTurnId": "01a213e2-bed7-7821-9e31-83b73136f68d",
+     "items": [],
+     "itemsView": "notLoaded",
+     "status": "completed",
+     "error": null
+    }
+   }
+  ]
+ ],
+ "rollout": [
+  {
+   "timestamp": "2026-11-25T18:05:56.883Z",
+   "ordinal": 1,
+   "type": "event_msg",
+   "payload": {
+    "type": "task_started",
+    "turn_attribution": {
+     "turn_id": "01a213e2-bed7-7821-9e31-83b73136f68d",
+     "turn_trigger": null,
+     "parent_turn_id": null,
+     "initiating_agent_path": null,
+     "root_turn_id": "01a213e2-bed7-7821-9e31-83b73136f68d"
+    },
+    "turn_id": "01a213e2-bed7-7821-9e31-83b73136f68d",
+    "root_turn_id": "01a213e2-bed7-7821-9e31-83b73136f68d",
+    "started_at": 1795629956,
+    "model_context_window": 475000,
+    "collaboration_mode_kind": "default"
+   }
+  },
+  {
+   "timestamp": "2026-11-25T18:05:59.694Z",
+   "ordinal": 11,
+   "type": "response_item",
+   "payload": {
+    "type": "message",
+    "id": "msg_01a213e2-ca0e-7150-b48a-2a6a92badab3",
+    "role": "user",
+    "content": [
+     {
+      "type": "input_text",
+      "text": "只回一句：查完了，登录页的问题在 src/login.js 第 12 行少了 await。不要运行任何命令。"
+     }
+    ]
+   }
+  },
+  {
+   "timestamp": "2026-11-25T18:05:59.695Z",
+   "ordinal": 12,
+   "type": "event_msg",
+   "payload": {
+    "type": "item_completed",
+    "thread_id": "01a213e2-bda5-78a0-a332-22f058820434",
+    "turn_id": "01a213e2-bed7-7821-9e31-83b73136f68d",
+    "item": {
+     "type": "UserMessage",
+     "id": "01a213e2-ca0e-7150-b48a-2a505524ea55",
+     "content": [
+      {
+       "type": "text",
+       "text": "只回一句：查完了，登录页的问题在 src/login.js 第 12 行少了 await。不要运行任何命令。",
+       "text_elements": []
+      }
+     ]
+    },
+    "started_at_ms": 1795629959695,
+    "completed_at_ms": 1795629959695
+   }
+  },
+  {
+   "timestamp": "2026-11-25T18:06:45.903Z",
+   "type": "event_msg",
+   "payload": {
+    "type": "item_completed",
+    "thread_id": "01a213e2-bda5-78a0-a332-22f058820434",
+    "turn_id": "01a213e2-bed7-7821-9e31-83b73136f68d",
+    "item": {
+     "type": "AgentMessage",
+     "id": "01a213e2-cb00-7000-8000-000000000001",
+     "content": [
+      {
+       "type": "Text",
+       "text": "查完了，登录页的问题在 src/login.js 第 12 行少了 await。"
+      }
+     ]
+    }
+   }
+  },
+  {
+   "timestamp": "2026-11-25T18:06:45.903Z",
+   "ordinal": 13,
+   "type": "event_msg",
+   "payload": {
+    "type": "task_complete",
+    "root_turn_id": "01a213e2-bed7-7821-9e31-83b73136f68d",
+    "turn_id": "01a213e2-bed7-7821-9e31-83b73136f68d",
+    "last_agent_message": "查完了，登录页的问题在 src/login.js 第 12 行少了 await。",
+    "error": null,
+    "started_at": 1795629956,
+    "completed_at": 1795630005,
+    "duration_ms": 49061
+   }
+  }
+ ],
+ "expect": [
+  {
+   "type": "turn_end",
+   "attrs": "outcome=\"done\"",
+   "has": [
+    "它最后说的",
+    "src/login.js 第 12 行少了 await"
+   ]
+  }
+ ]
+}

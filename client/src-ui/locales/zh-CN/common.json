@@ -1795,7 +1795,31 @@
     },
     "pages_hint": "查看已添加的网页，给端口生成地址；不能删除。",
     "hosts_manage": "在 SSH 主机页逐台设置",
-    "tool_names": "AI 能调用的工具（给想对照日志的人）"
+    "tool_names": "AI 能调用的工具（给想对照日志的人）",
+    "ep": {
+      "title": "Claude Code 的入口名",
+      "switch": "报给 Anthropic 的入口名用 looklook",
+      "hint": "默认关，沿用 Claude Code 自己的 sdk-cli。只影响对话模式、助理和后台小任务起的 Claude Code，终端里直接运行的不变；已经在跑的会话要等它的 Claude Code 下次启动才生效。",
+      "why": "为什么有这个开关：社区报告和官方说法",
+      "colon": "：",
+      "what": "看看的对话模式、助理和后台小任务（起标题、宠物台词等）用 claude -p --input-format stream-json 启动你装的 Claude Code。这样启动时，Claude Code 在每个请求里报的入口名是 sdk-cli；在终端里直接运行 claude 时是 cli。打开这个开关后报 looklook。无论开关如何，看看都会在请求头里另外注明客户端是看看（CLAUDE_AGENT_SDK_CLIENT_APP），这一项不改变入口名。",
+      "reports": "社区报告",
+      "r_issue": "原始报告，至今未关闭，Anthropic 没有回复。报告者在 Max 账号上对比同样的工作量：入口名为 sdk-cli 时，每单位用量占 5 小时额度约为 cli 的 1.8 倍。楼里有多人在 Linux、macOS、Windows 上复现。有人只改入口名、其余条件不变做了对照，每周额度也相差 1.14–1.32 倍。",
+      "r_t3issue": "T3 Code（同类的开源客户端）作者在一个 Max 账号上实测：Agent SDK 和 claude -p 每单位用量占 5 小时额度约为终端的 1.6–1.7 倍，当时每周额度没看到差别。",
+      "r_t3pr": "T3 Code 把入口名改成自己的名字 t3-code。合并后有用户在 Pro 账号上复测，和终端的差别在测量误差内（额度只显示整数百分比，误差约 ±20%）。",
+      "official": "官方说法",
+      "o_none": "Anthropic 没有公开说明不同入口名的计量是否不同，也没有对上面的报告表态。",
+      "help_title": "帮助文章《Use the Claude Agent SDK with your Claude plan》",
+      "o_help": "Agent SDK 和 claude -p 用订阅登录时从订阅额度里扣；文中没有提到和终端按不同比例扣。",
+      "legal_title": "Claude Code 法律与合规页",
+      "o_legal": "订阅的额度“按普通的个人使用”设定；Anthropic 保留执行使用限制的权利，可能不事先通知。页面没有提到入口名。",
+      "know": "打开前要知道",
+      "k_honest": "looklook 是这些请求的真实来源，看看不会把它们报成终端的 cli。",
+      "k_nopromise": "上面都是社区实测，不保证能省额度；Anthropic 随时可能调整计量方式。",
+      "k_behavior": "Claude Code 内部有几处按 sdk-cli 区分的行为（例如内置子代理列表），打开后如果对话里有异常，关掉即可恢复。",
+      "k_scope": "只对这台电脑生效，不在电脑之间同步。用第三方接口（API Key、中转）的账号不按订阅额度计，开不开都一样。",
+      "checked": "以上内容整理于 2026 年 11 月 25 日，以链接里的原文为准。"
+    }
   },
   "select": {
     "toggle": "选择文字",
@@ -4438,6 +4462,7 @@
     "ceiling_switched": "派出去的会话最多到「{{name}}」，下一次派活生效",
     "level_label": "这个会话的权限",
     "level_switched": "这个会话换成「{{name}}」了",
+    "mode_hint_agy_auto": "由 Antigravity 自己判断哪些操作要问你",
     "level_switched_next": "这个会话换成「{{name}}」了，下一轮生效",
     "level": {
       "read_only": "只看",
@@ -4647,7 +4672,17 @@
     "defaults_model_none": "跟配置走",
     "defaults_model_none_hint": "用这个工具自己配置的默认模型",
     "defaults_saved": "{{engine}} 默认换成「{{name}}」，下一次派活生效",
-    "mode_workspaceWrite": "工作区可写"
+    "mode_workspaceWrite": "工作区可写",
+    "protect": {
+      "title": "助理自己动手时靠什么挡住",
+      "codex": "Codex 自己的沙箱：只看不动时只读，其余时候只能写工作目录；要越过沙箱的命令先过看看的检查。",
+      "claude_gate": "看看在 Claude Code 每次用工具前检查，按上面选的模式放行、问你或拒绝。选“只看不动”时还会另外打开 Claude Code 的系统沙箱。",
+      "claude_ro_unknown": "只看不动：看看先检查每条命令。系统沙箱开没开起来，要等助理下次启动后才知道。",
+      "claude_ro_pending": "只看不动：看看先检查每条命令。系统沙箱等这一轮做完、助理重启后打开。",
+      "claude_ro_on": "只看不动：看看先检查每条命令；Claude Code 的系统沙箱另外在系统层面挡住工作目录以外的写入。",
+      "claude_ro_off": "只看不动：系统沙箱没开起来（{{reason}}），现在只靠看看检查命令。装上缺的工具后点上面的“重启”。",
+      "unknown_reason": "原因不明"
+    }
   },
   "chat_link": {
     "system": "在系统浏览器打开",

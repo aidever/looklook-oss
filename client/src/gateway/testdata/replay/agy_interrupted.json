@@ -1,0 +1,106 @@
+{
+ "about": "派出去的 Antigravity 会话被用户按了停止：大脑收到一次 turn_end（interrupted），之后不再盯",
+ "engine": "agy",
+ "frames": [
+  {
+   "t": 1000,
+   "brief": {
+    "phase": "running",
+    "board": "working",
+    "since": 1000,
+    "active_at": 1000,
+    "attn": null,
+    "turn": {
+     "started_at": 1000
+    }
+   }
+  },
+  {
+   "t": 20000,
+   "brief": {
+    "phase": "idle",
+    "board": "idle",
+    "since": 20000,
+    "active_at": 20000,
+    "attn": null,
+    "turn": {
+     "started_at": 1000,
+     "ended_at": 20000,
+     "outcome": "interrupted",
+     "error": null
+    }
+   }
+  },
+  {
+   "t": 24000,
+   "brief": {
+    "phase": "idle",
+    "board": "idle",
+    "since": 20000,
+    "active_at": 20000,
+    "attn": null,
+    "turn": {
+     "started_at": 1000,
+     "ended_at": 20000,
+     "outcome": "interrupted",
+     "error": null
+    }
+   }
+  },
+  {
+   "t": 30000,
+   "brief": {
+    "phase": "running",
+    "board": "working",
+    "since": 30000,
+    "active_at": 30000,
+    "attn": null,
+    "turn": {
+     "started_at": 30000
+    }
+   }
+  },
+  {
+   "t": 40000,
+   "brief": {
+    "phase": "idle",
+    "board": "ended",
+    "since": 40000,
+    "active_at": 40000,
+    "attn": null,
+    "turn": {
+     "started_at": 30000,
+     "ended_at": 40000,
+     "outcome": "done",
+     "error": null
+    }
+   }
+  },
+  {
+   "t": 45000,
+   "brief": {
+    "phase": "idle",
+    "board": "ended",
+    "since": 40000,
+    "active_at": 40000,
+    "attn": null,
+    "turn": {
+     "started_at": 30000,
+     "ended_at": 40000,
+     "outcome": "done",
+     "error": null
+    }
+   }
+  }
+ ],
+ "reply": "",
+ "expect": [
+  {
+   "type": "turn_end",
+   "attrs": "outcome=\"interrupted\"",
+   "has": [
+    "被打断"
+   ]
+  }
+ ]
+}

@@ -165,6 +165,83 @@ function ToolsCard({ version }) {
   );
 }
 
+// 对话模式、助理、后台小任务起的 `claude -p` 报给 Anthropic 的入口名（默认 sdk-cli，打开报 looklook；src/chat/claude_sdk.rs identity_env）。
+// 只摆事实：社区实测、官方说法、打开前要知道的，链接都给原文，不替用户下结论（docs/CLAUDE_SDK.md「入口名」）
+const EP_LINKS = {
+  issue: 'https://github.com/anthropics/claude-code/issues/97074',
+  t3issue: 'https://github.com/pingdotgg/t3code/issues/24649',
+  t3pr: 'https://github.com/pingdotgg/t3code/pull/28410',
+  help: 'https://support.claude.com/en/articles/15036540',
+  legal: 'https://code.claude.com/docs/en/legal-and-compliance',
+};
+
+function Ext({ href, children }) {
+  return (
+    <a href={href} target="_blank" rel="noreferrer">
+      {children}
+    </a>
+  );
+}
+
+function ClaudeEntrypointCard() {
+  const { t } = useTranslation();
+  const toast = useToast();
+  const [s, error, reload] = useLoad(() => api.get('/settings'), []);
+  const [busy, setBusy] = useState(false);
+  if (error) return <ErrorNote error={error} />;
+  if (!s) return <Skeleton height={80} />;
+  const set = async (on) => {
+    setBusy(true);
+    try {
+      await api.put('/settings', { claude_entrypoint: on });
+      reload();
+    } catch (e) {
+      toast(errorText(t, e), 'error');
+    } finally {
+      setBusy(false);
+    }
+  };
+  const item = (key, link, label) => (
+    <li>
+      <Ext href={EP_LINKS[link]}>{label}</Ext>
+      {t('ai.ep.colon')}
+      {t(`ai.ep.${key}`)}
+    </li>
+  );
+  return (
+    <Card id="claude-entrypoint" title={t('ai.ep.title')}>
+      <Row label={t('ai.ep.switch')} hint={t('ai.ep.hint')}>
+        <Switch checked={Boolean(s.claude_entrypoint)} disabled={busy} label={t('ai.ep.switch')} onChange={set} />
+      </Row>
+      <More summary={t('ai.ep.why')}>
+        <div className="ep-notes small">
+          <p>{t('ai.ep.what')}</p>
+          <h4>{t('ai.ep.reports')}</h4>
+          <ul>
+            {item('r_issue', 'issue', 'anthropics/claude-code#97074')}
+            {item('r_t3issue', 't3issue', 'pingdotgg/t3code#24649')}
+            {item('r_t3pr', 't3pr', 'pingdotgg/t3code#28410')}
+          </ul>
+          <h4>{t('ai.ep.official')}</h4>
+          <ul>
+            <li>{t('ai.ep.o_none')}</li>
+            {item('o_help', 'help', t('ai.ep.help_title'))}
+            {item('o_legal', 'legal', t('ai.ep.legal_title'))}
+          </ul>
+          <h4>{t('ai.ep.know')}</h4>
+          <ul>
+            <li>{t('ai.ep.k_honest')}</li>
+            <li>{t('ai.ep.k_nopromise')}</li>
+            <li>{t('ai.ep.k_behavior')}</li>
+            <li>{t('ai.ep.k_scope')}</li>
+          </ul>
+          <p className="muted">{t('ai.ep.checked')}</p>
+        </div>
+      </More>
+    </Card>
+  );
+}
+
 const HUB = [
   { id: 'accounts', icon: UserCog },
   { id: 'remote', icon: Bell },
@@ -182,6 +259,7 @@ const HUB_ALIAS = {
   usage: 'accounts',
   updates: 'accounts',
   'agent-updates': 'accounts',
+  'claude-entrypoint': 'accounts',
   notify: 'remote',
   feishu: 'remote',
   mcp: 'tools',
@@ -249,7 +327,7 @@ export default function AiPage() {
   const go = (id) => navigate(`/ai#${id}`, { replace: true });
   // 从设置 → 关于的“AI 工具的更新”过来：滚到版本卡片
   useEffect(() => {
-    const target = hash === '#updates' || hash === '#agent-updates' ? 'agent-updates' : hash === '#guard' ? 'guard' : null;
+    const target = hash === '#updates' || hash === '#agent-updates' ? 'agent-updates' : hash === '#guard' ? 'guard' : hash === '#claude-entrypoint' ? 'claude-entrypoint' : null;
     if (target) setTimeout(() => document.getElementById(target)?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 50);
   }, [hash]);
   return (
@@ -290,6 +368,7 @@ export default function AiPage() {
         <>
           <AgentUpdatesCard />
           <ClaudeProfilesCard />
+          <ClaudeEntrypointCard />
           <CodexProfilesCard />
           <AgyProfilesCard />
           <UsageStatsCard />

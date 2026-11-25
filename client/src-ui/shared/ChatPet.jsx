@@ -5,7 +5,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { X } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
-import { api, localApi, rtcMode } from './api.js';
+import { api, localApi } from './api.js';
+import { onDeskState, onPetsVer } from './live.js';
 import { isTouch } from './KeyBar.jsx';
 import PetPlayer from './pet/PetPlayer.jsx';
 import { agentState, textOf } from './pet/brain.js';
@@ -30,32 +31,23 @@ function readHidden() {
 }
 
 // 宠物相关的东西变了（设置、装 / 删、生成了台词，可能是在别的标签页、桌面宠物窗口、远程打开的页面里改的）：
-// 客户端有个版本号，长轮询它，变了就发 PETS_CHANGED，各处重新取。整页共用一个轮询。
-const live = { n: 0, ver: null, run: false };
-function liveLoop() {
-  if (!live.n) {
-    live.run = false;
-    return;
-  }
-  (rtcMode ? api : localApi).get(`/pets/version${live.ver == null ? '' : `?since=${live.ver}`}`).then(
-    (r) => {
-      if (live.ver != null && r?.ver !== live.ver) window.dispatchEvent(new Event(PETS_CHANGED));
-      live.ver = r?.ver ?? live.ver;
-      setTimeout(liveLoop, 200);
-    },
-    // 连不上（客户端旧、断网）：过一会儿再试
-    () => setTimeout(liveLoop, 10000),
-  );
-}
+// 客户端有个版本号，变了就发 PETS_CHANGED，各处重新取。整页共用一个订阅（shared/live.js：本机走 WebSocket，远程长轮询）。
+const live = { n: 0, ver: null, off: null };
 export function usePetsLive() {
   useEffect(() => {
     live.n += 1;
-    if (!live.run) {
-      live.run = true;
-      liveLoop();
+    if (!live.off) {
+      live.off = onPetsVer((ver) => {
+        if (live.ver != null && ver !== live.ver) window.dispatchEvent(new Event(PETS_CHANGED));
+        live.ver = ver;
+      });
     }
     return () => {
       live.n -= 1;
+      if (!live.n && live.off) {
+        live.off();
+        live.off = null;
+      }
     };
   }, []);
 }
@@ -105,33 +97,27 @@ export function useDeskNotify(open) {
         },
         () => {},
       );
-    const loop = async () => {
-      while (!dead) {
-        try {
-          const r = await localApi.get(`/desktop/pet${st?.seq != null ? `?since=${st.seq}` : ''}`);
-          if (dead) return;
-          st = r;
-          apply();
-          const o = r?.open;
-          if (o?.seq != null && o.seq !== seen) {
-            // 刚开起来时只认最近几秒的（点了气泡、主窗口是那时才开的）
-            if (seen != null || Date.now() - (o.at ?? 0) < 10000) {
-              // 桌面宠物右键菜单里点了“宠物设置”
-              if (o.kind === 'settings') window.dispatchEvent(new CustomEvent('ll-menu', { detail: 'pet_settings' }));
-              else openRef.current?.(o.id);
-            }
-            seen = o.seq;
-          } else if (seen == null) seen = o?.seq ?? 0;
-        } catch {
-          await new Promise((ok) => setTimeout(ok, 10000));
+    const onState = (r) => {
+      if (dead) return;
+      st = r;
+      apply();
+      const o = r?.open;
+      if (o?.seq != null && o.seq !== seen) {
+        // 刚开起来时只认最近几秒的（点了气泡、主窗口是那时才开的）
+        if (seen != null || Date.now() - (o.at ?? 0) < 10000) {
+          // 桌面宠物右键菜单里点了“宠物设置”
+          if (o.kind === 'settings') window.dispatchEvent(new CustomEvent('ll-menu', { detail: 'pet_settings' }));
+          else openRef.current?.(o.id);
         }
-      }
+        seen = o.seq;
+      } else if (seen == null) seen = o?.seq ?? 0;
     };
     loadCfg();
-    loop();
+    const off = onDeskState(onState);
     window.addEventListener(PETS_CHANGED, loadCfg);
     return () => {
       dead = true;
+      off();
       desk.on = false;
       window.removeEventListener(PETS_CHANGED, loadCfg);
     };

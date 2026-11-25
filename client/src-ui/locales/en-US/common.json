@@ -1795,7 +1795,31 @@
     },
     "pages_hint": "List added pages and create addresses for ports; can’t delete.",
     "hosts_manage": "Set per host on the SSH page",
-    "tool_names": "Tools the AI can call (for checking logs)"
+    "tool_names": "Tools the AI can call (for checking logs)",
+    "ep": {
+      "title": "Claude Code entrypoint",
+      "switch": "Report the entrypoint to Anthropic as looklook",
+      "hint": "Off by default, which keeps Claude Code's own sdk-cli. Only affects Claude Code started by chat mode, the assistant and background tasks; claude run directly in a terminal is unchanged. A running session picks it up the next time its Claude Code starts.",
+      "why": "Why this switch exists: community reports and what Anthropic says",
+      "colon": ": ",
+      "what": "Looklook's chat mode, assistant and background tasks (titles, pet lines, etc.) start your installed Claude Code with claude -p --input-format stream-json. Started this way, Claude Code reports the entrypoint sdk-cli on every request; run directly in a terminal it reports cli. With this switch on it reports looklook. Either way, Looklook also names itself as the client in a request header (CLAUDE_AGENT_SDK_CLIENT_APP), which does not change the entrypoint.",
+      "reports": "Community reports",
+      "r_issue": "The original report. Still open, with no reply from Anthropic. On a Max account, the same workload used about 1.8x as much of the 5-hour limit per unit of usage with sdk-cli as with cli. Several people reproduced it on Linux, macOS and Windows. One controlled test changed only the entrypoint and also saw the weekly limit drain 1.14–1.32x faster.",
+      "r_t3issue": "The author of T3 Code (a similar open-source client) measured on one Max account that the Agent SDK and claude -p used about 1.6–1.7x as much of the 5-hour limit per unit of usage as the terminal. No difference was seen in the weekly limit at the time.",
+      "r_t3pr": "T3 Code changed its entrypoint to its own name, t3-code. After the merge, a user retested on a Pro account and found the difference from the terminal within measurement error (the limit only shows whole percents, about ±20%).",
+      "official": "What Anthropic says",
+      "o_none": "Anthropic has not said publicly whether different entrypoints are metered differently, and has not commented on the reports above.",
+      "help_title": "Help article \"Use the Claude Agent SDK with your Claude plan\"",
+      "o_help": "When signed in with a plan, the Agent SDK and claude -p draw from the plan's limits. It does not mention a different rate from the terminal.",
+      "legal_title": "Claude Code legal and compliance page",
+      "o_legal": "Plan limits \"assume ordinary, individual usage\". Anthropic reserves the right to enforce usage restrictions, possibly without prior notice. The page does not mention entrypoints.",
+      "know": "Before turning it on",
+      "k_honest": "looklook is the real source of these requests. Looklook never reports them as the terminal's cli.",
+      "k_nopromise": "All of the above are community measurements. Saving limit is not guaranteed, and Anthropic can change its metering at any time.",
+      "k_behavior": "Claude Code has a few behaviors that depend on sdk-cli (for example its built-in subagent list). If chat behaves oddly after turning this on, turn it off to restore it.",
+      "k_scope": "Applies to this computer only and is not synced. Accounts on third-party APIs (API keys, proxies) are not metered against plan limits, so the switch makes no difference there.",
+      "checked": "Compiled on November 25, 2026. The linked originals are authoritative."
+    }
   },
   "select": {
     "toggle": "Select text",
@@ -4438,6 +4462,7 @@
     "ceiling_switched": "Sessions it starts now go up to “{{name}}” (from the next one)",
     "level_label": "This session’s permissions",
     "level_switched": "This session is now “{{name}}”",
+    "mode_hint_agy_auto": "Antigravity decides itself which actions to ask about",
     "level_switched_next": "This session is now “{{name}}” (from its next turn)",
     "level": {
       "read_only": "Read only",
@@ -4647,7 +4672,17 @@
     "defaults_model_none": "Follow config",
     "defaults_model_none_hint": "The tool's own configured default model",
     "defaults_saved": "{{engine}} default set to “{{name}}”, from the next dispatch",
-    "mode_workspaceWrite": "Workspace write"
+    "mode_workspaceWrite": "Workspace write",
+    "protect": {
+      "title": "What stops the assistant when it acts itself",
+      "codex": "Codex's own sandbox: read-only in Read only mode, otherwise writes only to the working directory. Commands that need to leave the sandbox go through Looklook's check first.",
+      "claude_gate": "Looklook checks every tool use by Claude Code and allows it, asks you or refuses, based on the mode above. In Read only mode, Claude Code's system sandbox is also turned on.",
+      "claude_ro_unknown": "Read only: Looklook checks every command. Whether the system sandbox is running is known after the assistant next starts.",
+      "claude_ro_pending": "Read only: Looklook checks every command. The system sandbox turns on after this turn finishes and the assistant restarts.",
+      "claude_ro_on": "Read only: Looklook checks every command, and Claude Code's system sandbox also blocks writes outside the working directory at the OS level.",
+      "claude_ro_off": "Read only: the system sandbox did not start ({{reason}}), so only Looklook's check applies. Install the missing tools, then press Restart above.",
+      "unknown_reason": "reason unknown"
+    }
   },
   "chat_link": {
     "system": "Open in system browser",

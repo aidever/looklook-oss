@@ -119,6 +119,8 @@ pub struct SdkSt {
     /// 最近一轮 `result` 的 `modelUsage` 里 Claude Code 自己认的各模型上下文窗口（模型 → token 数）：
     /// 第三方接口没有账号的模型目录，看看自己推算不出来，以它为准
     pub(super) windows: HashMap<String, u64>,
+    /// 这个进程起的时候带了系统沙箱设置（助理只读时，见 `assistant::claude_sandbox`）：助理换了模式、和现在要的不一样时要重起
+    pub(super) sandboxed: bool,
 }
 
 /// 用户登录 shell 里的这些变量不带给 claude：这个 shell 自己的（目录、层数、终端）、看看的终端标识、
@@ -235,7 +237,14 @@ impl Chat {
             args.push(if opts.full_access { "--dangerously-skip-permissions" } else { "--allow-dangerously-skip-permissions" }.into());
         }
         let flag_env = crate::claude_profiles::settings_env(&self.paths.home, &profile);
-        if let Ok(p) = super::hooks::ensure_terminal_settings(&self.paths, flag_env.as_ref().map(|e| (profile.id.as_str(), e))) {
+        let flag_env = flag_env.as_ref().map(|e| (profile.id.as_str(), e));
+        // 大脑、跑腿只读时：打开 Claude Code 自己的系统沙箱（assistant::claude_sandbox）。改了助理的模式要重起才换（Chat::assistant_mode_changed）
+        let sandbox = if gated { crate::assistant::claude_sandbox(&self.paths, self.assistant_mode(id)) } else { None };
+        let settings = match &sandbox {
+            Some(sb) => super::hooks::ensure_sandboxed_settings(&self.paths, flag_env, sb),
+            None => super::hooks::ensure_terminal_settings(&self.paths, flag_env),
+        };
+        if let Ok(p) = settings {
             args.extend(["--settings".into(), p.display().to_string()]);
         }
         let (resume, resume_at, first, model, effort, mode, transcript) = {
@@ -283,6 +292,7 @@ impl Chat {
             args.extend(["--add-dir".into(), attach.display().to_string()]);
         }
         let mut env = sdk_env(&shell, super::codex_app::user_env(&shell).await.unwrap_or_default());
+        env.extend(claude_sdk::identity_env(&self.store));
         // root 下 claude 不肯带全部权限运行，要说明是在沙箱里（和终端里的启动命令一样）
         if crate::platform::is_root() {
             env.push(("IS_SANDBOX".to_string(), "1".to_string()));
@@ -320,6 +330,7 @@ impl Chat {
                 st.mode = Some(m.to_string());
             }
             st.sdk.fast_on = matches!(init["fast_mode_state"].as_str(), Some("on" | "cooldown"));
+            st.sdk.sandboxed = sandbox.is_some();
             st.sdk.proc = Some(proc.clone());
             st.sdk.idle_since = Some(Instant::now());
             st.error = None;
@@ -381,6 +392,7 @@ impl Chat {
             cmd.env("PATH", p);
         }
         cmd.env_remove(super::hooks::INSTANCE_ENV).env_remove("TMUX").env_remove("TMUX_PANE");
+        claude_sdk::apply_identity(&mut cmd, &self.store);
         if let Some(e) = &profile_env {
             e.apply(&mut cmd);
         }
@@ -881,6 +893,39 @@ impl Chat {
             "clear_auth" => proc.request("mcp_clear_auth", json!({ "serverName": name })).await?,
             _ => return Err(LocalError::invalid("op", "invalid")),
         })
+    }
+
+    /// 只记进对话、不让 claude 回答（`shouldQuery: false`）：下一轮带着它一起发给模型。没开过的会话也行（照样有 init、写记录，
+    /// result 的 num_turns 是 0，不算一轮）
+    pub(super) async fn sdk_inject(self: &Arc<Self>, id: &str, text: &str) -> Result<bool, LocalError> {
+        let inst = self.inst(id);
+        let proc = self.sdk_attach(id).await?;
+        proc.send_append(json!(text)).await?;
+        // 记录文件是 claude 收到以后才写的：过一会儿再读
+        let me = self.clone();
+        tokio::spawn(async move {
+            for ms in [300, 1200] {
+                tokio::time::sleep(Duration::from_millis(ms)).await;
+                me.poll(&inst).await;
+            }
+        });
+        Ok(true)
+    }
+
+    /// 系统沙箱现在的情况（不起进程：没在跑时返回 None）。`active`：真的开起来了（平台支持、依赖齐全）
+    pub(super) async fn sdk_sandbox(&self, id: &str) -> Option<Value> {
+        let inst = self.inst(id);
+        let (proc, sandboxed) = {
+            let st = lock(&inst.st);
+            (st.sdk.proc.clone().filter(|p| p.alive())?, st.sdk.sandboxed)
+        };
+        if !sandboxed {
+            return Some(json!({ "requested": false }));
+        }
+        // `enabled` 是实际有没有开起来（设置里开了是 `enabled_in_settings`）；没开起来时 `unavailable_reason` 是 Claude Code 的原话
+        let r = proc.request_within("get_sandbox_dialog", json!({}), Duration::from_secs(10)).await.ok()?;
+        let reason = r["unavailable_reason"].as_str().map(|s| s.chars().take(300).collect::<String>());
+        Some(json!({ "requested": true, "active": r["enabled"] == true, "reason": reason }))
     }
 
     pub(super) async fn sdk_btw(self: &Arc<Self>, id: &str, question: &str) -> Result<Value, LocalError> {

@@ -1,0 +1,331 @@
+{
+ "about": "派出去的 Codex 会话：接口一直 503，重连 5 次后这一轮失败。大脑要收到一次 turn_end（failed，带原因），之后接着盯（可能自动接着跑）",
+ "recorded": "codex-cli 0.172.0 app-server，2026-11-25 真录；去掉了和这件事无关的通知（MCP 启动、远程控制），地址、请求号换成占位",
+ "thread": {
+  "id": "01a213e2-bda5-78a0-a332-22f058820434",
+  "cwd": "/w/app"
+ },
+ "notes": [
+  [
+   "thread/status/changed",
+   {
+    "threadId": "01a213e2-bda5-78a0-a332-22f058820434",
+    "status": {
+     "type": "active",
+     "activeFlags": []
+    }
+   }
+  ],
+  [
+   "turn/started",
+   {
+    "threadId": "01a213e2-bda5-78a0-a332-22f058820434",
+    "turn": {
+     "id": "01a213e2-bed7-7821-9e31-83b73136f68d",
+     "rootTurnId": "01a213e2-bed7-7821-9e31-83b73136f68d",
+     "items": [],
+     "itemsView": "notLoaded",
+     "status": "inProgress",
+     "error": null,
+     "startedAt": 1795629956,
+     "completedAt": null,
+     "durationMs": null
+    }
+   }
+  ],
+  [
+   "item/started",
+   {
+    "item": {
+     "type": "userMessage",
+     "id": "01a213e2-ca0e-7150-b48a-2a505524ea55",
+     "clientId": null,
+     "content": [
+      {
+       "type": "text",
+       "text": "只回一句：查完了，登录页的问题在 src/login.js 第 12 行少了 await。不要运行任何命令。",
+       "text_elements": []
+      }
+     ],
+     "startedAtMs": 1795629959695,
+     "completedAtMs": null
+    },
+    "threadId": "01a213e2-bda5-78a0-a332-22f058820434",
+    "turnId": "01a213e2-bed7-7821-9e31-83b73136f68d",
+    "startedAtMs": 1795629959695
+   }
+  ],
+  [
+   "item/completed",
+   {
+    "item": {
+     "type": "userMessage",
+     "id": "01a213e2-ca0e-7150-b48a-2a505524ea55",
+     "clientId": null,
+     "content": [
+      {
+       "type": "text",
+       "text": "只回一句：查完了，登录页的问题在 src/login.js 第 12 行少了 await。不要运行任何命令。",
+       "text_elements": []
+      }
+     ],
+     "startedAtMs": 1795629959695,
+     "completedAtMs": 1795629959695
+    },
+    "threadId": "01a213e2-bda5-78a0-a332-22f058820434",
+    "turnId": "01a213e2-bed7-7821-9e31-83b73136f68d",
+    "contentTokenCount": null,
+    "completedAtMs": 1795629959695
+   }
+  ],
+  [
+   "error",
+   {
+    "error": {
+     "message": "Reconnecting... 1/5",
+     "codexErrorInfo": {
+      "responseStreamDisconnected": {
+       "httpStatusCode": 503
+      }
+     },
+     "additionalDetails": "unexpected status 503 Service Unavailable: Service temporarily unavailable, url: https://api.example.com/v1/responses, cf-ray: 0000000000000000-XXX, request id: 00000000-0000-0000-0000-000000000000",
+     "misalignment": null
+    },
+    "willRetry": true,
+    "threadId": "01a213e2-bda5-78a0-a332-22f058820434",
+    "turnId": "01a213e2-bed7-7821-9e31-83b73136f68d"
+   }
+  ],
+  [
+   "error",
+   {
+    "error": {
+     "message": "Reconnecting... 2/5",
+     "codexErrorInfo": {
+      "responseStreamDisconnected": {
+       "httpStatusCode": 503
+      }
+     },
+     "additionalDetails": "unexpected status 503 Service Unavailable: Service temporarily unavailable, url: https://api.example.com/v1/responses, cf-ray: 0000000000000000-XXX, request id: 00000000-0000-0000-0000-000000000000",
+     "misalignment": null
+    },
+    "willRetry": true,
+    "threadId": "01a213e2-bda5-78a0-a332-22f058820434",
+    "turnId": "01a213e2-bed7-7821-9e31-83b73136f68d"
+   }
+  ],
+  [
+   "error",
+   {
+    "error": {
+     "message": "Reconnecting... 3/5",
+     "codexErrorInfo": {
+      "responseStreamDisconnected": {
+       "httpStatusCode": 503
+      }
+     },
+     "additionalDetails": "unexpected status 503 Service Unavailable: Service temporarily unavailable, url: https://api.example.com/v1/responses, cf-ray: 0000000000000000-XXX, request id: 00000000-0000-0000-0000-000000000000",
+     "misalignment": null
+    },
+    "willRetry": true,
+    "threadId": "01a213e2-bda5-78a0-a332-22f058820434",
+    "turnId": "01a213e2-bed7-7821-9e31-83b73136f68d"
+   }
+  ],
+  [
+   "error",
+   {
+    "error": {
+     "message": "Reconnecting... 4/5",
+     "codexErrorInfo": {
+      "responseStreamDisconnected": {
+       "httpStatusCode": 503
+      }
+     },
+     "additionalDetails": "unexpected status 503 Service Unavailable: Service temporarily unavailable, url: https://api.example.com/v1/responses, cf-ray: 0000000000000000-XXX, request id: 00000000-0000-0000-0000-000000000000",
+     "misalignment": null
+    },
+    "willRetry": true,
+    "threadId": "01a213e2-bda5-78a0-a332-22f058820434",
+    "turnId": "01a213e2-bed7-7821-9e31-83b73136f68d"
+   }
+  ],
+  [
+   "error",
+   {
+    "error": {
+     "message": "Reconnecting... 5/5",
+     "codexErrorInfo": {
+      "responseStreamDisconnected": {
+       "httpStatusCode": 503
+      }
+     },
+     "additionalDetails": "unexpected status 503 Service Unavailable: Service temporarily unavailable, url: https://api.example.com/v1/responses, cf-ray: 0000000000000000-XXX, request id: 00000000-0000-0000-0000-000000000000",
+     "misalignment": null
+    },
+    "willRetry": true,
+    "threadId": "01a213e2-bda5-78a0-a332-22f058820434",
+    "turnId": "01a213e2-bed7-7821-9e31-83b73136f68d"
+   }
+  ],
+  [
+   "thread/status/changed",
+   {
+    "threadId": "01a213e2-bda5-78a0-a332-22f058820434",
+    "status": {
+     "type": "systemError"
+    }
+   }
+  ],
+  [
+   "error",
+   {
+    "error": {
+     "message": "unexpected status 503 Service Unavailable: Service temporarily unavailable, url: https://api.example.com/v1/responses, cf-ray: 0000000000000000-XXX, request id: 00000000-0000-0000-0000-000000000000",
+     "codexErrorInfo": {
+      "httpConnectionFailed": {
+       "httpStatusCode": 503
+      }
+     },
+     "additionalDetails": null,
+     "misalignment": null
+    },
+    "willRetry": false,
+    "threadId": "01a213e2-bda5-78a0-a332-22f058820434",
+    "turnId": "01a213e2-bed7-7821-9e31-83b73136f68d"
+   }
+  ],
+  [
+   "thread/readState/changed",
+   {
+    "threadId": "01a213e2-bda5-78a0-a332-22f058820434",
+    "readState": {
+     "firstUnread": {
+      "type": "turn",
+      "turnId": "01a213e2-bed7-7821-9e31-83b73136f68d"
+     },
+     "revision": "589a7588-62a7-47c0-a560-b9e1d6fc3138"
+    }
+   }
+  ],
+  [
+   "turn/completed",
+   {
+    "threadId": "01a213e2-bda5-78a0-a332-22f058820434",
+    "turn": {
+     "id": "01a213e2-bed7-7821-9e31-83b73136f68d",
+     "rootTurnId": "01a213e2-bed7-7821-9e31-83b73136f68d",
+     "items": [],
+     "itemsView": "notLoaded",
+     "status": "failed",
+     "error": {
+      "message": "unexpected status 503 Service Unavailable: Service temporarily unavailable, url: https://api.example.com/v1/responses, cf-ray: 0000000000000000-XXX, request id: 00000000-0000-0000-0000-000000000000",
+      "codexErrorInfo": {
+       "httpConnectionFailed": {
+        "httpStatusCode": 503
+       }
+      },
+      "additionalDetails": null,
+      "misalignment": null
+     },
+     "startedAt": 1795629956,
+     "completedAt": 1795630005,
+     "durationMs": 49061
+    }
+   }
+  ]
+ ],
+ "rollout": [
+  {
+   "timestamp": "2026-11-25T18:05:56.883Z",
+   "ordinal": 1,
+   "type": "event_msg",
+   "payload": {
+    "type": "task_started",
+    "turn_attribution": {
+     "turn_id": "01a213e2-bed7-7821-9e31-83b73136f68d",
+     "turn_trigger": null,
+     "parent_turn_id": null,
+     "initiating_agent_path": null,
+     "root_turn_id": "01a213e2-bed7-7821-9e31-83b73136f68d"
+    },
+    "turn_id": "01a213e2-bed7-7821-9e31-83b73136f68d",
+    "root_turn_id": "01a213e2-bed7-7821-9e31-83b73136f68d",
+    "started_at": 1795629956,
+    "model_context_window": 475000,
+    "collaboration_mode_kind": "default"
+   }
+  },
+  {
+   "timestamp": "2026-11-25T18:05:59.694Z",
+   "ordinal": 11,
+   "type": "response_item",
+   "payload": {
+    "type": "message",
+    "id": "msg_01a213e2-ca0e-7150-b48a-2a6a92badab3",
+    "role": "user",
+    "content": [
+     {
+      "type": "input_text",
+      "text": "只回一句：查完了，登录页的问题在 src/login.js 第 12 行少了 await。不要运行任何命令。"
+     }
+    ]
+   }
+  },
+  {
+   "timestamp": "2026-11-25T18:05:59.695Z",
+   "ordinal": 12,
+   "type": "event_msg",
+   "payload": {
+    "type": "item_completed",
+    "thread_id": "01a213e2-bda5-78a0-a332-22f058820434",
+    "turn_id": "01a213e2-bed7-7821-9e31-83b73136f68d",
+    "item": {
+     "type": "UserMessage",
+     "id": "01a213e2-ca0e-7150-b48a-2a505524ea55",
+     "content": [
+      {
+       "type": "text",
+       "text": "只回一句：查完了，登录页的问题在 src/login.js 第 12 行少了 await。不要运行任何命令。",
+       "text_elements": []
+      }
+     ]
+    },
+    "started_at_ms": 1795629959695,
+    "completed_at_ms": 1795629959695
+   }
+  },
+  {
+   "timestamp": "2026-11-25T18:06:45.903Z",
+   "ordinal": 13,
+   "type": "event_msg",
+   "payload": {
+    "type": "task_complete",
+    "root_turn_id": "01a213e2-bed7-7821-9e31-83b73136f68d",
+    "turn_id": "01a213e2-bed7-7821-9e31-83b73136f68d",
+    "last_agent_message": null,
+    "error": {
+     "message": "unexpected status 503 Service Unavailable: Service temporarily unavailable, url: https://api.example.com/v1/responses, cf-ray: 0000000000000000-XXX, request id: 00000000-0000-0000-0000-000000000000",
+     "codex_error_info": {
+      "http_connection_failed": {
+       "http_status_code": 503
+      }
+     }
+    },
+    "started_at": 1795629956,
+    "completed_at": 1795630005,
+    "duration_ms": 49061
+   }
+  }
+ ],
+ "expect": [
+  {
+   "type": "turn_end",
+   "attrs": "outcome=\"failed\"",
+   "has": [
+    "这一轮出错了",
+    "503"
+   ]
+  }
+ ]
+}

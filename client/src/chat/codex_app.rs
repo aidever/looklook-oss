@@ -13,7 +13,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -32,19 +32,20 @@ const START_WAIT: Duration = Duration::from_secs(20);
 /// app-server 主动发来的
 #[derive(Debug)]
 pub enum Incoming {
-    Notification { method: String, params: Value },
+    Notification { seq: u64, method: String, params: Value },
     /// 要看看答复的请求（审批、提问）：答复用 [`AppServer::respond`]
     Request { id: Value, method: String, params: Value },
     /// 连接断了
     Closed,
 }
 
-type Waiter = oneshot::Sender<Result<Value, Value>>;
+type Waiter = oneshot::Sender<(u64, Result<Value, Value>)>;
 
 pub struct AppServer {
     out: mpsc::UnboundedSender<Message>,
     waiting: Mutex<HashMap<i64, Waiter>>,
     next: AtomicI64,
+    rx_seq: AtomicU64,
     alive: AtomicBool,
     /// 起这个进程时的配置（程序、第三方服务商）；变了要换新进程
     pub signature: String,
@@ -263,7 +264,7 @@ impl AppServer {
             }
             let _ = sink.close().await;
         });
-        let me = Arc::new(Self { out, waiting: Mutex::new(HashMap::new()), next: AtomicI64::new(1), alive: AtomicBool::new(true), signature, pid, state_file });
+        let me = Arc::new(Self { out, waiting: Mutex::new(HashMap::new()), next: AtomicI64::new(1), rx_seq: AtomicU64::new(0), alive: AtomicBool::new(true), signature, pid, state_file });
         let reader = me.clone();
         tokio::spawn(async move {
             while let Some(Ok(m)) = stream.next().await {
@@ -276,8 +277,9 @@ impl AppServer {
                 reader.dispatch(msg, &tx);
             }
             reader.alive.store(false, Ordering::SeqCst);
+            let seq = reader.rx_seq.fetch_add(1, Ordering::SeqCst) + 1;
             for (_, w) in lock(&reader.waiting).drain() {
-                let _ = w.send(Err(json!({ "message": "app-server connection closed" })));
+                let _ = w.send((seq, Err(json!({ "message": "app-server connection closed" }))));
             }
             let _ = tx.send(Incoming::Closed);
         });
@@ -285,6 +287,7 @@ impl AppServer {
     }
 
     fn dispatch(&self, msg: Value, tx: &mpsc::UnboundedSender<Incoming>) {
+        let seq = self.rx_seq.fetch_add(1, Ordering::SeqCst) + 1;
         let method = msg["method"].as_str().map(String::from);
         match (msg.get("id"), method) {
             (Some(id), None) => {
@@ -294,14 +297,14 @@ impl AppServer {
                         Some(e) => Err(e.clone()),
                         None => Ok(msg.get("result").cloned().unwrap_or(Value::Null)),
                     };
-                    let _ = w.send(r);
+                    let _ = w.send((seq, r));
                 }
             }
             (Some(id), Some(method)) => {
                 let _ = tx.send(Incoming::Request { id: id.clone(), method, params: msg["params"].clone() });
             }
             (None, Some(method)) => {
-                let _ = tx.send(Incoming::Notification { method, params: msg["params"].clone() });
+                let _ = tx.send(Incoming::Notification { seq, method, params: msg["params"].clone() });
             }
             (None, None) => {}
         }
@@ -315,8 +318,8 @@ impl AppServer {
         self.out.send(Message::text(msg.to_string())).map_err(|_| LocalError::new("CODEX_APP_SERVER").with("detail", "closed"))
     }
 
-    /// 发请求、等答复。app-server 答错误时返回 `CODEX_REQUEST_FAILED`（带上它的 message）。
-    pub async fn call(&self, method: &str, params: Value) -> Result<Value, LocalError> {
+    /// 发请求、等答复，一并返回该答复在 WebSocket 上的帧序号（用来和排队中的通知比先后）。
+    pub async fn call_seq(&self, method: &str, params: Value) -> Result<(u64, Value), LocalError> {
         if !self.alive() {
             return Err(LocalError::new("CODEX_APP_SERVER").with("detail", "not running"));
         }
@@ -328,8 +331,8 @@ impl AppServer {
             return Err(e);
         }
         match tokio::time::timeout(CALL_TIMEOUT, rx).await {
-            Ok(Ok(Ok(v))) => Ok(v),
-            Ok(Ok(Err(e))) => {
+            Ok(Ok((seq, Ok(v)))) => Ok((seq, v)),
+            Ok(Ok((_, Err(e)))) => {
                 let msg = e["message"].as_str().unwrap_or("").chars().take(500).collect::<String>();
                 tracing::debug!(method, error = %e, "app-server 请求失败");
                 Err(LocalError::new("CODEX_REQUEST_FAILED").with("detail", msg))
@@ -340,6 +343,11 @@ impl AppServer {
                 Err(LocalError::new("CODEX_APP_SERVER").with("detail", format!("{method} timeout")))
             }
         }
+    }
+
+    /// 发请求、等答复。app-server 答错误时返回 `CODEX_REQUEST_FAILED`（带上它的 message）。
+    pub async fn call(&self, method: &str, params: Value) -> Result<Value, LocalError> {
+        self.call_seq(method, params).await.map(|(_, v)| v)
     }
 
     pub async fn notify(&self, method: &str, params: Value) -> Result<(), LocalError> {

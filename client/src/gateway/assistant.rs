@@ -41,7 +41,6 @@ const REPLY_MAX: usize = 1500;
 /// 一轮结束后等多久再去读最后一段（等记录写完）
 const SETTLE: Duration = Duration::from_secs(3);
 const TICK: Duration = Duration::from_secs(2);
-const ENGINES: &[&str] = &["claude", "codex"];
 const QUEUE_KEY: &str = "assistant.queue";
 
 /// 排着队的新会话：`after` 那个会话这一轮做完再开
@@ -87,12 +86,12 @@ fn queue_update<T>(app: &App, f: impl FnOnce(&mut Vec<Queued>) -> T) -> T {
 
 /// 不填引擎时派给谁：用户在设置里选了、而且装着 → 它；否则装了 Claude Code 用它，再否则 Codex（不能默认派给没装的）
 async fn default_engine(app: &App) -> &'static str {
-    if let Some(e) = core::settings(&app.store).dispatch_engine {
-        if engine_installed(app, e).await {
-            return e.launch();
+    if let Some(t) = core::settings(&app.store).dispatch_engine.as_deref().and_then(core::tool) {
+        if tool_installed(app, t.launch).await {
+            return t.launch;
         }
     }
-    if engine_installed(app, core::Engine::Claude).await { "claude" } else { "codex" }
+    if tool_installed(app, "claude").await { "claude" } else { "codex" }
 }
 
 /// 这件活是从哪交代的：大脑这一轮是用户自己说话开的 → Some（在飞书哪条消息 / None = 页面上）；
@@ -138,10 +137,17 @@ pub async fn ensure_brain(app: &App, engine: core::Engine) -> R<String> {
 
 /// 这台电脑上装了这个工具没有
 async fn engine_installed(app: &App, engine: core::Engine) -> bool {
+    tool_installed(app, engine.launch()).await
+}
+
+/// 这台电脑上装了这个工具（[`core::TOOLS`] 的启动类型）没有
+async fn tool_installed(app: &App, launch: &str) -> bool {
     let shell = app.instances.shell().to_string();
-    match engine {
-        core::Engine::Claude => crate::chat::claude_sdk::program(&shell).await.is_some(),
-        core::Engine::Codex => crate::chat::codex_app::program(&shell).await.is_file(),
+    match launch {
+        "claude" => crate::chat::claude_sdk::program(&shell).await.is_some(),
+        "codex" => crate::chat::codex_app::program(&shell).await.is_file(),
+        "agy" => crate::chat::agy_acp::program(&shell).await.is_file(),
+        _ => false,
     }
 }
 
@@ -341,7 +347,7 @@ async fn sessions(app: &App, project: Option<&str>) -> Result<Vec<Value>, String
         .instances()
         .unwrap_or_default()
         .iter()
-        .filter(|r| !core::is_hidden(&app.store, &r.id) && matches!(r.launch.as_str(), "claude" | "codex"))
+        .filter(|r| !core::is_hidden(&app.store, &r.id) && core::tool(&r.launch).is_some())
         .filter(|r| dir.as_ref().is_none_or(|d| crate::history::same_dir(&r.workdir, d) || core::project_root(FsPath::new(&r.workdir)) == core::project_root(FsPath::new(d))))
         .map(|r| session_view(app, r, watches.contains_key(&r.id)))
         .collect())
@@ -350,7 +356,11 @@ async fn sessions(app: &App, project: Option<&str>) -> Result<Vec<Value>, String
 /// 这一轮里它最后说的话（从最近一条用户消息之后算起）
 async fn last_reply(app: &App, id: &str) -> String {
     let Ok(snap) = app.chat.snapshot(id).await else { return String::new() };
-    let items = snap["items"].as_array().cloned().unwrap_or_default();
+    reply_of(snap["items"].as_array().map(Vec::as_slice).unwrap_or_default())
+}
+
+/// 对话记录里最近一条用户消息之后它说的话
+fn reply_of(items: &[Value]) -> String {
     let mut texts: Vec<String> = vec![];
     for it in items.iter().rev() {
         match it["k"].as_str() {
@@ -526,12 +536,14 @@ async fn open_session(app: &App, project: &str, title: &str, engine: &str, first
         full_access: Some(pick.mode == "bypassPermissions" || pick.mode == "fullAccess"),
         claude_profile: if engine == "claude" { dispatch_account(app, engine) } else { None },
         codex_profile: if engine == "codex" { dispatch_account(app, engine) } else { None },
+        agy_profile: if engine == "agy" { dispatch_account(app, engine) } else { None },
         // 第一句话等登记好再送：起进程时要带上找助理的工具（assistant_note）；权限、模型也要先换好
         prompt: None,
         ..Default::default()
     };
     let v = super::create_session(app, input, true).await?;
-    if let Err(e) = core::add_worker(&app.paths, &app.store, &v.row.id, app.ui_addr) {
+    let worker_tools = core::tool(engine).is_some_and(|t| t.worker_tools);
+    if let Err(e) = worker_tools.then(|| core::add_worker(&app.paths, &app.store, &v.row.id, app.ui_addr)).transpose() {
         tracing::warn!(error = %e, "助理：没能给新会话写好找助理的工具");
     }
     if let Err(e) = app.chat.apply_mode(&v.row.id, &pick.mode).await {
@@ -558,8 +570,13 @@ async fn session_start(app: &App, a: &Value) -> Result<Value, String> {
     let project = resolve_project(app, &s("project")).await?;
     let engine = match s("engine").as_str() {
         "" => default_engine(app).await.to_string(),
-        e if ENGINES.contains(&e) => e.to_string(),
-        e => return Err(format!("unknown engine {e}; use one of: {}", ENGINES.join(", "))),
+        e if core::tool(e).is_some() => {
+            if !tool_installed(app, e).await {
+                return Err(format!("{e} is not installed on this computer; leave engine empty or use one of the installed tools"));
+            }
+            e.to_string()
+        }
+        e => return Err(format!("unknown engine {e}; use one of: {}", core::dispatch_tools().join(", "))),
     };
     let said = said_for_job(app, a)?;
     // 用户在不在看的是他这一轮说没说话，不看 quote 抄了多少
@@ -884,7 +901,7 @@ fn tool_defs() -> Value {
     let obj = |props: Value, required: &[&str]| json!({ "type": "object", "properties": props, "required": required, "additionalProperties": false });
     json!([
         { "name": "projects_list", "description": "The projects on this computer that Looklook knows about (folders with open sessions or past AI conversations), newest first. Each has recent conversation topics, whether it is a git repo and its remote; a folder that is not a repo lists the git repos inside it (repos_inside) — a project is often a folder holding several repos.", "inputSchema": obj(json!({}), &[]) },
-        { "name": "sessions_list", "description": "The AI coding sessions (Claude Code / Codex) currently open in Looklook, including the ones the user opened by hand. Call this before deciding between session_start and session_send. state: working | waiting_for_user | turn_finished | idle | stopped | not_started.",
+        { "name": "sessions_list", "description": "The AI coding sessions (Claude Code / Codex / Antigravity) currently open in Looklook, including the ones the user opened by hand. Call this before deciding between session_start and session_send. state: working | waiting_for_user | turn_finished | idle | stopped | not_started.",
           "inputSchema": obj(json!({ "project": { "type": "string", "description": "Only sessions in this project (name or path). Omit for all." } }), &[]) },
         { "name": "session_start", "description": "Start a NEW coding session for a piece of work. The user's own words are attached verbatim by Looklook; `brief` is only your added background. If another session is working in the same project this is queued behind it by default.",
           "inputSchema": obj(json!({
@@ -892,7 +909,7 @@ fn tool_defs() -> Value {
               "title": { "type": "string", "description": "A few words for the session list, in the user's language." },
               "brief": { "type": "string", "description": "Background the session needs for this job, as up to four parts: what is already decided / what is still open / hard constraints (including standing agreements) / when to stop and ask. No implementation plan, nothing about other jobs or how to answer on Feishu. May be empty when the user's words say it all." },
               "reason": { "type": "string", "description": "One sentence, in the user's language, shown to the user: why a new session, why here." },
-              "engine": { "type": "string", "enum": ENGINES, "description": "Only when the user named one for this job. Omitted = the tool the user picked in settings for sessions you start (Claude Code when unset and installed)." },
+              "engine": { "type": "string", "enum": core::dispatch_tools(), "description": "Only when the user named one for this job (agy = Antigravity). Omitted = the tool the user picked in settings for sessions you start (Claude Code when unset and installed). An agy session cannot call assistant_note; you hear from it when its turn ends." },
               "now": { "type": "boolean", "description": "Start right away even though another session is working in the same project. Only when the user asked for that." },
               "quote": { "type": "string", "description": "Only when the user's latest message also talks about other things: the sentences of it that are about THIS job, copied word for word (Looklook checks). Empty string = attach none of it. Omit when the whole message is about this job." },
               "permission": { "type": "string", "enum": ["read_only", "ask", "project", "full"], "description": "How much this session may do without asking. Omit unless the user said something about it for this job or the job is clearly read-only: omitted = the default permission the user set in settings (project when unset). read_only = only read and investigate (reviews, finding causes, answering questions about the code). ask = edits inside the project go ahead, every command asks the user (the user said \"ask me first\"). project = edits and commands inside the project go ahead; leaving the project, network, pushing and deploying ask. full = nothing asks; only when the user said so (\"let it do whatever it needs\"). Dangerous commands still ask at full. Above the user's limit needs the user's approval; while the user is away it never goes above project." },
@@ -1304,103 +1321,155 @@ pub async fn run(app: App) {
             // 推到飞书：这件活是在飞书哪里交代的（不是用户最近说话的那个群）
             let link = push_link(&app, w.feishu.clone());
             let kind = if core::is_errand(&app.store, &sid) { " kind=\"errand\"" } else { "" };
-            // 它在提问：告诉大脑（它可能答得上，答不上就转给用户）。审批不告诉：卡片直接给用户
-            let pending = b["attn"]["pending_id"].as_u64().filter(|_| b["attn"]["kind"] == "question");
-            if pending.is_some() && pending != w.told_pending {
-                core::watch_update(&app.store, |m| {
-                    if let Some(x) = m.get_mut(&sid) {
-                        x.told_pending = pending;
-                    }
-                });
-                let q = b["attn"]["question"].as_str().unwrap_or("").to_string();
-                let opts: Vec<&str> = b["attn"]["options"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
-                let body = format!("它在问：{q}\n选项：{}\n用户能在看看里直接回答这张卡片。只有答案就在用户交代这件活时说过的话里，你才用 session_send 替他答，并告诉他。", if opts.is_empty() { "（自己填）".to_string() } else { opts.join(" / ") });
-                tell_brain_to(&app, event("question", &sid, &title, &row.workdir, kind, &body), link.clone()).await;
-            }
-            // 审批等太久（用户没看到卡片？）、很久没动静：各叫醒大脑一次，让它提醒用户。不替用户批、不叫停
             let now = crate::util::system_ms();
-            let approval = b["attn"]["pending_id"].as_u64().filter(|_| b["attn"]["kind"] == "permission");
-            if let Some(p) = approval.filter(|p| w.nagged_pending != Some(*p) && now - b["since"].as_i64().unwrap_or(now) >= NAG_APPROVAL_MS) {
-                core::watch_update(&app.store, |m| {
-                    if let Some(x) = m.get_mut(&sid) {
-                        x.nagged_pending = Some(p);
-                    }
-                });
-                let body = format!("{}\n审批只有用户能点（看看里、飞书卡片上都能点），你不能替他批。简短提醒用户一句，说清楚是哪件活在等什么；用户说了不批或者要停，再照他说的办。", core::doing_state(&b, now));
-                tell_brain_to(&app, event("waiting_approval", &sid, &title, &row.workdir, kind, &body), link.clone()).await;
-            }
-            let active = b["active_at"].as_i64().unwrap_or(now);
-            if b["board"] == "working" && now - active >= NAG_STALL_MS && w.nagged_stall != active {
-                core::watch_update(&app.store, |m| {
-                    if let Some(x) = m.get_mut(&sid) {
-                        x.nagged_stall = active;
-                    }
-                });
-                let body = format!("{}\n可能卡住了，也可能在跑很久的命令（构建、测试、下载）。用 session_get 看一眼最后在干什么，简短告诉用户；你不能自己叫停它，用户说停才停。", core::doing_state(&b, now));
-                tell_brain_to(&app, event("stalled", &sid, &title, &row.workdir, kind, &body), link.clone()).await;
-            }
-            let ended = b["turn"]["ended_at"].as_i64().unwrap_or(0);
-            let running = matches!(b["phase"].as_str(), Some("running" | "approval"));
-            if ended <= w.told_end || running {
+            let seen = watch_seen(&w, &b, now);
+            if !seen.iter().any(|x| matches!(x, Seen::TurnEnd { .. })) {
                 settling.remove(&sid);
-                continue;
             }
-            if settling.entry(sid.clone()).or_insert_with(Instant::now).elapsed() < SETTLE {
-                continue;
-            }
-            settling.remove(&sid);
-            let outcome = b["turn"]["outcome"].as_str().unwrap_or("done");
-            // 正常做完、被打断：这件活告一段落，之后不再盯。出错的（额度用完等）接着盯：可能自动接着跑
-            let finished = outcome != "failed";
-            let now = crate::util::system_ms();
-            core::watch_update(&app.store, |m| {
-                if let Some(x) = m.get_mut(&sid) {
-                    x.told_end = ended;
-                    if finished {
-                        x.done_at = now;
+            for x in seen {
+                let Seen::TurnEnd { ended: _, outcome, error } = &x else {
+                    core::watch_update(&app.store, |m| {
+                        if let Some(v) = m.get_mut(&sid) {
+                            watch_mark(v, &x, now);
+                        }
+                    });
+                    tell_brain_to(&app, event(x.kind(), &sid, &title, &row.workdir, kind, &seen_body(&x, &b, now)), link.clone()).await;
+                    continue;
+                };
+                // 等记录写完再读最后一段
+                if settling.entry(sid.clone()).or_insert_with(Instant::now).elapsed() < SETTLE {
+                    continue;
+                }
+                settling.remove(&sid);
+                core::watch_update(&app.store, |m| {
+                    if let Some(v) = m.get_mut(&sid) {
+                        watch_mark(v, &x, now);
+                    }
+                });
+                let reply = last_reply(&app, &sid).await;
+                let mut body = turn_end_body(outcome, &reply, error.as_deref());
+                // 结果带上事实：不只靠它自己说（最后一段可能丢、可能只是描述）。跑腿只查不改，不用
+                if !core::is_errand(&app.store, &sid) {
+                    if let Some((facts, head)) = git_facts(&row.workdir, &w.head).await {
+                        body.push_str("\n\n");
+                        body.push_str(&facts);
+                        core::watch_update(&app.store, |m| {
+                            if let Some(v) = m.get_mut(&sid) {
+                                v.head = head;
+                            }
+                        });
                     }
                 }
-            });
-            let reply = last_reply(&app, &sid).await;
-            let mut body = match (outcome, reply.is_empty()) {
-                ("interrupted", _) => "这一轮被打断了（用户按了停止，或者会话结束了）。".to_string(),
-                ("failed", true) => format!("这一轮出错了：{}", b["turn"]["error"].as_str().unwrap_or("没有更多信息")),
-                (_, true) => "这一轮结束了，它没有留下文字回复。".to_string(),
-                _ => format!("它最后说的（最多 {REPLY_MAX} 字，更早的看会话）：\n{}", core::tail_chars(&reply, REPLY_MAX)),
-            };
-            // 结果带上事实：不只靠它自己说（最后一段可能丢、可能只是描述）。跑腿只查不改，不用
-            if !core::is_errand(&app.store, &sid) {
-                if let Some((facts, head)) = git_facts(&row.workdir, &w.head).await {
-                    body.push_str("\n\n");
-                    body.push_str(&facts);
-                    core::watch_update(&app.store, |m| {
-                        if let Some(x) = m.get_mut(&sid) {
-                            x.head = head;
-                        }
-                    });
-                }
-            }
-            if tell_brain_to(&app, event("turn_end", &sid, &title, &row.workdir, &format!("{kind} outcome=\"{outcome}\""), &body), link).await {
-                failed.remove(&sid);
-                let what = if kind.is_empty() { "结果" } else { "跑腿回来" };
-                crate::assistant_memory::journal(&app.paths, &format!("{what}（{outcome}）[{sid}] {title} · {} · {}", base_name(&row.workdir), core::tail_chars(&reply, 300)));
-            } else {
-                let n = failed.entry(sid.clone()).or_default();
-                *n += 1;
-                if *n < SEND_TRIES {
-                    // 没送进去：退回去，下一圈再送
-                    core::watch_update(&app.store, |m| {
-                        if let Some(x) = m.get_mut(&sid) {
-                            x.told_end = w.told_end;
-                            x.done_at = 0;
-                        }
-                    });
-                } else {
-                    tracing::warn!(session = %sid, "助理：结果送了几次都没送进大脑，放弃");
+                if tell_brain_to(&app, event(x.kind(), &sid, &title, &row.workdir, &format!("{kind} outcome=\"{outcome}\""), &body), link.clone()).await {
                     failed.remove(&sid);
+                    let what = if kind.is_empty() { "结果" } else { "跑腿回来" };
+                    crate::assistant_memory::journal(&app.paths, &format!("{what}（{outcome}）[{sid}] {title} · {} · {}", base_name(&row.workdir), core::tail_chars(&reply, 300)));
+                } else {
+                    let n = failed.entry(sid.clone()).or_default();
+                    *n += 1;
+                    if *n < SEND_TRIES {
+                        // 没送进去：退回去，下一圈再送
+                        core::watch_update(&app.store, |m| {
+                            if let Some(v) = m.get_mut(&sid) {
+                                v.told_end = w.told_end;
+                                v.done_at = 0;
+                            }
+                        });
+                    } else {
+                        tracing::warn!(session = %sid, "助理：结果送了几次都没送进大脑，放弃");
+                        failed.remove(&sid);
+                    }
                 }
             }
         }
+    }
+}
+
+/// 盯着的会话这一圈看到的、要告诉大脑的事。只看记下的 [`core::Watch`] 和会话的看板（`ChatManager::brief`），
+/// 不碰别的：看守循环和回放测试（`replay_*`，testdata/replay）用的是同一份
+#[derive(Debug, Clone, PartialEq)]
+enum Seen {
+    /// 它在提问：告诉大脑（它可能答得上，答不上就转给用户）。审批不告诉：卡片直接给用户
+    Question { pending: u64, question: String, options: Vec<String> },
+    /// 审批等太久（用户没看到卡片？）：叫醒大脑一次，让它提醒用户。不替用户批
+    ApprovalWaiting { pending: u64 },
+    /// 在干活但很久没有任何进展：叫醒大脑一次。不叫停
+    Stalled { active: i64 },
+    /// 一轮结束了（循环里还要等 [`SETTLE`] 让记录写完）
+    TurnEnd { ended: i64, outcome: String, error: Option<String> },
+}
+
+impl Seen {
+    /// 送进大脑的事件类型
+    fn kind(&self) -> &'static str {
+        match self {
+            Seen::Question { .. } => "question",
+            Seen::ApprovalWaiting { .. } => "waiting_approval",
+            Seen::Stalled { .. } => "stalled",
+            Seen::TurnEnd { .. } => "turn_end",
+        }
+    }
+}
+
+fn watch_seen(w: &core::Watch, b: &Value, now: i64) -> Vec<Seen> {
+    let mut out = vec![];
+    let pending = |kind: &str| b["attn"]["pending_id"].as_u64().filter(|_| b["attn"]["kind"] == kind);
+    if let Some(p) = pending("question").filter(|p| w.told_pending != Some(*p)) {
+        let options = b["attn"]["options"].as_array().into_iter().flatten().filter_map(Value::as_str).map(String::from).collect();
+        out.push(Seen::Question { pending: p, question: b["attn"]["question"].as_str().unwrap_or("").to_string(), options });
+    }
+    if let Some(p) = pending("permission").filter(|p| w.nagged_pending != Some(*p) && now - b["since"].as_i64().unwrap_or(now) >= NAG_APPROVAL_MS) {
+        out.push(Seen::ApprovalWaiting { pending: p });
+    }
+    let active = b["active_at"].as_i64().unwrap_or(now);
+    if b["board"] == "working" && now - active >= NAG_STALL_MS && w.nagged_stall != active {
+        out.push(Seen::Stalled { active });
+    }
+    let ended = b["turn"]["ended_at"].as_i64().unwrap_or(0);
+    let running = matches!(b["phase"].as_str(), Some("running" | "approval"));
+    if ended > w.told_end && !running {
+        let outcome = b["turn"]["outcome"].as_str().unwrap_or("done").to_string();
+        out.push(Seen::TurnEnd { ended, outcome, error: b["turn"]["error"].as_str().map(String::from) });
+    }
+    out
+}
+
+/// 告诉过大脑了：记下来，同一件事不再说
+fn watch_mark(w: &mut core::Watch, x: &Seen, now: i64) {
+    match x {
+        Seen::Question { pending, .. } => w.told_pending = Some(*pending),
+        Seen::ApprovalWaiting { pending } => w.nagged_pending = Some(*pending),
+        Seen::Stalled { active } => w.nagged_stall = *active,
+        Seen::TurnEnd { ended, outcome, .. } => {
+            w.told_end = *ended;
+            // 正常做完、被打断：这件活告一段落，之后不再盯。出错的（额度用完等）接着盯：可能自动接着跑
+            if outcome != "failed" {
+                w.done_at = now;
+            }
+        }
+    }
+}
+
+/// 事件正文（一轮结束的用 [`turn_end_body`]，要带最后说的话）
+fn seen_body(x: &Seen, b: &Value, now: i64) -> String {
+    match x {
+        Seen::Question { question, options, .. } => format!(
+            "它在问：{question}\n选项：{}\n用户能在看看里直接回答这张卡片。只有答案就在用户交代这件活时说过的话里，你才用 session_send 替他答，并告诉他。",
+            if options.is_empty() { "（自己填）".to_string() } else { options.join(" / ") }
+        ),
+        Seen::ApprovalWaiting { .. } => format!("{}\n审批只有用户能点（看看里、飞书卡片上都能点），你不能替他批。简短提醒用户一句，说清楚是哪件活在等什么；用户说了不批或者要停，再照他说的办。", core::doing_state(b, now)),
+        Seen::Stalled { .. } => format!("{}\n可能卡住了，也可能在跑很久的命令（构建、测试、下载）。用 session_get 看一眼最后在干什么，简短告诉用户；你不能自己叫停它，用户说停才停。", core::doing_state(b, now)),
+        Seen::TurnEnd { outcome, error, .. } => turn_end_body(outcome, "", error.as_deref()),
+    }
+}
+
+/// 一轮结束的正文：它最后说的话；没说话的写清楚是怎么结束的
+fn turn_end_body(outcome: &str, reply: &str, error: Option<&str>) -> String {
+    match (outcome, reply.is_empty()) {
+        ("interrupted", _) => "这一轮被打断了（用户按了停止，或者会话结束了）。".to_string(),
+        ("failed", true) => format!("这一轮出错了：{}", error.unwrap_or("没有更多信息")),
+        (_, true) => "这一轮结束了，它没有留下文字回复。".to_string(),
+        _ => format!("它最后说的（最多 {REPLY_MAX} 字，更早的看会话）：\n{}", core::tail_chars(reply, REPLY_MAX)),
     }
 }
 
@@ -1673,14 +1742,27 @@ async fn digest(app: &App, brain: &str, since: Option<&str>, expand: bool) -> (S
     }
 }
 
-/// 把整理好的对话送进现在的大脑（界面上是一张“带过来的对话”卡片）。`stuck`：用户最后那句因为账号问题没答上，接着答
+/// 把整理好的对话送进现在的大脑（界面上是一张“带过来的对话”卡片）。`stuck`：用户最后那句因为账号问题没答上，接着答。
+/// 不用接着答时只记进对话、不起一轮（[`crate::chat::Chat::note`]，学 t3code 的 injectHistory）：不花一轮额度，也不会冒出一句“接上了”。
+/// 大脑做不到（老版本 Codex 等）才照旧发一轮
 async fn hand_in(app: &App, from: &str, text: &str, stuck: bool) {
     if text.is_empty() && !stuck {
         return;
     }
+    let head = format!("下面是你（同一个助理）之前在「{from}」里和用户的对话（最近的部分，更早的省略了）。现在换到这里，接着往下聊；还有效的约定、在干的活以每一轮附带的信息为准。");
+    let quiet = core::tool(core::settings(&app.store).engine.launch()).is_some_and(|t| t.silent_note);
+    if !stuck && quiet {
+        if let Some(brain) = core::brain_id(&app.store) {
+            let body = format!("{head}\n\n{text}\n\n这条只是记进对话，不用回，等用户往下说。");
+            match app.chat.note(&brain, &event("handoff", "", from, "", core::NOTE_ATTR, &body)).await {
+                Ok(true) => return,
+                Ok(false) => {}
+                Err(e) => tracing::warn!(error = ?e, "助理：带过来的对话没能记进对话，改成发一轮"),
+            }
+        }
+    }
     let tail = if stuck { "用户最后那句因为账号问题没答上，现在接着答。" } else { "这条不用细回，回一句“接上了”就行，等用户往下说。" };
-    let body = format!("下面是你（同一个助理）之前在「{from}」里和用户的对话（最近的部分，更早的省略了）。现在换到这里，接着往下聊；还有效的约定、在干的活以每一轮附带的信息为准。\n\n{text}\n\n{tail}");
-    tell_brain_push(app, event("handoff", "", from, "", "", &body), stuck).await;
+    tell_brain_push(app, event("handoff", "", from, "", "", &format!("{head}\n\n{text}\n\n{tail}")), stuck).await;
 }
 
 /// 换引擎（Claude Code ↔ Codex）：把旧引擎大脑上次带走之后的对话带给新的
@@ -1691,10 +1773,7 @@ async fn hand_over(app: &App, from_brain: &str, from: core::Engine) {
         handed.insert(from_brain.to_string(), l);
         let _ = app.store.set(HANDED_KEY, &handed);
     }
-    let name = match from {
-        core::Engine::Claude => "Claude Code",
-        core::Engine::Codex => "Codex",
-    };
+    let name = core::tool(from.launch()).map_or(from.launch(), |t| t.name);
     hand_in(app, name, &text, false).await;
 }
 
@@ -1844,11 +1923,26 @@ pub async fn state(State(app): State<App>) -> R<Json<Value>> {
     for e in core::Engine::ALL {
         engines.push(json!({ "id": e.launch(), "installed": engine_installed(&app, e).await, "has_brain": core::brains(&app.store).contains_key(e.launch()) }));
     }
+    // 能派活的工具和它们的权限模式（能力表，界面照这个画，不自己再抄一份）
+    let mut tools = vec![];
+    for t in core::TOOLS {
+        tools.push(json!({
+            "id": t.launch,
+            "name": t.name,
+            "installed": tool_installed(&app, t.launch).await,
+            "brain": t.brain.is_some(),
+            "modes": t.modes.iter().map(|(m, l)| json!([m, l.id()])).collect::<Vec<_>>(),
+            "by_level": core::Level::ALL.iter().map(|l| (l.id().to_string(), json!(t.by_level[*l as usize]))).collect::<serde_json::Map<_, _>>(),
+            "worker_tools": t.worker_tools,
+            "mode_next_turn": t.mode_next_turn,
+        }));
+    }
     Ok(Json(json!({
         "brain": brain,
         "settings": core::settings(&app.store),
         "ceiling": core::ceiling(&core::settings(&app.store)).id(),
         "engines": engines,
+        "tools": tools,
         // 飞书机器人：飞书应用配好、绑定了没有；飞书 CLI 装没装（feishu_bot.rs、lark_cli.rs）
         "feishu": {
             "configured": crate::notify::load_feishu(&app.store).is_some(),
@@ -1862,7 +1956,20 @@ pub async fn state(State(app): State<App>) -> R<Json<Value>> {
         "waits": core::waits(&app.store),
         "stats": { "fixed": fixed, "of": of },
         "default_model": core::DEFAULT_MODEL,
+        "protect": protect(&app, brain.as_deref()).await,
     })))
+}
+
+/// 助理自己动手时，靠什么挡住不该做的（助理页“设置”里如实显示）：
+/// - `codex`：Codex 自己的沙箱（只读 / 只能写工作区）+ 审批过闸门；
+/// - Claude Code：闸门（PreToolUse）判；只读时另开系统沙箱，`sandbox` 是它现在的情况（大脑没在跑时没有）
+async fn protect(app: &App, brain: Option<&str>) -> Value {
+    let s = core::settings(&app.store);
+    let sandbox = match brain {
+        Some(b) if core::tool(s.engine.launch()).is_some_and(|t| t.os_sandbox) => app.chat.sandbox_status(b).await,
+        _ => None,
+    };
+    json!({ "engine": s.engine.launch(), "mode": s.mode, "sandbox": sandbox })
 }
 
 /// `GET /api/assistant/summary`：会话栏最上面那一行“助理”用的（几秒拉一次，只读内存里的状态）：开没开、
@@ -1921,6 +2028,7 @@ pub struct DefaultsReq {
 fn account_exists(app: &App, engine: &str, id: &str) -> bool {
     match engine {
         "claude" => crate::claude_profiles::get(&app.store, id).is_some(),
+        "agy" => crate::agy_profiles::get(&app.store, id).is_some(),
         _ => crate::codex_profiles::get(&app.store, id).is_some(),
     }
 }
@@ -1950,11 +2058,11 @@ fn parse_settings(app: &App, req: &SettingsReq) -> R<core::Settings> {
     if let Some(e) = req.dispatch_engine.as_deref().map(str::trim) {
         s.dispatch_engine = match e {
             "" => None,
-            e => Some(core::Engine::parse(e).ok_or_else(|| LocalError::invalid("dispatch_engine", "invalid"))?),
+            e => Some(core::tool(e).ok_or_else(|| LocalError::invalid("dispatch_engine", "invalid"))?.launch.to_string()),
         };
     }
     for (engine, d) in req.defaults.iter().flatten() {
-        if !ENGINES.contains(&engine.as_str()) {
+        if core::tool(engine).is_none() {
             return Err(LocalError::invalid("engine", "invalid"));
         }
         let to = s.defaults_mut(engine);
@@ -1992,10 +2100,15 @@ pub async fn enable(State(app): State<App>, body: Option<Json<SettingsReq>>) -> 
 /// 换引擎、权限模式。换引擎：用那个引擎的大脑（没有就建一个；换回来接着原来的对话）；权限模式下一次用工具就生效
 pub async fn put_settings(State(app): State<App>, Json(req): Json<SettingsReq>) -> R<Json<Value>> {
     let s = parse_settings(&app, &req)?;
-    let old = core::settings(&app.store).engine;
+    let prev = core::settings(&app.store);
+    let old = prev.engine;
     let from = core::brain_id(&app.store);
     let brain = ensure_brain(&app, s.engine).await?;
     core::save_settings(&app.store, s.clone())?;
+    // 只读进出：Claude Code 大脑的系统沙箱要重起才换（闸门本来就按新模式判）
+    if s.mode != prev.mode {
+        app.chat.assistant_mode_changed(&brain);
+    }
     // 换引擎：两边是两段对话，把旧的那边上次带走之后说的带过来（后台做，不让页面等）
     if let Some(from) = from.filter(|f| s.engine != old && *f != brain) {
         let app = app.clone();
@@ -2057,7 +2170,7 @@ pub async fn fix(State(app): State<App>, Path(id): Path<String>, Json(req): Json
         "new" if d.kind == "send" => {
             let first = core::compose_brief(Some(&d.said), &d.brief, false);
             let title = d.said.lines().next().unwrap_or(&d.title).chars().take(30).collect::<String>();
-            let engine = if ENGINES.contains(&d.engine.as_str()) { d.engine.clone() } else { default_engine(&app).await.to_string() };
+            let engine = if core::tool(&d.engine).is_some() { d.engine.clone() } else { default_engine(&app).await.to_string() };
             let settings = core::settings(&app.store);
             let pick = dispatch_level(&settings, &engine, None, true);
             let model = dispatch_model(&settings, &engine, None);
@@ -2476,6 +2589,77 @@ pub async fn lark_next(State(app): State<App>) -> R<Json<crate::lark_cli::Status
     Ok(Json(crate::lark_cli::install(app.instances.shell(), lark_zh(&app), |_| {}).await?))
 }
 
+/// 回放（借 t3code 的 replay fixtures）：一串会话看板状态按时间走一遍，和看守循环同样判断、记下、等记录写完，
+/// 收集会送进大脑的事件。`testdata/replay/*.json`；Codex 那几份是真录的 app-server 通知，在 `codex_chat` 的测试里喂进真的 Chat 再回放
+#[cfg(test)]
+pub(crate) mod replay {
+    use super::*;
+
+    #[derive(Default)]
+    pub(crate) struct Replayer {
+        w: core::Watch,
+        settle: Option<i64>,
+        /// (类型, 属性, 正文)
+        pub events: Vec<(String, String, String)>,
+    }
+
+    impl Replayer {
+        /// 看守循环的一圈：`now` 时看到会话是 `b` 的样子，最后说的话是 `reply`
+        pub(crate) fn tick(&mut self, now: i64, b: &Value, reply: &str) {
+            if self.w.done_at != 0 {
+                return;
+            }
+            let seen = watch_seen(&self.w, b, now);
+            if !seen.iter().any(|x| matches!(x, Seen::TurnEnd { .. })) {
+                self.settle = None;
+            }
+            for x in seen {
+                let (attrs, body) = match &x {
+                    Seen::TurnEnd { outcome, error, .. } => {
+                        let start = *self.settle.get_or_insert(now);
+                        if now - start < SETTLE.as_millis() as i64 {
+                            continue;
+                        }
+                        self.settle = None;
+                        (format!(" outcome=\"{outcome}\""), turn_end_body(outcome, reply, error.as_deref()))
+                    }
+                    _ => (String::new(), seen_body(&x, b, now)),
+                };
+                watch_mark(&mut self.w, &x, now);
+                let text = event(x.kind(), "s1", "活", "/w/app", &attrs, &body);
+                self.events.push((x.kind().to_string(), attrs, text));
+            }
+        }
+
+        /// 和 fixture 的 `expect` 一条条对上
+        pub(crate) fn check(&self, name: &str, expect: &Value) {
+            let want = expect.as_array().cloned().unwrap_or_default();
+            let got: Vec<&str> = self.events.iter().map(|e| e.0.as_str()).collect();
+            assert_eq!(got.len(), want.len(), "{name}: 送进大脑的事件 {got:?}\n{:#?}", self.events);
+            for (e, x) in self.events.iter().zip(&want) {
+                assert_eq!(e.0, x["type"].as_str().unwrap_or(""), "{name}");
+                if let Some(a) = x["attrs"].as_str() {
+                    assert!(e.1.contains(a), "{name}: {} 应带 {a}", e.1);
+                    assert!(e.2.contains(a), "{name}: 事件头应带 {a}: {}", e.2);
+                }
+                for h in x["has"].as_array().into_iter().flatten().filter_map(Value::as_str) {
+                    assert!(e.2.contains(h), "{name}: {} 事件里应有「{h}」：\n{}", e.0, e.2);
+                }
+            }
+        }
+    }
+
+    pub(crate) fn fixture(name: &str) -> Value {
+        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/gateway/testdata/replay").join(name);
+        serde_json::from_slice(&std::fs::read(&p).unwrap_or_else(|e| panic!("{}: {e}", p.display()))).unwrap()
+    }
+
+    /// 对话记录 → 它最后说的话（和 last_reply 一样）
+    pub(crate) fn reply(items: &[Value]) -> String {
+        reply_of(items)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2595,12 +2779,61 @@ mod tests {
 
     #[test]
     fn engine_modes_map_to_levels() {
-        for e in ["claude", "codex"] {
+        for e in crate::assistant::dispatch_tools() {
             for l in crate::assistant::Level::ALL {
                 assert_eq!(crate::assistant::level_of(e, crate::assistant::native_mode(e, l)), Some(l), "{e} {l:?}");
             }
             assert_eq!(crate::assistant::engine_modes(e).len(), 5);
         }
         assert_eq!(crate::assistant::level_of("codex", "auto"), None);
+        assert_eq!(crate::assistant::level_of("shell", "plan"), None, "不是助理能用的工具");
+        // agy 和 Claude Code 同一套写法，每个模式 agy 那边都认得（agy_chat::acp_mode）
+        for m in crate::assistant::engine_modes("agy") {
+            assert!(crate::chat::agy_chat::acp_mode(m).is_some(), "{m}");
+        }
+        // 能当大脑的引擎都在表里
+        for e in crate::assistant::Engine::ALL {
+            assert_eq!(crate::assistant::tool(e.launch()).and_then(|t| t.brain), Some(e));
+        }
+    }
+
+    #[test]
+    fn dispatch_engine_setting_takes_any_tool() {
+        let mut s = crate::assistant::Settings::default();
+        s.dispatch_engine = Some("agy".into());
+        s.defaults_mut("agy").mode = Some("plan".into());
+        let v = serde_json::to_value(&s).unwrap();
+        assert_eq!(v["dispatch_engine"], "agy");
+        assert_eq!(v["agy"]["mode"], "plan");
+        assert_eq!(crate::assistant::default_level(&s, "agy"), Some(crate::assistant::Level::ReadOnly));
+        // 旧版存的（Engine 枚举）照样读得出来
+        let old: crate::assistant::Settings = serde_json::from_value(serde_json::json!({ "dispatch_engine": "codex" })).unwrap();
+        assert_eq!(old.dispatch_engine.as_deref(), Some("codex"));
+    }
+
+    #[test]
+    fn replay_board_fixtures() {
+        for name in ["claude_question_then_done.json", "claude_slow_approval_stall_limit.json", "agy_interrupted.json"] {
+            let f = super::replay::fixture(name);
+            let mut r = super::replay::Replayer::default();
+            let reply = f["reply"].as_str().unwrap_or("");
+            for fr in f["frames"].as_array().unwrap() {
+                r.tick(fr["t"].as_i64().unwrap(), &fr["brief"], fr["reply"].as_str().unwrap_or(reply));
+            }
+            r.check(name, &f["expect"]);
+        }
+    }
+
+    #[test]
+    fn reply_of_stops_at_last_user_message() {
+        let items = vec![
+            json!({ "k": "user", "text": "上一件" }),
+            json!({ "k": "assistant", "blocks": [{ "t": "text", "text": "旧的" }] }),
+            json!({ "k": "user", "text": "修一下" }),
+            json!({ "k": "assistant", "blocks": [{ "t": "thinking", "text": "想" }, { "t": "text", "text": "先看看" }] }),
+            json!({ "k": "user", "text": "顺便", "mid": true }),
+            json!({ "k": "assistant", "blocks": [{ "t": "text", "text": "改好了" }] }),
+        ];
+        assert_eq!(super::reply_of(&items), "先看看\n\n改好了");
     }
 }
