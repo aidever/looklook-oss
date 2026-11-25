@@ -80,8 +80,28 @@ export function rememberDevices(d) {
   save();
 }
 
+// 这次打开页面里看到过的会话（id → 会话），本机、局域网打开也记：手机上从会话列表点进整页会话（/t/）时，
+// 列表那边已经卸掉了，整页会话还没拿到自己的信息前靠它知道是不是对话会话，不先显示成终端
+const seenInst = new Map();
+
+export function rememberInstance(inst) {
+  if (inst?.id) seenInst.set(inst.id, inst);
+}
+
+/** 见过的某个会话（这次打开里见过的，没有就从远程快照里找），只用来先显示。 */
+export function knownInstance(id) {
+  if (seenInst.has(id)) return seenInst.get(id);
+  for (const items of Object.values(read()?.instances ?? {})) {
+    const hit = Array.isArray(items) ? items.find((i) => i?.id === id) : null;
+    if (hit) return hit;
+  }
+  return null;
+}
+
 export function rememberInstances(dev, items) {
-  if (!rtcMode || !Array.isArray(items)) return;
+  if (!Array.isArray(items)) return;
+  for (const i of items) rememberInstance(i);
+  if (!rtcMode) return;
   read();
   const c = ensure();
   // 会话列表本来就只有元数据（标题、目录、状态、类型），没有对话内容

@@ -30,6 +30,7 @@ import {
   CircleStop,
   CornerDownRight,
   ExternalLink,
+  FileDiff,
   FilePen,
   FileText,
   Folder,
@@ -80,6 +81,7 @@ import {
   PencilLine,
 } from 'lucide-react';
 import { createContext, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useReducer, useRef, useState } from 'react';
+import { pressMenu } from '../shared/press.js';
 import { createPortal } from 'react-dom';
 import { useTranslation } from 'react-i18next';
 
@@ -87,11 +89,11 @@ import { api, deviceApi, fetchRaw, plainLinksWork, selectedDevice, terminalDevic
 import { isTouch } from '../shared/KeyBar.jsx';
 import { chatEventsMode, onChatEventsMode, subscribeChat } from '../shared/chatEvents.js';
 import { spinnerText } from '../shared/spinner.js';
+import { pathResolver } from '../files/pathLinks.js';
 import {
   CODEX_ACTIONS,
   CODEX_COMMANDS,
   contextGauge,
-  DSH_COMMANDS,
   AGY_ACTIONS,
   AGY_COMMANDS,
   AGY_ONLY,
@@ -187,11 +189,11 @@ import { useLinkOpen } from '../shared/linkOpen.jsx';
 // ---------------- 数据 ----------------
 
 /** 服务端状态里的 `agent` → 文案里的 {{agent}}；老版本服务端不带 agent，就是 Claude Code */
-const AGENT_NAMES = { claude: 'Claude Code', codex: 'Codex', dsh: 'DSH', agy: 'Antigravity' };
+const AGENT_NAMES = { claude: 'Claude Code', codex: 'Codex', agy: 'Antigravity' };
 /** 这个对话的 AI 工具和它支持的操作（`status.caps`；老版本服务端不带 caps，就是全部可用）：界面只按它显示按钮 */
 const AgentCtx = createContext({ id: 'claude', name: AGENT_NAMES.claude, caps: {} });
 /** 这段对话产出的文件（Codex）：list 给资源栏，links（文字里的写法 → 地址）给回复里的路径变成链接 */
-const ArtifactCtx = createContext({ list: [], links: null, fileUrl: null });
+const ArtifactCtx = createContext({ list: [], links: null, fileUrl: null, paths: null });
 
 /** 在右侧面板里打开一个子代理的步骤：`openAgent({ id, tool_use_id, … })`（ChatView 提供；对话里的子代理卡片、运行中的子代理条用） */
 const SideCtx = createContext({ openAgent: null });
@@ -683,6 +685,9 @@ function EditBody({ id, block, result }) {
           <button type="button" className="chat-more" onClick={() => openFile({ ep: fileEndpoints(id), path, focus })}>
             <Expand size={13} aria-hidden="true" /> {t('chat.edit_open')}
           </button>
+          <button type="button" className="chat-more" onClick={() => openFile({ ep: fileEndpoints(id), path, focus, diff: true })}>
+            <FileDiff size={13} aria-hidden="true" /> {t('chat.edit_diff')}
+          </button>
         </div>
       )}
     </>
@@ -1084,7 +1089,7 @@ function WorkTrace({ part, attention, tail, children }) {
  */
 function Rows({ id, items, live, limit = 0, trace = false, attention = false }) {
   const { t } = useT();
-  const { links, fileUrl } = useContext(ArtifactCtx);
+  const { links, fileUrl, paths } = useContext(ArtifactCtx);
   const results = useMemo(() => resultsById(items), [items]);
   const all = useMemo(() => chatRows(items, toolUseIds(items)), [items]);
   const [max, setMax] = useState(limit);
@@ -1102,8 +1107,8 @@ function Rows({ id, items, live, limit = 0, trace = false, attention = false }) 
       case 'text': {
         // 一段回复的最后一段文字（后面是用户消息、提示或者没有了）：下面放复制按钮，复制这段回复的全部文字
         const next = rows[n + 1];
-        if (live && !next) return <Markdown key={r.key} text={r.block.text} links={links} fileUrl={fileUrl} />;
-        if (next && next.k !== 'item') return <Markdown key={r.key} text={r.block.text} links={links} fileUrl={fileUrl} />;
+        if (live && !next) return <Markdown key={r.key} text={r.block.text} links={links} fileUrl={fileUrl} paths={paths} />;
+        if (next && next.k !== 'item') return <Markdown key={r.key} text={r.block.text} links={links} fileUrl={fileUrl} paths={paths} />;
         let from = n;
         while (from > 0 && rows[from - 1].k !== 'item') from--;
         const all = rows.slice(from, n + 1).filter((x) => x.k === 'text').map((x) => x.block.text).join('\n\n');
@@ -1157,7 +1162,7 @@ function Rows({ id, items, live, limit = 0, trace = false, attention = false }) 
 /** 一段回复的最后一段文字，下面是复制和用时；手机上长按这一段弹出复制菜单 */
 function ReplyEnd({ id, text, all, turn }) {
   const { t } = useT();
-  const { links, fileUrl } = useContext(ArtifactCtx);
+  const { links, fileUrl, paths } = useContext(ArtifactCtx);
   const [sheet, setSheet] = useState(false);
   const press = useLongPress(() => setSheet(true));
   const toast = useToast();
@@ -1168,7 +1173,7 @@ function ReplyEnd({ id, text, all, turn }) {
   return (
     <div className="chat-reply-end" {...press} {...rc.bind}>
       {rc.menu}
-      <Markdown text={text} links={links} fileUrl={fileUrl} />
+      <Markdown text={text} links={links} fileUrl={fileUrl} paths={paths} />
       <div className="chat-reply-acts">
         <CopyButton text={all} label={false} variant="plain" />
         {turn && <span className="chat-turn">{t('chat.turn', { s: Math.max(1, Math.round(turn.ms / 1000)) })}</span>}
@@ -1482,7 +1487,10 @@ function previewTarget(href) {
   const path = u.searchParams.get('path');
   if (!m || !path) return null;
   const id = decodeURIComponent(m[1]);
-  if (m[2] !== 'chat/artifact') return { ep: fileEndpoints(id), path };
+  // 回复里的 `a.rs:12`、`#L12-L20`：打开后标出那几行
+  const line = Number(u.searchParams.get('line')) || 0;
+  const focus = line ? { from: line, to: Math.max(line, Number(u.searchParams.get('to')) || line) } : undefined;
+  if (m[2] !== 'chat/artifact') return { ep: fileEndpoints(id), path, focus };
   const art = (p, dl) => `/instances/${id}/chat/artifact?path=${encodeURIComponent(p)}${dl ? '&download=1' : ''}`;
   return { ep: { preview: (p) => art(p), download: (p) => art(p, true), plain: plainLinksWork() }, path };
 }
@@ -1522,36 +1530,47 @@ function conversationFiles(items, cwd) {
 const FILE_TOOLS = new Set(['Read', 'Edit', 'MultiEdit', 'Write', 'NotebookEdit']);
 
 /**
- * 对话里点开的文件：全屏（手机）/ 居中大窗（电脑）。文字带行号，`focus` 那几行标出来并滚过去（读的那段、改的地方）；
- * 能复制路径；`list`（同一组文件：改动列表，或者对话里读过、改过的文件）里有它时，标题栏和 ← → 前后翻。
+ * 对话里点开的文件：手机上整屏（返回键关）；电脑上（够宽时）停靠在对话右边，可以一边看一边聊，最多开 8 个标签。
+ * 文字带行号，`focus` 那几行标出来并滚过去（读的那段、改的地方）；能复制路径、在“文件”标签里显示；
+ * `list`（同一组文件：改动列表，或者对话里读过、改过的文件）里有它时，标题栏和 ← → 前后翻。
  */
-function FileViewer({ target, onTarget, onClose }) {
-  // 返回键关掉文件查看器（docs/REMOTE_UX_2026-11-07.md §7.2）
-  useLayer(true, onClose);
+function FileViewer({ tabs, cur, docked, onTarget, onPick, onCloseTab, onClose }) {
   const { t } = useT();
+  const confirm = useConfirm();
   const { files } = useContext(PreviewCtx);
-  const { path, ep, focus, edit } = target;
-  const sep = pathSep(path);
-  const name = fileName(path);
-  const list = (target.list ?? files ?? []).includes(path) ? target.list ?? files : null;
+  const box = useRef(null);
+  const tab = tabs.find((x) => x.key === cur) ?? tabs[tabs.length - 1];
+  // 返回键关掉文件查看器（docs/REMOTE_UX_2026-11-07.md §7.2）：只有整屏的时候
+  useLayer(!docked, onClose);
+  const dirty = useRef(new Map());
+  const { path, ep } = tab.target;
+  const list = (tab.target.list ?? files ?? []).includes(path) ? tab.target.list ?? files : null;
   const at = list ? list.indexOf(path) : -1;
   const go = useCallback(
     (d) => {
       const next = list?.[at + d];
-      if (next) onTarget({ ep, path: next, list: target.list });
+      if (next) onTarget({ ep, path: next, list: tab.target.list, diff: tab.target.diff });
     },
-    [list, at, ep, target.list, onTarget],
+    [list, at, ep, tab.target.list, tab.target.diff, onTarget],
   );
+  const closeTab = async (key) => {
+    if (dirty.current.get(key) && !(await confirm({ title: t('fb.edit_discard_title'), body: t('fb.edit_discard_body'), confirm: t('fb.edit_discard'), danger: true }))) return;
+    dirty.current.delete(key);
+    onCloseTab(key);
+  };
   useEffect(() => {
     const key = (e) => {
+      // 停靠时只管焦点在查看器里的按键（对话输入框里的 ← → Esc 照常）
+      if (docked && !box.current?.contains(e.target)) return;
       if (e.key === 'Escape') {
+        if (e.target.closest?.('.cm-panels, .fv-goto')) return;
         e.preventDefault();
         e.stopPropagation();
         onClose();
         return;
       }
-      // ← →：前后翻（在输入框里、按着修饰键时不管）
-      if ((e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') || e.altKey || e.ctrlKey || e.metaKey || e.shiftKey || e.target.closest?.('input, textarea')) return;
+      // ← →：前后翻（在输入框里、编辑器里、按着修饰键时不管）
+      if ((e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') || e.altKey || e.ctrlKey || e.metaKey || e.shiftKey || e.target.closest?.('input, textarea, .cm-editor')) return;
       if (!list || list.length < 2) return;
       e.preventDefault();
       e.stopPropagation();
@@ -1559,7 +1578,7 @@ function FileViewer({ target, onTarget, onClose }) {
     };
     window.addEventListener('keydown', key, true);
     return () => window.removeEventListener('keydown', key, true);
-  }, [onClose, go, list]);
+  }, [onClose, go, list, docked]);
   const extra = (
     <>
       {list && list.length > 1 && (
@@ -1593,13 +1612,72 @@ function FileViewer({ target, onTarget, onClose }) {
       )}
     </>
   );
+  const strip = tabs.length > 1 && (
+    <div className="fv-tabs" role="tablist">
+      {tabs.map((x) => (
+        <span key={x.key} className="fv-tab" role="tab" aria-selected={x.key === tab.key} title={x.target.path}>
+          <button type="button" className="fv-tab-name ellipsis" onClick={() => onPick(x.key)}>
+            {fileName(x.target.path)}
+          </button>
+          <button type="button" className="fv-tab-x" onClick={() => closeTab(x.key)} aria-label={t('action.close')}>
+            <X size={12} />
+          </button>
+        </span>
+      ))}
+    </div>
+  );
+  // 每个标签的预览都留着（编辑到一半切走再切回来还在），看不见的不动
+  const body = (
+    <div className={docked ? 'chat-file-dock' : 'chat-fv-modal'} ref={box} role={docked ? 'complementary' : undefined} aria-label={fileName(path)} tabIndex={docked ? -1 : undefined}>
+      {strip}
+      {tabs.map((x) => {
+        const on = x.key === tab.key;
+        return (
+          <div key={x.key} className="chat-fv-pane" hidden={!on}>
+            <FilePreview
+              key={x.gen}
+              ep={x.target.ep}
+              entry={{ name: fileName(x.target.path), path: x.target.path }}
+              sep={pathSep(x.target.path)}
+              onClose={() => (tabs.length > 1 ? onCloseTab(x.key) : onClose())}
+              focus={x.target.focus}
+              extra={on ? extra : null}
+              edit={x.target.edit}
+              diff={x.target.diff}
+              active={on}
+              onDirty={(d) => dirty.current.set(x.key, d)}
+            />
+          </div>
+        );
+      })}
+    </div>
+  );
+  if (docked) return body;
   return createPortal(
-    <div className="chat-file-viewer" role="dialog" aria-modal="true" aria-label={name} onClick={(e) => e.target === e.currentTarget && onClose()}>
-      <FilePreview key={`${path}:${focus?.from ?? ''}`} ep={ep} entry={{ name, path }} sep={sep} onClose={onClose} focus={focus} extra={extra} edit={edit} />
+    <div className="chat-file-viewer" role="dialog" aria-modal="true" aria-label={fileName(path)} onClick={(e) => e.target === e.currentTarget && onClose()}>
+      {body}
     </div>,
     document.body,
   );
 }
+
+/** 电脑上够宽（停靠查看器放得下）：不是触屏、窗口至少 1000 px */
+function useDockable() {
+  const q = '(min-width: 1000px)';
+  const [ok, setOk] = useState(() => !touchUiDevice && window.matchMedia?.(q).matches);
+  useEffect(() => {
+    if (touchUiDevice) return undefined;
+    const m = window.matchMedia?.(q);
+    if (!m) return undefined;
+    const on = () => setOk(m.matches);
+    m.addEventListener('change', on);
+    return () => m.removeEventListener('change', on);
+  }, []);
+  return ok;
+}
+const touchUiDevice = typeof window !== 'undefined' && Boolean(window.matchMedia?.('(hover: none) and (pointer: coarse)').matches);
+const TABS_MAX = 8;
+let tabSeq = 0;
 
 /** 复制文件的完整路径（图标按钮，复制好了打个勾） */
 function CopyPath({ path }) {
@@ -1624,35 +1702,83 @@ function CopyPath({ path }) {
 /** 对话里点到的这台电脑上的文件：在页面里预览（和“文件”页同一个预览），不用跳到新标签页或者直接下载。
  *  按着 Ctrl / ⌘ / Shift 点、或者中键点，照旧按链接本来的方式打开 */
 function usePreviewLinks() {
-  const [target, setTarget] = useState(null);
+  const [tabs, setTabs] = useState([]);
+  const [cur, setCur] = useState(null);
   const [image, setImage] = useState(null);
-  const onClick = useCallback((e) => {
-    if (e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
-    // 回复里的图片：页面里看大图（在链接里的也是，不跳走）
-    const img = e.target.closest?.('.md img[src]');
-    if (img && img.getAttribute('src') !== 'data:,') {
+  const docked = useDockable();
+  // 打开一个文件：已经开着就切过去（要标的行变了就重新打开那个标签），没开就加一个标签（电脑上最多 8 个，手机上只有一个）
+  const open = useCallback(
+    (target) => {
+      setTabs((list) => {
+        const hit = list.find((x) => x.target.path === target.path);
+        if (hit) {
+          setCur(hit.key);
+          const same = (hit.target.focus?.from ?? 0) === (target.focus?.from ?? 0) && Boolean(hit.target.diff) === Boolean(target.diff);
+          return list.map((x) => (x.key === hit.key ? { ...x, target, gen: same ? x.gen : tabSeq++ } : x));
+        }
+        const tab = { key: `t${tabSeq++}`, gen: tabSeq++, target };
+        setCur(tab.key);
+        const max = docked ? TABS_MAX : 1;
+        return [...list, tab].slice(-max);
+      });
+    },
+    [docked],
+  );
+  // 前后翻：换掉当前标签里的文件
+  const onTarget = useCallback(
+    (target) =>
+      setTabs((list) => {
+        const i = list.findIndex((x) => x.key === cur);
+        if (i < 0) return list;
+        const next = [...list];
+        next[i] = { ...next[i], target, gen: tabSeq++ };
+        return next;
+      }),
+    [cur],
+  );
+  const onClick = useCallback(
+    (e) => {
+      if (e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+      // 停靠的查看器里的点击不管（预览里的 Markdown 有自己的链接）
+      if (e.target.closest?.('.chat-file-dock')) return;
+      // 回复里的图片：页面里看大图（在链接里的也是，不跳走）
+      const img = e.target.closest?.('.md img[src]');
+      if (img && img.getAttribute('src') !== 'data:,') {
+        e.preventDefault();
+        const src = img.getAttribute('src');
+        setImage({ url: src.startsWith('/api/') ? src.slice(4) : src, name: img.getAttribute('alt') || undefined });
+        return;
+      }
+      const a = e.target.closest?.('a[href]');
+      if (!a) return;
+      const tgt = previewTarget(a.getAttribute('href'));
+      if (!tgt) return;
       e.preventDefault();
-      const src = img.getAttribute('src');
-      setImage({ url: src.startsWith('/api/') ? src.slice(4) : src, name: img.getAttribute('alt') || undefined });
-      return;
-    }
-    const a = e.target.closest?.('a[href]');
-    if (!a) return;
-    const tgt = previewTarget(a.getAttribute('href'));
-    if (!tgt) return;
-    e.preventDefault();
-    if (VIEW_IMAGE.test(tgt.path)) setImage({ url: tgt.ep.download(tgt.path), name: fileName(tgt.path) });
-    else setTarget(tgt);
+      if (VIEW_IMAGE.test(tgt.path)) setImage({ url: tgt.ep.download(tgt.path), name: fileName(tgt.path) });
+      else open(tgt);
+    },
+    [open],
+  );
+  const close = useCallback(() => {
+    setTabs([]);
+    setCur(null);
   }, []);
-  const close = useCallback(() => setTarget(null), []);
+  const closeTab = useCallback((key) => {
+    setTabs((list) => {
+      const next = list.filter((x) => x.key !== key);
+      setCur((c) => (c === key ? next[next.length - 1]?.key ?? null : c));
+      return next;
+    });
+  }, []);
   const closeImage = useCallback(() => setImage(null), []);
+  const shown = tabs.length > 0 && <FileViewer tabs={tabs} cur={cur} docked={docked} onTarget={onTarget} onPick={setCur} onCloseTab={closeTab} onClose={close} />;
   const viewer = (
     <>
-      {target && <FileViewer target={target} onTarget={setTarget} onClose={close} />}
+      {!docked && shown}
       {image && <ImageViewer images={[image]} onClose={closeImage} />}
     </>
   );
-  return { onClick, open: setTarget, viewer };
+  return { onClick, open, viewer, dock: docked ? shown : null };
 }
 const VIEW_IMAGE = /\.(png|jpe?g|gif|webp|bmp|ico|avif)$/i;
 
@@ -2151,7 +2277,7 @@ function ElicitForm({ pending, onAnswer, busy, spin }) {
 
 /** 权限审批、Claude 的提问、计划审批 */
 function PendingCard({ id, pending, active }) {
-  const { t, i18n } = useT();
+  const { t } = useT();
   const { id: agentId, caps } = useContext(AgentCtx);
   const toast = useToast();
   // 点一下就锁住：答复送到、等状态更新把卡片收走的这段时间按的那个按钮一直转圈、其余按钮不能点（不然看着像没点上，用户会连点）
@@ -2198,15 +2324,12 @@ function PendingCard({ id, pending, active }) {
           <Markdown text={input.plan ?? ''} />
         </div>
         <div className="chat-acts">
-          {/* DSH 批准后就离开计划模式，不分自动、逐项确认 */}
           <Button busy={spin('plan1')} disabled={busy} onClick={() => plan(1)}>
-            {t(agentId === 'dsh' ? 'chat.plan_approve' : 'chat.plan_auto')} <kbd className="chat-kbd">↵</kbd>
+            {t('chat.plan_auto')} <kbd className="chat-kbd">↵</kbd>
           </Button>
-          {agentId !== 'dsh' && (
-            <Button variant="secondary" busy={spin('plan2')} disabled={busy} onClick={() => plan(2)}>
-              {t('chat.plan_manual')}
-            </Button>
-          )}
+          <Button variant="secondary" busy={spin('plan2')} disabled={busy} onClick={() => plan(2)}>
+            {t('chat.plan_manual')}
+          </Button>
         </div>
         <form
           className="chat-acts"
@@ -2244,10 +2367,7 @@ function PendingCard({ id, pending, active }) {
           </button>
         )}
         {pending.tool !== 'apply_patch' && (open || (diff && diff.length <= 40)) && (diff ? <DiffView lines={diff} /> : <Pre text={JSON.stringify(input, null, 2)} />)}
-        {/* DSH 的审批原因带中英两份（display_reason），按界面语言挑 */}
-        {(input.display_reason?.[i18n.language.startsWith('zh') ? 'zh' : 'en'] || input.description) && (
-          <p className="chat-note">{input.display_reason?.[i18n.language.startsWith('zh') ? 'zh' : 'en'] || input.description}</p>
-        )}
+        {input.description && <p className="chat-note">{input.description}</p>}
         {pending.guard && <GuardNote from={pending.guard_from} rule={pending.guard} />}
         <div className="chat-acts">
           <Button busy={spin('allow')} disabled={busy} onClick={() => answer('allow')}>
@@ -2271,9 +2391,9 @@ function PendingCard({ id, pending, active }) {
             if (!busy) answer('deny', { message: reason });
           }}
         >
-          {/* DSH 的审批只能答允许 / 拒绝，带不了原因 */}
-          {agentId !== 'dsh' && agentId !== 'agy' && <input className="chat-field grow" placeholder={t('chat.deny_reason')} value={reason} onChange={(e) => setReason(e.target.value)} />}
-          <Button type="submit" variant={agentId === 'dsh' || agentId === 'agy' ? 'secondary' : 'ghost'} busy={spin('deny')} disabled={busy}>
+          {/* agy 的审批只能答允许 / 拒绝，带不了原因 */}
+          {agentId !== 'agy' && <input className="chat-field grow" placeholder={t('chat.deny_reason')} value={reason} onChange={(e) => setReason(e.target.value)} />}
+          <Button type="submit" variant={agentId === 'agy' ? 'secondary' : 'ghost'} busy={spin('deny')} disabled={busy}>
             {t('chat.deny')}
           </Button>
         </form>
@@ -2309,6 +2429,11 @@ function PendingCard({ id, pending, active }) {
 
 // ---------------- Codex 要先处理的：待确认的 hook、还没登录 ----------------
 
+/** 用第三方接口的会话里登录了 OpenAI 账号，后台把会话换成了官方账号：模型菜单重新取（见 codex_login_switch） */
+function profileSwitched(id) {
+  window.dispatchEvent(new CustomEvent(`ll-chat-profile:${id}`));
+}
+
 /** 还没登录：在这里登录（ChatGPT 设备码，远程也能用；或者填 API Key），不用去终端 */
 function CodexLogin({ id, onTab, onDone, again }) {
   const { t } = useT();
@@ -2326,6 +2451,7 @@ function CodexLogin({ id, onTab, onDone, again }) {
     setBusy(how);
     try {
       const r = await api.post(`/instances/${id}/chat/codex-login`, { how, ...body });
+      if (r?.switched) profileSwitched(id);
       if (how === 'device') setFlow(r);
       else onDone();
     } catch (e) {
@@ -2413,7 +2539,9 @@ function CodexSetup({ id, phase, onTab }) {
   const [setup, setSetup] = useState(null);
   const load = useCallback(async () => {
     try {
-      setSetup(await api.get(`/instances/${id}/chat/setup`));
+      const r = await api.get(`/instances/${id}/chat/setup`);
+      if (r?.switched) profileSwitched(id);
+      setSetup(r);
     } catch {
       // 读不到（app-server 还没起来、旧版 Codex 没有 hooks/list）：不显示，下次再看
     }
@@ -2716,7 +2844,8 @@ function AccountsDialog({ id, agent, onClose }) {
   // 设备码登录等着时 CodexLogin 每 3 秒叫一次：登录好了就关掉
   const codexDone = useCallback(async () => {
     const r = await api.get(`/instances/${id}/chat/setup`).catch(() => null);
-    if (r && !r.login_required && setup?.login_required) {
+    if (r?.switched) profileSwitched(id);
+    if (r && (r.switched || (!r.login_required && setup?.login_required))) {
       toast(t('chat.codex_login_done'), 'ok');
       onClose();
     } else reload();
@@ -2987,7 +3116,7 @@ function Popover({ onClose, className = '', children, label }) {
     };
   }, [onClose]);
   return (
-    <div ref={ref} className={`chat-pop ${className}`} role="menu" aria-label={label}>
+    <div ref={ref} className={`chat-pop ${className}`} role="menu" aria-label={label} {...pressMenu}>
       {children}
     </div>
   );
@@ -4121,11 +4250,9 @@ function Composer({ id, active, status, phase, touch, offline, models, usage, it
     const builtin = COMMANDS.filter(([name]) =>
       agentId === 'codex'
         ? CODEX_COMMANDS.includes(name)
-        : agentId === 'dsh'
-          ? DSH_COMMANDS.includes(name)
-          : agentId === 'agy'
-            ? AGY_COMMANDS.includes(name)
-            : !CODEX_ONLY.includes(name) && !AGY_ONLY.includes(name) && !(caps?.sdk && SDK_UNAVAILABLE.includes(name)),
+        : agentId === 'agy'
+          ? AGY_COMMANDS.includes(name)
+          : !CODEX_ONLY.includes(name) && !AGY_ONLY.includes(name) && !(caps?.sdk && SDK_UNAVAILABLE.includes(name)),
     ).map(([name, action]) => {
       const override = agentId === 'codex' ? CODEX_ACTIONS[name] : agentId === 'agy' ? AGY_ACTIONS[name] : null;
       // Codex / agy 里意思不一样的有自己的说明（codex_ / agy_ 开头），没有的用通用的
@@ -4219,7 +4346,7 @@ function Composer({ id, active, status, phase, touch, offline, models, usage, it
     const el = area.current;
     const at = el ? el.selectionStart ?? text.length : text.length;
     if (ch === '/') {
-      // Claude Code / DSH 的命令和技能只认开头的 /
+      // Claude Code 的命令和技能只认开头的 /
       const rest = text.replace(/^\s+/, '');
       setMentOff(null);
       setText(rest ? `/ ${rest}` : '/');
@@ -4313,7 +4440,7 @@ function Composer({ id, active, status, phase, touch, offline, models, usage, it
           <p className="chat-note">{t('chat.btw_note')}</p>
         </section>
       )}
-      {/^![^!]/.test(text) && agentId !== 'dsh' && agentId !== 'agy' && <p className="chat-bang-hint">{t('chat.bang_hint')}</p>}
+      {/^![^!]/.test(text) && agentId !== 'agy' && <p className="chat-bang-hint">{t('chat.bang_hint')}</p>}
       {slash.length > 0 && (
         <ul className="chat-slash" role="listbox">
           {slash.map((c, n) => (
@@ -4602,7 +4729,7 @@ function Composer({ id, active, status, phase, touch, offline, models, usage, it
           <button type="button" className="btn btn-plain btn-icon" onClick={() => picker.current?.click()} disabled={disabled} aria-label={t('chat.attach')} title={t('chat.attach_hint')}>
             <Paperclip size={17} />
           </button>
-          {/* 和终端里一样引用文件（@）、指定技能（Codex 是 $，Claude Code / DSH 是开头的 /） */}
+          {/* 和终端里一样引用文件（@）、指定技能（Codex 是 $，Claude Code 是开头的 /） */}
           <button type="button" className="btn btn-plain btn-icon chat-trigger-btn" onMouseDown={(e) => e.preventDefault()} onClick={() => insertTrigger('@')} disabled={disabled} aria-label={t('chat.mention')} title={t('chat.mention_hint')}>
             <AtSign size={17} />
           </button>
@@ -4615,21 +4742,6 @@ function Composer({ id, active, status, phase, touch, offline, models, usage, it
             <span className="ellipsis">{modeText}</span>
             <ChevronDown size={13} aria-hidden="true" />
           </button>
-          )}
-          {/* DSH 的计划模式：点了送 `/plan`、`/plan off`（DSH 自己的命令），开着时高亮 */}
-          {agentId === 'dsh' && (
-            <button
-              type="button"
-              className="btn btn-plain chat-chip chat-chip-mode"
-              data-mode={status?.mode === 'plan' ? 'plan' : ''}
-              aria-pressed={status?.mode === 'plan'}
-              disabled={!ready || phase === 'running'}
-              onClick={() => api.post(`/instances/${id}/chat/input`, { text: status?.mode === 'plan' ? '/plan off' : '/plan', images: [] }).catch((e) => toast(errorText(t, e), 'error'))}
-              title={t(status?.mode === 'plan' ? 'chat.dsh_plan_off' : 'chat.dsh_plan_on')}
-            >
-              <ListTodo size={14} aria-hidden="true" />
-              <span className="ellipsis">{t('chat.mode_plan')}</span>
-            </button>
           )}
           {/* 以前说过的话：点开搜（电脑上 Ctrl+R），选一句接到输入框里 */}
           <button type="button" className="btn btn-plain btn-icon chat-inputs-btn" data-pop-anchor="" aria-expanded={menu === 'inputs'} disabled={disabled} onClick={() => setMenu(menu === 'inputs' ? null : 'inputs')} aria-label={t('chat.inputs')} title={touch ? t('chat.inputs') : t('chat.inputs_hint')}>
@@ -4969,10 +5081,10 @@ function Detached({ id, status }) {
         </div>
       )}
       {(reason === 'claude_sdk' || reason?.startsWith?.('agy_')) && status?.error && <p className="chat-note chat-sdk-error">{status.error}</p>}
-      {(reason === 'not_running' || reason === 'ended' || reason === 'app_server' || reason === 'claude_sdk' || reason?.startsWith?.('dsh_') || reason?.startsWith?.('agy_')) && (
+      {(reason === 'not_running' || reason === 'ended' || reason === 'app_server' || reason === 'claude_sdk' || reason?.startsWith?.('agy_')) && (
         <div className="chat-acts">
           <Button busy={busy} onClick={relaunch}>
-            {t(reason === 'app_server' || reason === 'claude_sdk' || reason?.startsWith?.('dsh_') || reason?.startsWith?.('agy_') ? 'chat.relaunch_app_server' : status?.session_id ? 'chat.relaunch_resume' : 'chat.relaunch')}
+            {t(reason === 'app_server' || reason === 'claude_sdk' || reason?.startsWith?.('agy_') ? 'chat.relaunch_app_server' : status?.session_id ? 'chat.relaunch_resume' : 'chat.relaunch')}
           </Button>
         </div>
       )}
@@ -5218,7 +5330,7 @@ function ChangesTab({ id, items, onTab }) {
           <ul className="chat-files-list">
             {files.map((f) => {
               const abs = absPath(f.path, cwd);
-              const open = () => openFile?.({ ep: fileEndpoints(id), path: abs, list: files.map((x) => absPath(x.path, cwd)) });
+              const open = () => openFile?.({ ep: fileEndpoints(id), path: abs, list: files.map((x) => absPath(x.path, cwd)), diff: true });
               return (
                 <li key={f.path} title={f.path}>
                   <button type="button" className="chat-file-row" onClick={open} disabled={!openFile} aria-label={`${t('chat.file_open')} ${f.path}`}>
@@ -6133,7 +6245,6 @@ function AgyConfigTab({ id }) {
 const SIDE_TABS = ['changes', 'outline', 'tasks', 'usage', 'config'];
 const CODEX_TABS = ['changes', 'outline', 'agents', 'resources', 'usage', 'config'];
 const AGY_TABS = ['changes', 'outline', 'agents', 'usage', 'config'];
-const DSH_TABS = ['changes', 'outline', 'usage'];
 
 const RES_ICONS = { link: Globe, search: Search, image: ImageIcon };
 const ART_ICONS = { image: ImageIcon, pdf: FileText, video: FileText, audio: FileText, text: FileText, file: FileText };
@@ -6254,8 +6365,8 @@ function SidePanel({ id, tab, onTab, onClose, status, items, onTermTab, onCompac
   const { t } = useT();
   // 资源栏、子代理栏先只给 Codex（Claude 的子代理在“任务”里，和后台命令一起）
   const agentId = useContext(AgentCtx).id;
-  const tabs = agentId === 'claude' ? SIDE_TABS : agentId === 'dsh' || agentId === 'agy' ? DSH_TABS : CODEX_TABS;
-  // 记着的栏这个工具没有（例如从 Claude 的“任务”换到 DSH）：显示第一栏
+  const tabs = agentId === 'claude' ? SIDE_TABS : agentId === 'agy' ? AGY_TABS : CODEX_TABS;
+  // 记着的栏这个工具没有（例如从 Claude 的“任务”换到 agy）：显示第一栏
   if (!tabs.includes(tab)) tab = tabs[0];
   const bg = backgroundCounts(status);
   const running = (bg.subagent ?? 0) + (bg.shell ?? 0);
@@ -6288,7 +6399,7 @@ function SidePanel({ id, tab, onTab, onClose, status, items, onTermTab, onCompac
           {tab === 'tasks' && <TasksTab id={id} sel={agentSel} onSel={onAgentSel} />}
           {tab === 'agents' && <AgentsTab id={id} items={items} live={live} sel={agentSel} onSel={onAgentSel} />}
           {tab === 'usage' && <UsageTab id={id} status={status} onCompact={onCompact} />}
-          {tab === 'config' && (agentId === 'codex' ? <CodexConfigTab id={id} /> : <ConfigTab id={id} />)}
+          {tab === 'config' && (agentId === 'codex' ? <CodexConfigTab id={id} /> : agentId === 'agy' ? <AgyConfigTab id={id} /> : <ConfigTab id={id} />)}
           {tab === 'resources' && <ResourcesTab id={id} items={items} />}
           {tab === 'outline' && <OutlineTab items={items} {...outline} />}
         </ErrorBoundary>
@@ -6619,7 +6730,7 @@ function ChatFresh({ kind, title, agent }) {
   );
 }
 
-export default function ChatView({ id, launch, active, touch, offline = false, onTab, onDraftBack, label }) {
+export default function ChatView({ id, launch, workdir = null, active, touch, offline = false, onTab, onDraftBack, label }) {
   const router = useRouter();
   const chat = useChat(id, active);
   const { status, items: allItems } = chat;
@@ -6701,7 +6812,13 @@ export default function ChatView({ id, launch, active, touch, offline = false, o
     }
   }, []);
   // 模型菜单的选项、上下文窗口：模型变了重新取
-  const modelKey = `${status?.actual_model ?? ''}|${status?.model ?? ''}|${phase === 'detached'}`;
+  const [profileGen, setProfileGen] = useState(0);
+  useEffect(() => {
+    const on = () => setProfileGen((n) => n + 1);
+    window.addEventListener(`ll-chat-profile:${id}`, on);
+    return () => window.removeEventListener(`ll-chat-profile:${id}`, on);
+  }, [id]);
+  const modelKey = `${status?.actual_model ?? ''}|${status?.model ?? ''}|${phase === 'detached'}|${profileGen}`;
   const { data: models } = usePoll(`/instances/${id}/chat/models`, { enabled: caps?.models !== false && status != null && phase !== 'detached', deps: [modelKey] });
   const { data: usage } = usePoll(`/instances/${id}/chat/usage`, { enabled: caps?.usage !== false && status != null, deps: [status?.actual_model, status?.context] });
   // 产出的文件：对话有新条目时重新取（只有 Codex 有）
@@ -6711,7 +6828,7 @@ export default function ChatView({ id, launch, active, touch, offline = false, o
   // 网址：系统浏览器 / 远程浏览器（会话所在那台电脑上的）
   const links = useLinkOpen(terminalDevice(id));
   const knownDir = useSessions()?.known(id)?.workdir;
-  const cwd = status?.cwd ?? knownDir ?? null;
+  const cwd = status?.cwd ?? knownDir ?? workdir ?? null;
   const convFiles = useMemo(() => conversationFiles(items, cwd), [items, cwd]);
   const previewCtx = useMemo(() => ({ open: files.open, cwd, files: convFiles }), [files.open, cwd, convFiles]);
   // 右侧面板里打开着的子代理（对话里的卡片、运行中的子代理条、面板里的列表都能打开）；看步骤时面板可以加宽
@@ -6720,11 +6837,22 @@ export default function ChatView({ id, launch, active, touch, offline = false, o
   const openAgent = useCallback(
     (a) => {
       setAgentSel(a);
-      setSide(agentId === 'claude' ? 'tasks' : agentId === 'dsh' || agentId === 'agy' ? 'outline' : 'agents');
+      setSide(agentId === 'claude' ? 'tasks' : agentId === 'agy' ? 'outline' : 'agents');
     },
     [agentId, setSide],
   );
   const sideCtx = useMemo(() => ({ openAgent, wide, onWide: setWide }), [openAgent, wide]);
+  // 回复里提到的文件路径：问那台电脑哪些存在（相对路径按会话目录），存在的换成链接（files/pathLinks.js）
+  const pathLinks = useMemo(() => {
+    const ops = deviceApi(terminalDevice(id) ?? undefined);
+    const resolve = pathResolver((paths) => ops.post('/fs/exists', { paths, base: cwd ?? undefined }).then((r) => r?.items ?? []));
+    const root = cwd ? cwd.replace(/[\\/]+$/, '') : null;
+    return {
+      resolve,
+      href: (abs, from, to) => `${localFileUrl(id, abs)}${from ? `&line=${from}&to=${to || from}` : ''}`,
+      outside: (abs) => (root && abs !== root && !abs.startsWith(`${root}${pathSep(root)}`) ? t('chat.path_outside') : ''),
+    };
+  }, [id, cwd, t]);
   const artifactCtx = useMemo(() => {
     const list = arts?.items ?? [];
     const links = {};
@@ -6733,8 +6861,8 @@ export default function ChatView({ id, launch, active, touch, offline = false, o
       // 文字里的写法，加上完整路径的两种斜杠（Codex 引用文件时用正斜杠，路径里可能有空格）
       for (const m of [...(a.mentions ?? []), a.path, a.path.replaceAll('\\', '/')]) links[m] = url;
     }
-    return { list, links: list.length ? links : null, fileUrl: (p) => localFileUrl(id, p) };
-  }, [arts, id]);
+    return { list, links: list.length ? links : null, fileUrl: (p) => localFileUrl(id, p), paths: pathLinks };
+  }, [arts, id, pathLinks]);
   // 这一轮从什么时候开始跑的（运行中显示用了多久）；等审批时接着算
   const [since, setSince] = useState(null);
   useEffect(() => {
@@ -6949,6 +7077,7 @@ export default function ChatView({ id, launch, active, touch, offline = false, o
           <Composer id={id} active={active} status={status} phase={phase} touch={touch} offline={offline && !chat.online} models={models} usage={usage} items={items} onAction={onAction} onSide={setSide} />
         </div>
       </div>
+      {files.dock}
       {side && (
         <SidePanel
           id={id}

@@ -2,7 +2,7 @@
 // - 零配置：点击链接即弹出精美悬浮动作面板（桌面端智能定位，移动端底部抽屉）；
 // - 未绑定指纹浏览器：本机打开 / 复制链接 / 绑定指纹浏览器（原位弹窗完成绑定）；
 // - 已绑定指纹浏览器：在指纹浏览器中打开（含实时状态点；若未启动则弹窗确认启动并打开）/ 本机打开 / 复制链接；
-// - ⌘ / Ctrl + 点击快捷直开本机浏览器，右键与长按保持原生菜单。
+// - ⌘ / Ctrl + 点击同样弹菜单（不再直开），右键与长按保持原生菜单。
 import { Copy, ExternalLink, Globe, Link2, Settings2, X } from 'lucide-react';
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
@@ -109,10 +109,6 @@ export function useLinkOpen(device, onClosed) {
       } catch {
         return false;
       }
-      if (opts.mod) {
-        window.open(url, '_blank', 'noopener,noreferrer');
-        return true;
-      }
       const initial = cachedBinding(device) || { bound: false };
       setMenu({ url, x, y, top: opts.top ?? y - 8, binding: initial });
       fetchBinding(device, true).then((fresh) => {
@@ -125,7 +121,7 @@ export function useLinkOpen(device, onClosed) {
 
   const onClickCapture = useCallback(
     (e) => {
-      if (e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+      if (e.defaultPrevented || e.button !== 0) return;
       if (e.target.closest?.('.md img, .link-pop, .link-pop-backdrop')) return;
       const a = e.target.closest?.('a[href]');
       if (!a || a.hasAttribute('download') || a.classList.contains('md-file') || a.closest('[contenteditable="true"]')) return;

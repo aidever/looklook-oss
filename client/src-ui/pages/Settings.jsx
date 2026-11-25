@@ -340,7 +340,7 @@ export default function Settings() {
             }
           />
           <UpdateCheck />
-          {/* Claude Code、Codex、DSH 的版本和自动更新在 AI 助手页：在这里找更新的人点一下过去 */}
+          {/* Claude Code、Codex、Antigravity 的版本和自动更新在 AI 助手页：在这里找更新的人点一下过去 */}
           <Row label={t('aup.settings_link')} hint={t('aup.settings_link_hint')}>
             <Link to="/ai#updates">{t('aup.settings_link_go')}</Link>
           </Row>

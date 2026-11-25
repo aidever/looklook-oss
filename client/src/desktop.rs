@@ -440,11 +440,11 @@ fn show_main(app: &AppHandle) {
 ///
 /// `console`：本机管理台地址；`url`：窗口一开始加载的地址。网页新开的窗口先加载 about:blank，由 WebKit / WebView2
 /// 把请求的页面载入返回的窗口（Tauri 文档的做法）。自己再加载一次目标地址会有两次导航，前一次被取消后
-/// macOS 上 WKWebView 的地址短暂为空，wry 读它时 panic，应用直接崩溃（用户报告：打开 DSH、终端“新窗口打开”）。
+/// macOS 上 WKWebView 的地址短暂为空，wry 读它时 panic，应用直接崩溃（用户报告：终端“新窗口打开”）。
 fn window<'a>(app: &'a AppHandle, label: &str, console: Url, url: Url) -> WebviewWindowBuilder<'a, Wry, AppHandle> {
     let handle = app.clone();
     WebviewWindowBuilder::new(app, label, WebviewUrl::External(url))
-        // 管理台据此知道自己在桌面应用里（例如 DSH 改由系统浏览器打开）
+        // 管理台据此知道自己在桌面应用里
         .initialization_script("window.__LOOKLOOK_DESKTOP__ = true;")
         .title(tr("看看", "Looklook"))
         // macOS：窗口在后台时点一下就生效（例如直接切到侧栏里的会话），不用先点一下把窗口叫到前面
@@ -461,7 +461,7 @@ fn window<'a>(app: &'a AppHandle, label: &str, console: Url, url: Url) -> Webvie
             }
             // macOS：交回 Tauri 新建的网页视图（上面那种做法）在 1.19 上仍会让 WebKit 抛 Objective-C 异常，应用直接退出
             // （问题报告里只有一条 “panic in a function that cannot unwind”，没有 Rust 自己的 panic 信息）。
-            // 先开空白页再跳转的（DSH、未运行的终端）交给 wry 按 WebKit 的要求自己建窗口，页面拿得到窗口句柄；
+            // 先开空白页再跳转的（未运行的终端）交给 wry 按 WebKit 的要求自己建窗口，页面拿得到窗口句柄；
             // 直接打开本机网址的，拒绝这次请求，等回调结束后再照常新建应用窗口。
             if cfg!(target_os = "macos") {
                 if target.as_str() == "about:blank" {

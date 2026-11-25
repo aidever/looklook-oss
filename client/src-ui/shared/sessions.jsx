@@ -111,16 +111,15 @@ export async function renameSession({ id, current, client, confirm, t, toast }) 
 /** 图标用的类型：现在在跑的 AI 工具（普通终端里手动起的 claude、codex 也算，电脑端 session_probe.rs 认的），否则会话的类型 */
 export const sessionLaunch = (i) => (i?.launch === 'agy' && i?.chat_ui ? 'agy' : i?.tool || i?.launch);
 /**
- * 会话是怎么用这个 AI 工具的：'chat' 对话界面、'term' 在终端里跑（手动起的、没开对话界面的）、'web' DSH 网页版；
+ * 会话是怎么用这个 AI 工具的：'chat' 对话界面、'term' 在终端里跑（手动起的、没开对话界面的）；
  * 不是 AI 工具（普通终端、自定义命令）为 null。同一个工具两种用法图标一样，靠这个加角标区分。
  */
 export function sessionMode(i) {
   if (!i) return null;
   if (i.launch === 'agy' && i.chat_ui) return 'chat';
   const l = sessionLaunch(i);
-  if (!['claude', 'codex', 'opencode', 'dsh', 'agy'].includes(l)) return null;
-  if (l === 'dsh' && i.launch === 'dsh' && !i.chat_ui) return 'web';
-  return ['claude', 'codex', 'dsh', 'agy'].includes(i.launch) && i.chat_ui && l === i.launch ? 'chat' : 'term';
+  if (!['claude', 'codex', 'agy'].includes(l)) return null;
+  return ['claude', 'codex', 'agy'].includes(i.launch) && i.chat_ui && l === i.launch ? 'chat' : 'term';
 }
 /** 用户自己起的名字（和 agent 的会话名不一样时作为次要信息显示）。 */
 export const customName = (i) => {
@@ -150,13 +149,13 @@ const instDir = (i) => {
 };
 
 /** 能接着以前的对话的工具（客户端 history.rs 的 AGENTS）。 */
-export const AGENTS = ['claude', 'codex', 'opencode', 'agy'];
+export const AGENTS = ['claude', 'codex', 'agy'];
 /** 项目页的地址。 */
 export const projectPath = (p) => `/project?${new URLSearchParams({ d: p.device ?? '', w: p.workdir })}`;
 
 /**
  * 项目里的会话合成一个列表：在运行的（`live`）+ 停了的终端和以前的对话（`rest`，从新到旧）。
- * 那台电脑能接着以前的对话时，停了的 Claude Code / Codex / OpenCode 会话不单列（`stopped`）：它的对话在以前的对话里，
+ * 那台电脑能接着以前的对话时，停了的 Claude Code / Codex / Antigravity 会话不单列（`stopped`）：它的对话在以前的对话里，
  * 点一下接着聊；不能接着、或者不知道能不能（旧版客户端）时照旧列出来。正开在会话里的对话只列那个会话。
  * `count` 是一共多少个（以前的对话按总数算，不只是带着的这几个）。`convs` 不给时用项目上带着的最近几个。
  */

@@ -168,7 +168,7 @@ export function SelectText({ text, onQuote = null, onClose }) {
 
 /**
  * 用户消息下面悬停出现的操作（跟 Claude / Codex 桌面版一样）：复制、编辑（`onEdit`：就地改这句，丢掉之后的对话从这里重新来）。
- * 这种会话改不了（终端模式、DSH）时铅笔换成“填回输入框”（改一改作为新的一句发）。
+ * 这种会话改不了（终端模式）时铅笔换成“填回输入框”（改一改作为新的一句发）。
  * editOff：暂时不能改的原因（连不上电脑），按钮灰掉、悬停显示原因。
  */
 export function UserActs({ id, text, onEdit, editOff = '' }) {

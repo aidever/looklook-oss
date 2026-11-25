@@ -1,4 +1,4 @@
-// AI 工具版本：Claude Code、Codex、DSH、Antigravity 现在的版本、有没有新版本（“当前 → 新版本”）、一键更新，每个一个“自动更新”开关。
+// AI 工具版本：Claude Code、Codex、Antigravity 现在的版本、有没有新版本（“当前 → 新版本”）、一键更新，每个一个“自动更新”开关。
 // 放在 AI 助手页“账号与模型”最上面（设置 → 关于里也有入口）。后端见 src/agent_update.rs：
 // 按用户实际的安装方式更新（npm / pnpm / bun、Claude Code 安装脚本的 `claude update`、Homebrew、`agy update`）；
 // 自动更新等到没有会话正在用这个工具时才装，不打断在跑的会话。装的进度和“一键安装”共用 `GET /tools/install/{tool}`。
@@ -12,7 +12,7 @@ import { errorText } from '../shared/i18n.js';
 import { InstallSteps } from './Terminals.jsx';
 import { Button, Card, CopyButton, ErrorNote, Note, Skeleton, Switch, Time, useConfirm, useLoad, useToast } from '../shared/ui.jsx';
 
-const NAMES = { claude: 'Claude Code', codex: 'Codex', dsh: 'DSH', agy: 'Antigravity' };
+const NAMES = { claude: 'Claude Code', codex: 'Codex', agy: 'Antigravity' };
 
 /** 上次更新的结果：成功、失败（能照着做的提示） */
 function LastOutcome({ item }) {

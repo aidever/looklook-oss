@@ -16,8 +16,10 @@ import { attachTextInput } from './input.js';
 
 const PAD = 5; // 四周留白（和 xterm 的页面一样）
 const BUCKET = 64; // 回滚区一块的行数
-const MAX_HIST = 20000; // 浏览器里最多留这么多回滚行
-const FIRST_HISTORY = 2000; // 连上后先取这么多
+const MAX_HIST = 20000; // 往上翻看时浏览器里最多留这么多回滚行
+// 停在最下面时只留这么多（手机上七八屏）：页面里元素太多（agy 的回滚行一个汉字一个元素，两千行就两万多个）手机弹键盘要等好一会儿；早的往上翻时再取
+const KEEP_HIST = 300;
+const FIRST_HISTORY = KEEP_HIST; // 连上后先取这么多
 const OLDER_BATCH = 1000; // 往上翻到头时再取这么多
 
 export const isTouch = () => Boolean(window.matchMedia && window.matchMedia('(hover: none) and (pointer: coarse)').matches);
@@ -427,8 +429,14 @@ export class DomTerminal {
       this.programScroll = false;
       return;
     }
+    const was = this.stick;
     this.stick = this.atBottom();
     this.pill.classList.toggle('on', !this.stick && !this.appMode());
+    // 翻看完回到最下面：多取的早期行丢掉
+    if (this.stick && !was && !this.frozen && this.histCount > KEEP_HIST + BUCKET) {
+      this.dropOldest(KEEP_HIST);
+      this.scrollToBottom();
+    }
     if (this.root.scrollTop < this.root.clientHeight * 2) this.loadOlder();
   }
 
@@ -449,6 +457,7 @@ export class DomTerminal {
   toBottom() {
     this.stick = true;
     this.pill.classList.remove('on');
+    if (!this.frozen) this.dropOldest(KEEP_HIST);
     this.scrollToBottom();
   }
 
@@ -523,12 +532,17 @@ export class DomTerminal {
       if (row.seq > this.maxSeq) this.maxSeq = row.seq;
     }
     // 太多了丢掉最早的块
-    while (this.histCount > MAX_HIST && this.bucketKeys.length > 1) {
-      const k = this.bucketKeys.shift();
-      const b = this.buckets.get(k);
+    this.dropOldest(this.stick && !this.frozen ? KEEP_HIST : MAX_HIST);
+  }
+
+  /** 丢掉最早的整块，留下不少于 keep 行（丢掉的往上翻到头时 loadOlder 再取） */
+  dropOldest(keep) {
+    while (this.bucketKeys.length > 1) {
+      const b = this.buckets.get(this.bucketKeys[0]);
+      if (this.histCount - b.children.length < keep) break;
+      this.buckets.delete(this.bucketKeys.shift());
       this.histCount -= b.children.length;
       b.remove();
-      this.buckets.delete(k);
       const first = this.buckets.get(this.bucketKeys[0]);
       this.minSeq = first?.firstElementChild ? Number(first.firstElementChild.dataset.seq) : Infinity;
     }
@@ -659,12 +673,17 @@ export class DomTerminal {
   sendTyped(text) {
     if (this.disableStdin || !text) return;
     const mods = window.__llApplyMods;
-    this.conn.input(typeof mods === 'function' ? mods(text) : text, true);
+    const out = typeof mods === 'function' ? mods(text) : text;
+    // 按键条的 Ctrl / Alt 把字变成了控制键：终端里没有这个字，输入框也清空
+    if (out !== text) this.textInput?.reset();
+    this.conn.input(out, true);
     this.toBottomOnInput();
   }
 
-  sendRaw(data) {
+  /** keepInput：输入框自己按差补发的退格，不清空输入框；别的（按键条、回车、方向键、粘贴）都清空，跟终端重新对齐 */
+  sendRaw(data, keepInput) {
     if (this.disableStdin) return;
+    if (!keepInput) this.textInput?.reset();
     this.conn.input(data);
     this.toBottomOnInput();
   }
@@ -679,9 +698,9 @@ export class DomTerminal {
   }
 
   setupInput() {
-    attachTextInput(this.ta, {
+    this.textInput = attachTextInput(this.ta, {
       modes: () => this.modes,
-      sendRaw: (d) => this.sendRaw(d),
+      sendRaw: (d, keep) => this.sendRaw(d, keep),
       sendTyped: (t) => this.sendTyped(t),
       paste: (t) => this.paste(t),
     });

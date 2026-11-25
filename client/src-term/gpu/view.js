@@ -125,9 +125,9 @@ export class GpuTerminal {
     this.applyFont();
     this.applyTheme();
 
-    attachTextInput(ta, {
+    this.textInput = attachTextInput(ta, {
       modes: () => this.modes,
-      sendRaw: (d) => this.sendRaw(d),
+      sendRaw: (d, keep) => this.sendRaw(d, keep),
       sendTyped: (t) => this.sendTyped(t),
       paste: (t) => this.paste(t),
       onKey: (e) => this.onKey(e),
@@ -364,12 +364,17 @@ export class GpuTerminal {
   sendTyped(text) {
     if (this.disableStdin || !text) return;
     const mods = window.__llApplyMods;
-    this.conn.input(typeof mods === 'function' ? mods(text) : text, true);
+    const out = typeof mods === 'function' ? mods(text) : text;
+    // 按键条的 Ctrl / Alt 把字变成了控制键：终端里没有这个字，输入框也清空
+    if (out !== text) this.textInput?.reset();
+    this.conn.input(out, true);
     this.afterInput();
   }
 
-  sendRaw(data) {
+  /** keepInput：输入框自己按差补发的退格，不清空输入框；别的（按键条、回车、方向键、粘贴）都清空，跟终端重新对齐 */
+  sendRaw(data, keepInput) {
     if (this.disableStdin) return;
+    if (!keepInput) this.textInput?.reset();
     this.conn.input(data);
     this.afterInput();
   }

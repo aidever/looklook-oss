@@ -51,7 +51,7 @@ pub fn claude_prompts(dirs: &[PathBuf], project: &Path, limit: usize) -> Vec<Pro
 }
 
 /// 看看自己记的输入历史（`<home>/inputs.jsonl`）：在看看里发出去的每一句，所有工具都记。
-/// Claude Code 的对话模式（`claude -p`）不写 history.jsonl，Codex、DSH 没有按项目的历史，只靠它。
+/// Claude Code 的对话模式（`claude -p`）不写 history.jsonl，Codex 没有按项目的历史，只靠它。
 /// 每行 `{"text", "at", "workdir", "agent", "session"?}`。
 const OWN_FILE: &str = "inputs.jsonl";
 /// 超过这么大时只留后一半

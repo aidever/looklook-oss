@@ -54,7 +54,7 @@ const K = {
   pgdn: { label: 'PgDn', seq: tilde(6), repeat: true },
   ins: { label: 'Ins', seq: tilde(2) },
   del: { label: 'Del', seq: tilde(3), repeat: true },
-  // ⇧↵ 换行：发 Ctrl+J（\n），Claude Code / Codex / OpenCode 都当作输入框里的换行；普通 shell 里与回车一样。
+  // ⇧↵ 换行：发 Ctrl+J（\n），Claude Code / Codex 都当作输入框里的换行；普通 shell 里与回车一样。
   enter: { label: '↵', seq: (m) => (m.shift && !m.ctrl && !m.alt ? '\n' : m.alt ? '\x1b\r' : '\r') },
   bksp: { label: '⌫', seq: (m) => (m.ctrl ? '\x08' : m.alt ? '\x1b\x7f' : '\x7f'), repeat: true },
 };
@@ -76,13 +76,13 @@ export const MAIN_ROWS = [
 export const COMPACT_ROW = ['esc', 'tab', 'ctrl', 'left', 'up', 'down', 'right', 'ime', 'enter'];
 
 /**
- * 终端里跑的是 AI 编程助手（Claude Code / Codex / OpenCode）时：两行里的 Alt、一行里的 Ctrl 换成“换行”（nl，Ctrl+J），
+ * 终端里跑的是 AI 编程助手（Claude Code / Codex）时：两行里的 Alt、一行里的 Ctrl 换成“换行”（nl，Ctrl+J），
  * 手机上点一下就能在输入框里换行（这些工具里很少用 Alt，打断用 Esc）。Alt / Ctrl 还在“更多”面板里。
  */
 export const AI_MAIN_ROWS = [MAIN_ROWS[0].map((id) => (id === 'alt' ? 'nl' : id)), MAIN_ROWS[1]];
 export const AI_COMPACT_ROW = COMPACT_ROW.map((id) => (id === 'ctrl' ? 'nl' : id));
 /** 用这套按键的终端（instance.launch）。 */
-export const AI_LAUNCHES = ['codex', 'claude', 'opencode'];
+export const AI_LAUNCHES = ['codex', 'claude'];
 
 export const KEYS = {
   ...K,

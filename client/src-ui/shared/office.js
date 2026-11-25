@@ -1,4 +1,5 @@
-// 办公文件预览用到的纯函数（文件种类、CSV 解析、列名），界面在 pages/OfficePreview.jsx（docs/PLAN_2026-10-27.md §6.1）。
+// 办公文件预览用到的纯函数（文件种类、CSV 解析、列名），界面在 pages/OfficePreview.jsx（docs/PLAN_2026-10-27.md §6.1；
+// docx / pptx / 旧格式见 docs/FILES_REDO_DESIGN_2026-11-24.md §4.4.1）。
 
 /** 超过这个大小不取回来预览（整个文件要读进浏览器） */
 export const OFFICE_MAX = 20 * 1024 * 1024;
@@ -7,18 +8,23 @@ export const MAX_ROWS = 500;
 const KINDS = [
   ['pdf', /\.pdf$/i],
   ['docx', /\.docx$/i],
+  ['pptx', /\.pptx$/i],
   ['xlsx', /\.xlsx$/i],
+  // 旧格式：doc / ppt 先在浏览器里用 x2t 转成 docx / pptx（shared/x2t.js）；表格类用 SheetJS 直接读
+  ['doc', /\.doc$/i],
+  ['ppt', /\.ppt$/i],
+  ['xls', /\.(xls|xlsm|xlsb|ods)$/i],
   ['csv', /\.(csv|tsv)$/i],
-  ['other', /\.(doc|xls|xlsm|xlsb|ppt|pptx|odt|ods|odp|key|pages|numbers)$/i],
+  ['other', /\.(odt|odp|key|pages|numbers)$/i],
 ];
 
-/** 'pdf' | 'docx' | 'xlsx' | 'csv' | 'other'（预览不了的办公文件）| null */
+/** 'pdf' | 'docx' | 'pptx' | 'xlsx' | 'doc' | 'ppt' | 'xls' | 'csv' | 'other'（预览不了的办公文件）| null */
 export function officeKind(name) {
   return KINDS.find(([, re]) => re.test(name))?.[0] ?? null;
 }
 
 /** 要取回整个文件再渲染的种类（CSV 用文本预览接口） */
-export const WHOLE = ['pdf', 'docx', 'xlsx'];
+export const WHOLE = ['pdf', 'docx', 'pptx', 'xlsx', 'doc', 'ppt', 'xls'];
 
 /** CSV / TSV → 行（按 RFC 4180：引号里可以有分隔符、换行，两个引号表示一个引号）。分号分隔的（欧洲地区的 Excel 导出）按第一行猜 */
 export function parseCsv(text, name) {

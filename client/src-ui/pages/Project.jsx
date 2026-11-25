@@ -1,6 +1,6 @@
 // 项目页（/project?d=电脑&w=文件夹）：这个文件夹里的全部会话。在运行的在前，其余（停了的终端、以前的对话）按时间分组；
 // 以前的对话每次取 50 个（GET /history?workdir=…&before=…），翻到底再取。搜索先在取到的里找，回车在对话全文里搜。
-// 停了的 Claude Code / Codex / OpenCode 会话收在最下面：它们的对话已经在上面的列表里了，点一下就接着聊。
+// 停了的 Claude Code / Codex / Antigravity 会话收在最下面：它们的对话已经在上面的列表里了，点一下就接着聊。
 // `c=工具:对话号` 时展开那个对话（侧栏里点了可能正开在别处的对话，在这里看提示再选）。
 // 多台电脑上的同一个仓库（侧栏里合成一个项目）：上面可以切到别的电脑上的那个文件夹。
 import { ChevronDown, Folder, GitBranch, Pin, PinOff, Plus, Search, SquareTerminal, Trash2 } from 'lucide-react';

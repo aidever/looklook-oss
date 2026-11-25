@@ -1,4 +1,4 @@
-// 添加项目：选一台电脑，从那台电脑上有过对话的文件夹里勾（GET /history/folders，Claude Code、Codex、OpenCode 的记录里的工作目录），
+// 添加项目：选一台电脑，从那台电脑上有过对话的文件夹里勾（GET /history/folders，Claude Code、Codex、Antigravity 的记录里的工作目录），
 // 也可以粘贴路径、浏览文件夹。加进来后项目下面自动列出这个文件夹里以前的对话。
 // 新用户的开始页上也摆几个找到的文件夹（DiscoverCard），点一下就加。
 import { FolderOpen, FolderPlus, Search } from 'lucide-react';

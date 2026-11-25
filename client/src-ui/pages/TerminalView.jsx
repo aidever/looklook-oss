@@ -22,6 +22,7 @@ import PopMenu from '../shared/PopMenu.jsx';
 import { setWakeLock, useWakeLock, wakeLockSupported } from '../shared/wakeLock.js';
 import { useRouter } from '../shared/router.jsx';
 import { customName, sessionTitle, useSessions } from '../shared/sessions.jsx';
+import { knownInstance, rememberInstance } from '../shared/snapshot.js';
 import { SessionIcon } from '../shared/brands.jsx';
 import TextSelect, { useTextSelect } from '../shared/TextSelect.jsx';
 import { TermThemeModal } from '../shared/ThemePicker.jsx';
@@ -31,7 +32,6 @@ import ChatView from './ChatView.jsx';
 import FileBrowser from './FileBrowser.jsx';
 import GitPanel from './GitPanel.jsx';
 import { ProjectPages } from './Pages.jsx';
-import { WebPage } from './WebPane.jsx';
 import { useTermFiles } from './TermFiles.jsx';
 import { APP_CHROME, termTheme, termVars } from '../shared/termTheme.js';
 import { useOpenedPing, useSeenPing } from '../shared/board.js';
@@ -219,26 +219,22 @@ export const hasChat = (inst) => Boolean(CHAT_LAUNCHES.includes(inst?.launch) &&
 
 /**
  * 当前标签，按终端记在浏览器里。带对话界面的终端默认打开“对话”。
+ * 直接算出来、不靠 effect 改：effect 要等渲染后才改，进对话会话会先闪一帧终端。
+ * 还不知道是不是对话会话（`chat` 为 undefined）、也没选过时为 null：页面按应用配色、不显示终端专用的按钮。
  */
 function useTab(id, chat) {
   const key = `ll-tab:${id}`;
-  const read = () => {
+  const [stored, setStored] = useState(() => {
     try {
       return localStorage.getItem(key);
     } catch {
       return null;
     }
-  };
-  const [tab, setTabState] = useState(() => read() ?? 'term');
-  const chosen = useRef(read() != null);
-  useEffect(() => {
-    if (chat === undefined) return;
-    if (chat && !chosen.current) setTabState('chat');
-    if (!chat && tab === 'chat') setTabState('term');
-  }, [chat]);
+  });
+  let tab = stored ?? (chat ? 'chat' : chat === false ? 'term' : null);
+  if (tab === 'chat' && chat === false) tab = 'term';
   const setTab = (v) => {
-    chosen.current = true;
-    setTabState(v);
+    setStored(v);
     try {
       localStorage.setItem(key, v);
     } catch {
@@ -642,7 +638,7 @@ export function TermPane({ id, inst, active, missing, offline = false, onStart, 
         {running && chat && (
           <div className="term-files-tab chat-tab" hidden={tab !== 'chat'}>
             <ErrorBoundary>
-              <ChatView id={id} launch={inst?.launch} active={active && tab === 'chat'} touch={false} offline={offline} onTab={setTab} onDraftBack={draftBack} />
+              <ChatView id={id} launch={inst?.launch} workdir={inst?.workdir} active={active && tab === 'chat'} touch={false} offline={offline} onTab={setTab} onDraftBack={draftBack} />
             </ErrorBoundary>
           </div>
         )}
@@ -651,19 +647,13 @@ export function TermPane({ id, inst, active, missing, offline = false, onStart, 
   );
 }
 
-/** 手机上整页打开的会话。网页类型（DSH，地址带 ?web）打开它的网页（WebPane.jsx）。 */
+/** 手机上整页打开的会话。 */
 export default function TerminalView({ id }) {
   useEffect(() => {
     setFocusedDevice(terminalDevice(id) ?? selectedDevice());
     return () => setFocusedDevice(null);
   }, [id]);
-  if (new URLSearchParams(window.location.search).has('web')) return <WebPageLoader id={id} />;
   return <TermPage id={id} />;
-}
-
-function WebPageLoader({ id }) {
-  const [inst] = useLoad(() => api.get(`/instances/${id}`), [id]);
-  return <WebPage id={id} inst={inst} />;
 }
 
 function TermPage({ id }) {
@@ -690,7 +680,10 @@ function TermPage({ id }) {
   const transient = Boolean(loadError) && (!loadError.status || loadError.status >= 500);
   const inst = loadedInst ?? (transient && last.current?.id === id ? last.current.inst : null);
   const error = transient ? null : loadError;
-  const chat = inst ? hasChat(inst) : undefined;
+  // 还没拿到这个会话时先用会话列表里见过的（从列表点进来时已经有了）：顶栏图标、标题和标签马上对，不先显示成终端
+  if (loadedInst) rememberInstance(loadedInst);
+  const guess = inst ?? (error ? null : knownInstance(id));
+  const chat = guess ? hasChat(guess) : undefined;
   const first = useFirstSend(id);
   const draftBack = useDraftBack(id, inst);
   const [tab0, setTab] = useTab(id, chat);
@@ -700,6 +693,9 @@ function TermPage({ id }) {
   const allowed = status.account.allowed;
   const running = inst?.running;
   const live = Boolean(running && allowed);
+  // 对话界面不靠这里拿到的会话信息（只要 id 和类型）：还没拿到时按列表里见过的先挂上，对话内容不用等这一轮请求；
+  // 拿到后发现停了、不是对话会话就照常换掉
+  const chatLive = live || Boolean(!inst && !error && guess?.running && allowed);
   // 连不上电脑（重连中、网络断了、电脑离线）：终端内容照样显示，只是不能输入
   const offline = Boolean(transient && inst);
   const cut = useOffline(frame, offline && live, loaded);
@@ -855,10 +851,10 @@ function TermPage({ id }) {
         <span className="term-title">
           {/* 手机上的会话页：工具图标，右下角一个在线小点 */}
           <span className="term-lead">
-            <SessionIcon inst={inst} size={18} />
+            {guess ? <SessionIcon inst={guess} size={18} /> : <span style={{ display: 'inline-block', width: 18, height: 18 }} />}
             <span className={`dot ${live ? 'on' : ''}`} />
           </span>
-          <span className="ellipsis">{inst ? sessionTitle(inst) : "…"}</span>
+          <span className="ellipsis">{guess ? sessionTitle(guess) : '…'}</span>
           {live && <LinkBadge id={id} />}
         </span>
         {tab === 'term' && <NewlineHint inst={inst} touch={touch} />}
@@ -920,10 +916,10 @@ function TermPage({ id }) {
             <ProjectPages id={id} workdir={inst?.workdir} active={tab === 'pages'} />
           </div>
         )}
-        {live && chat && (
+        {chatLive && chat && (
           <div className="term-files-tab chat-tab" hidden={tab !== 'chat'}>
             <ErrorBoundary>
-              <ChatView id={id} launch={inst?.launch} active={tab === 'chat'} touch={touch} offline={offline} onTab={setTab} onDraftBack={draftBack} />
+              <ChatView id={id} launch={guess?.launch} workdir={guess?.workdir} active={tab === 'chat'} touch={touch} offline={offline} onTab={setTab} onDraftBack={draftBack} />
             </ErrorBoundary>
           </div>
         )}

@@ -522,8 +522,6 @@ pub fn zip(paths: &[String]) -> R<(std::fs::File, String)> {
 // ---------------- 编辑保存、跟随日志（§9.4 J4 / J5） ----------------
 
 /// 能在页面里编辑的最大文件（和预览一样 1 MiB）。
-pub const EDIT_MAX: u64 = 1024 * 1024;
-
 fn file_mtime(p: &Path) -> R<(std::fs::Metadata, i64)> {
     let m = std::fs::metadata(p).map_err(|e| io_err(e, p))?;
     if !m.is_file() {
@@ -531,23 +529,6 @@ fn file_mtime(p: &Path) -> R<(std::fs::Metadata, i64)> {
     }
     let t = mtime(&m).unwrap_or(0);
     Ok((m, t))
-}
-
-/// 保存编辑过的文字文件，返回新的修改时间。`if_mtime`：打开时的修改时间，对不上（期间被改过）报 FILE_CHANGED，
-/// 界面问覆盖还是重新载入；覆盖时不带。原地写（保留权限、属主、硬链接），不新建文件。
-pub fn write(path: &str, content: &str, if_mtime: Option<i64>) -> R<i64> {
-    let p = absolute(path)?;
-    let (m, now) = file_mtime(&p)?;
-    if m.len() > EDIT_MAX || content.len() as u64 > EDIT_MAX {
-        return Err(LocalError::new("FILE_TOO_BIG").with("max", EDIT_MAX));
-    }
-    if let Some(want) = if_mtime {
-        if want != now {
-            return Err(LocalError::new("FILE_CHANGED").with("mtime_ms", now));
-        }
-    }
-    std::fs::write(&p, content).map_err(|e| io_err(e, &p))?;
-    Ok(file_mtime(&p)?.1)
 }
 
 #[derive(Debug, Serialize)]
@@ -702,13 +683,14 @@ mod tests {
         let f = tmp.path().join("a.log");
         std::fs::write(&f, "one\n").unwrap();
         let p = f.display().to_string();
+        let w = |p: &str, c: &str, m: Option<i64>| crate::textfile::write(p, c, m, None, None, false, false);
         let (_, t0) = file_mtime(&f).unwrap();
-        assert_eq!(write(&p, "x", Some(t0 - 5)).unwrap_err().code, "FILE_CHANGED");
-        let t1 = write(&p, "one\ntwo\n", Some(t0)).unwrap();
+        assert_eq!(w(&p, "x", Some(t0 - 5)).unwrap_err().code, "FILE_CHANGED");
+        let t1 = w(&p, "one\ntwo\n", Some(t0)).unwrap();
         assert!(t1 >= t0);
         assert_eq!(std::fs::read_to_string(&f).unwrap(), "one\ntwo\n");
-        assert_eq!(write(&tmp.path().display().to_string(), "x", None).unwrap_err().code, "NOT_A_FILE");
-        assert_eq!(write(&tmp.path().join("new").display().to_string(), "x", None).unwrap_err().code, "NOT_FOUND", "不新建文件");
+        assert_eq!(w(&tmp.path().display().to_string(), "x", None).unwrap_err().code, "NOT_A_FILE");
+        assert_eq!(w(&tmp.path().join("new").display().to_string(), "x", None).unwrap_err().code, "NOT_FOUND", "不新建文件");
 
         let a = tail(&p, 0).unwrap();
         assert_eq!((a.text.as_str(), a.size, a.reset), ("one\ntwo\n", 8, false));

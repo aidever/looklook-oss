@@ -72,3 +72,86 @@ test('runs render with fixed-width boxes, classes and links', () => {
   assert.equal(runsText(runs), 'a<b中文─go');
   assert.equal(escapeHtml('<&>"'), '&lt;&amp;&gt;&quot;');
 });
+
+// ---------- 输入框按差发字（手机输入法重交整个词不重复） ----------
+import { attachTextInput } from './input.js';
+
+function fakeInput() {
+  const ta = new EventTarget();
+  ta.value = '';
+  ta.selectionStart = ta.selectionEnd = 0;
+  const out = [];
+  const ctl = attachTextInput(ta, {
+    modes: () => ({ appCursor: false }),
+    sendRaw: (d, keep) => {
+      if (!keep) ctl.reset();
+      out.push(d);
+    },
+    sendTyped: (t) => out.push(t),
+    paste: () => {},
+  });
+  const ev = (type, props = {}) => {
+    const e = new Event(type, { cancelable: true });
+    Object.assign(e, { isComposing: false, data: null, inputType: '' }, props);
+    ta.dispatchEvent(e);
+    return e;
+  };
+  const set = (v) => {
+    ta.value = v;
+    ta.selectionStart = ta.selectionEnd = v.length;
+  };
+  const type = (v) => {
+    set(v);
+    ev('input', { inputType: 'insertText' });
+  };
+  const compose = (v) => {
+    ev('compositionstart');
+    set(v);
+    ev('input', { inputType: 'insertCompositionText', isComposing: true });
+    ev('compositionend', { data: v });
+  };
+  return { ta, out, ev, set, type, compose, ctl };
+}
+
+test('IME re-committing the whole word does not repeat what was already sent', () => {
+  const f = fakeInput();
+  f.type('/');
+  f.compose('/n'); // 输入法把光标前的 “/” 连同新字一起再交一遍
+  f.compose('/ne');
+  f.compose('/new');
+  f.ev('input', { inputType: 'insertText' }); // Safari 组字后补的同样内容
+  assert.equal(f.out.join(''), '/new');
+});
+
+test('IME deleting or replacing text sends backspaces for the difference', () => {
+  const f = fakeInput();
+  f.compose('teh');
+  f.compose('the'); // 自动纠错
+  assert.equal(f.out.join(''), 'teh\x7f\x7fhe');
+  f.type('th');
+  assert.equal(f.out.join(''), 'teh\x7f\x7fhe\x7f');
+  // 输入框空了再退格：直接发
+  const g = fakeInput();
+  const e = g.ev('beforeinput', { inputType: 'deleteContentBackward' });
+  assert.ok(e.defaultPrevented);
+  assert.deepEqual(g.out, ['\x7f']);
+});
+
+test('enter and other keys clear the box so later typing starts fresh', () => {
+  const f = fakeInput();
+  f.type('ls');
+  f.ev('beforeinput', { inputType: 'insertLineBreak' });
+  assert.equal(f.ta.value, '');
+  f.type('p');
+  assert.equal(f.out.join(''), 'ls\rp');
+  // 组字中被按键条打断：组字结束、发完再清空
+  const g = fakeInput();
+  g.ev('compositionstart');
+  g.set('ni');
+  g.ctl.reset();
+  assert.equal(g.ta.value, 'ni');
+  g.set('你');
+  g.ev('compositionend', { data: '你' });
+  assert.equal(g.out.join(''), '你');
+  assert.equal(g.ta.value, '');
+});

@@ -207,7 +207,7 @@ pub const TERM_TAGS: &str = concat!(
     r#"<script src="/static/term.js"></script>"#
 );
 
-/// 会话标签里的网页界面（DSH）首页：远程走 WebRTC 时把 WebSocket 接到启动页上（src/web-inject.js）。
+/// 插件页面首页：远程走 WebRTC 时把 WebSocket 接到启动页上（src/web-inject.js）。
 /// 普通脚本在页面的模块脚本之前执行。
 pub const WEB_TAGS: &str = r#"<script src="/static/web.js"></script>"#;
 

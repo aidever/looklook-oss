@@ -170,8 +170,9 @@ function linkify(root, links) {
  * text：Markdown 原文；imageUrl(相对路径) → 图片地址（没有时相对路径的图片不显示）；
  * links：{ 文字里的写法: 地址 }，对话里提到的本机文件变成可以点开的链接；
  * fileUrl(绝对路径) → 地址：其他指向这台电脑上文件的链接也能点开（对话页传，“文件”页不传）。
+ * paths：{ resolve, href, outside }，正文里提到的、真的存在的文件路径换成链接（files/pathLinks.js，对话页传）。
  */
-export default function Markdown({ text, imageUrl, links, fileUrl }) {
+export default function Markdown({ text, imageUrl, links, fileUrl, paths }) {
   const { t } = useTranslation();
   const [html, setHtml] = useState(null);
   const [failed, setFailed] = useState(false);
@@ -284,6 +285,16 @@ export default function Markdown({ text, imageUrl, links, fileUrl }) {
       alive = false;
     };
   }, [html]);
+  // 正文里的文件路径：问过电脑存在的换成链接（回复还在一个字一个字出来时，每次内容变了重新找）
+  useEffect(() => {
+    const root = ref.current;
+    if (!root || html == null || !paths) return undefined;
+    let alive = true;
+    import('../files/pathLinks.js').then(({ linkPaths }) => alive && linkPaths(root, { ...paths, alive: () => alive })).catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, [html, paths]);
   if (failed) return <pre className="fb-text fb-wrap">{text}</pre>;
   if (html == null) return <p className="muted small fb-pad">{t('fb.loading')}</p>;
   // eslint-disable-next-line react/no-danger -- 已用 DOMPurify 清洗

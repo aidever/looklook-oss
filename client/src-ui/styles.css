@@ -1430,6 +1430,14 @@ input[type="checkbox"], input[type="radio"] { width: auto; min-height: 0; paddin
 .fb-sheet thead th { position: sticky; top: 0; z-index: 1; background: var(--panel-2); color: var(--muted); font-weight: 500; text-align: center; }
 .fb-sheet tbody th { position: sticky; left: 0; background: var(--panel-2); color: var(--muted); font-weight: 400; text-align: right; font-variant-numeric: tabular-nums; }
 .fb-sheet thead th:first-child { left: 0; z-index: 2; }
+/* Word（docx-preview）：白纸放在面板底色上；窄屏时 OfficePreview.jsx 用 zoom 缩到一屏宽 */
+.fb-docx { background: var(--panel-2); min-height: 100%; }
+.fb-docx .docx-wrapper { background: transparent; padding: 16px 0; }
+.fb-docx .docx-wrapper > section.docx { margin: 0 auto 16px; box-shadow: 0 1px 4px rgb(0 0 0 / 18%); }
+@media (max-width: 640px) { .fb-docx .docx-wrapper { padding: 8px 0; } .fb-docx .docx-wrapper > section.docx { margin-bottom: 8px; } }
+/* PowerPoint（pptx-renderer）：一页一页往下排，滚动容器是 .fb-preview-body */
+.fb-pptx { background: var(--panel-2); min-height: 100%; padding: 12px; box-sizing: border-box; }
+@media (max-width: 640px) { .fb-pptx { padding: 6px; } }
 .fb { position: relative; }
 /* 新建文件夹、上传：栏够宽时图标后面带文字，窄了（会话旁边的文件面板、手机）只剩图标 */
 .fb-bar { container-type: inline-size; }
@@ -2242,7 +2250,6 @@ button.chat-task-head.chat-task-main { flex-direction: row; align-items: center;
 .draft-mark { flex: none; width: 40px; height: 40px; border-radius: 12px; display: grid; place-items: center; background: var(--panel-2); color: var(--muted); }
 .draft-mark-claude { background: color-mix(in srgb, var(--claude) 14%, var(--panel)); color: var(--claude); }
 .draft-mark-codex { background: color-mix(in srgb, #0f766e 14%, var(--panel)); color: #0f766e; }
-.draft-mark-opencode { background: color-mix(in srgb, #7c3aed 14%, var(--panel)); color: #7c3aed; }
 .draft-recent { width: 100%; max-width: 720px; display: grid; grid-template-columns: minmax(0, 1fr); gap: 6px; }
 .draft-recent-label { padding: 0 4px; font-size: 12px; font-weight: 600; color: var(--muted); }
 .draft-conv {
@@ -3482,18 +3489,6 @@ button.slist-more { width: 100%; border: 0; background: none; font-family: var(-
 .macf-list .ok { color: var(--ok, #16a34a); }
 .macf-list .bad { color: var(--danger); }
 
-/* DSH 启动进度（WebPane 的 DshProgress） */
-.dsh-progress { margin-top: 14px; display: grid; gap: 8px; text-align: left; max-width: min(520px, 92vw); font-size: 13px; }
-.dsh-progress ol { list-style: none; margin: 0; padding: 0; display: grid; gap: 4px; }
-.dsh-progress li { display: grid; grid-template-columns: 16px 1fr auto; align-items: center; column-gap: 8px; color: var(--term-muted, #8a91a3); }
-.dsh-progress li[data-state="ok"], .dsh-progress li[data-state="run"] { color: var(--term-fg, #c5cad6); }
-.dsh-progress li[data-state="ok"] svg { color: var(--ok, #3fb37f); }
-.dsh-progress li[data-state="fail"] { color: var(--danger, #e5484d); }
-.dsh-progress li small { grid-column: 2 / -1; overflow-wrap: anywhere; opacity: .85; }
-.dsh-progress-hint { margin: 0; color: var(--term-muted, #8a91a3); }
-.dsh-progress-acts { display: flex; justify-content: flex-start; }
-.dsh-progress details summary { cursor: pointer; color: var(--term-muted, #8a91a3); }
-.dsh-progress pre { margin: 6px 0 0; max-height: 220px; overflow: auto; padding: 8px; border-radius: 8px; background: rgba(127,127,127,.12); font-size: 12px; white-space: pre-wrap; overflow-wrap: anywhere; }
 
 /* 对话里点到的文件：页面里预览（ChatView 的 FileViewer，里面是“文件”页的预览） */
 .chat-file-viewer { position: fixed; inset: 0; z-index: 95; display: grid; place-items: center; padding: max(16px, env(safe-area-inset-top)) max(16px, env(safe-area-inset-right)) max(16px, env(safe-area-inset-bottom)) max(16px, env(safe-area-inset-left)); background: rgba(8, 10, 16, .55); animation: fade .15s; }
@@ -4783,3 +4778,106 @@ button.link-badge:hover { filter: brightness(1.15); }
 .browser-bind-actions { display: flex; align-items: center; gap: 8px; padding-top: 4px; }
 .browser-bind-summary { display: inline-flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .browser-bind-row-btns { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+
+/* ---------- 文件管理改版 1124（docs/FILES_REDO_DESIGN_2026-11-24.md） ---------- */
+/* 对话里的文件：电脑上停靠在右边，多个标签 */
+.chat-file-dock { flex: none; width: clamp(420px, 44%, 860px); min-width: 0; display: flex; flex-direction: column; border-left: 1px solid var(--line); background: var(--panel); animation: fade .15s; }
+.chat-file-dock .chat-fv-pane, .chat-fv-modal .chat-fv-pane { flex: 1; min-height: 0; display: flex; }
+.chat-fv-pane[hidden] { display: none !important; }
+.chat-file-dock .fb-preview { flex: 1; border-left: 0; }
+.chat-fv-modal { width: min(960px, 100%); height: min(86vh, 100%); display: flex; flex-direction: column; border: 1px solid var(--line); border-radius: 14px; overflow: hidden; background: var(--panel); box-shadow: 0 24px 70px rgba(0, 0, 0, .35); animation: lightbox-in .18s ease-out; }
+.chat-fv-modal .fb-preview { flex: 1; width: auto; height: auto; border: 0; border-radius: 0; box-shadow: none; animation: none; }
+@media (max-width: 640px) { .chat-fv-modal { width: 100%; height: 100%; border-radius: 0; border: 0; } }
+.fv-tabs { flex: none; display: flex; gap: 2px; padding: 4px 6px 0; overflow-x: auto; border-bottom: 1px solid var(--line); background: var(--panel-2); scrollbar-width: none; }
+.fv-tab { flex: none; max-width: 200px; display: inline-flex; align-items: center; border: 1px solid transparent; border-bottom: 0; border-radius: 8px 8px 0 0; color: var(--muted); }
+.fv-tab[aria-selected="true"] { background: var(--panel); border-color: var(--line); color: var(--text); margin-bottom: -1px; }
+.fv-tab-name { min-width: 0; border: 0; background: none; color: inherit; font: 12.5px/1 var(--font); padding: 8px 4px 8px 10px; cursor: pointer; }
+.fv-tab-x { flex: none; display: inline-grid; place-items: center; width: 22px; height: 22px; margin-right: 4px; border: 0; border-radius: 5px; background: none; color: inherit; cursor: pointer; opacity: .6; }
+.fv-tab-x:hover { opacity: 1; background: var(--panel-2); }
+
+/* 查看器的提示条、编码、跳行 */
+.fv-bar { flex: none; display: flex; align-items: center; flex-wrap: wrap; gap: 4px 6px; padding: 4px 8px 4px 12px; border-bottom: 1px solid var(--line); background: var(--panel-2); }
+.fv-bar-warn { background: color-mix(in srgb, #f59e0b 14%, var(--panel)); }
+.fv-flash { color: var(--brand); white-space: nowrap; animation: fade .2s; }
+.fv-enc { flex: none; }
+.fv-enc-btn { font-size: 12px; color: var(--muted); padding: 2px 6px; white-space: nowrap; }
+.fv-size { white-space: nowrap; }
+.fv-add { color: #16a34a; font-weight: 600; }
+.fv-del { color: var(--danger); font-weight: 600; }
+.fv-goto { flex: none; display: flex; align-items: center; gap: 6px; padding: 6px 8px; border-bottom: 1px solid var(--line); background: var(--panel-2); }
+.fv-goto .input { flex: 1; min-width: 0; max-width: 220px; }
+/* 电脑上编辑 Markdown：左边改、右边看 */
+.fb-preview-body[data-split] { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); overflow: hidden; }
+.fb-preview-body[data-split] > * { min-height: 0; overflow: auto; }
+.fv-md-live { border-left: 1px solid var(--line); padding: 12px 16px; }
+/* 手机上编辑：贴着键盘的一排按键 */
+.fv-editbar { position: fixed; left: 0; right: 0; bottom: 0; z-index: 120; display: flex; gap: 4px; padding: 4px 6px calc(4px + env(safe-area-inset-bottom)); overflow-x: auto; background: var(--panel); border-top: 1px solid var(--line); scrollbar-width: none; }
+.fv-editbar button { flex: none; min-width: 38px; height: 36px; display: inline-grid; place-items: center; border: 1px solid var(--line); border-radius: 8px; background: var(--panel-2); color: var(--text); font: 14px/1 var(--mono); touch-action: manipulation; }
+.fb-preview:has(.fv-editbar) .fb-preview-body { padding-bottom: 48px; }
+
+/* JSON 树 */
+.jt { padding: 8px 6px; font: 13px/1.6 var(--mono); }
+.jt-row { display: flex; align-items: baseline; gap: 2px; width: 100%; min-width: 0; border: 0; background: none; color: inherit; font: inherit; text-align: left; padding: 0 8px 0 0; overflow-wrap: anywhere; }
+button.jt-row { cursor: pointer; }
+button.jt-row:hover { background: var(--panel-2); }
+.jt-caret { flex: none; align-self: center; transition: transform .12s; color: var(--muted); }
+.jt-toggle[aria-expanded="true"] .jt-caret { transform: rotate(90deg); }
+.jt-key { color: #7c3aed; white-space: nowrap; }
+.jt-sum, .jt-more { color: var(--muted); }
+.jt-string { color: #16a34a; }
+.jt-number { color: #0891b2; }
+.jt-boolean, .jt-null { color: #d97706; }
+
+/* Jupyter 笔记本 */
+.nb { padding: 10px 14px 20px; display: flex; flex-direction: column; gap: 12px; }
+.nb-cell { min-width: 0; }
+.nb-in { display: flex; gap: 8px; align-items: flex-start; }
+.nb-n { flex: none; width: 44px; text-align: right; color: var(--muted); font: 12px/1.9 var(--mono); }
+.nb-in pre { flex: 1; min-width: 0; margin: 0; padding: 8px 10px; border-radius: 8px; background: var(--panel-2); font: 13px/1.5 var(--mono); overflow-x: auto; }
+.nb-out { margin: 4px 0 0 52px; padding: 4px 10px; font: 12.5px/1.5 var(--mono); white-space: pre-wrap; overflow-wrap: anywhere; max-height: 420px; overflow: auto; }
+.nb-err { color: var(--danger); }
+.nb-img { display: block; max-width: calc(100% - 52px); margin: 6px 0 0 52px; background: #fff; }
+.nb-cell .md { padding-left: 52px; }
+
+/* 压缩包、十六进制 */
+.arc-head { position: sticky; top: 0; z-index: 1; display: flex; align-items: center; gap: 8px; padding: 6px 8px 6px 12px; border-bottom: 1px solid var(--line); background: var(--panel); }
+.arc-list { list-style: none; margin: 0; padding: 2px 0 12px; }
+.arc-row { display: flex; align-items: center; gap: 8px; width: 100%; min-height: 34px; padding: 4px 12px; border: 0; background: none; color: inherit; font: 13px/1.4 var(--mono); text-align: left; }
+button.arc-row { cursor: pointer; }
+button.arc-row:hover { background: var(--panel-2); }
+.fb-text.hex { font-size: 12px; }
+.fb-note { margin: 0; border-bottom: 1px solid var(--line); }
+
+/* 网页、PDF */
+.fb-html { height: 100%; display: flex; flex-direction: column; }
+.fb-html iframe { position: static; inset: auto; flex: 1; width: 100%; height: auto; min-height: 320px; border: 0; background: #fff; }
+.pdf-box { height: 100%; overflow: auto; padding: 8px; background: var(--panel-2); }
+.pdf-page { margin: 0 auto 8px; background: #fff; box-shadow: 0 1px 4px rgba(0, 0, 0, .15); }
+.pdf-page canvas { display: block; }
+
+/* 对话里认出来的文件路径；工作目录外的后面标一下 */
+.md a.md-path { text-decoration-style: dotted; }
+.md a.md-path[data-out]::after { content: attr(data-out); margin-left: 4px; padding: 0 4px; border-radius: 4px; background: var(--panel-2); color: var(--muted); font-size: .78em; text-decoration: none; display: inline-block; }
+
+/* 文件列表：图标视图、缩略图、加载更多 */
+.fb-thumb { flex: none; display: inline-grid; place-items: center; width: 64px; height: 64px; border-radius: 8px; overflow: hidden; }
+.fb-thumb img { width: 100%; height: 100%; object-fit: cover; }
+.fb-list.fb-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(112px, 1fr)); align-content: start; gap: 4px; padding: 8px; }
+.fb-list.fb-grid > :not(.fb-row) { grid-column: 1 / -1; }
+.fb-list.fb-grid .fb-head { display: none; }
+.fb-list.fb-grid .fb-row { position: relative; display: block; padding: 0; border: 0; border-radius: 10px; }
+.fb-list.fb-grid .fb-c-time, .fb-list.fb-grid .fb-c-size, .fb-list.fb-grid .fb-c-acts, .fb-list.fb-grid .fb-sub { display: none; }
+.fb-list.fb-grid .fb-c-check { position: absolute; top: 6px; left: 6px; z-index: 1; }
+.fb-list.fb-grid .fb-name { width: 100%; min-height: 0; display: flex; flex-direction: column; align-items: center; gap: 6px; padding: 10px 6px 8px; text-align: center; }
+.fb-list.fb-grid .fb-name > .fb-ico { width: 64px; height: 64px; padding: 15px; }
+.fb-list.fb-grid .fb-name-text { align-items: center; width: 100%; }
+.fb-list.fb-grid .fb-name-main { font-size: 12.5px; }
+.fb-more-rows { display: block; width: calc(100% - 16px); margin: 8px; padding: 10px; border: 1px dashed var(--line); border-radius: 8px; background: none; color: var(--brand); font: 13px/1.3 var(--font); cursor: pointer; }
+.fb-more-rows:disabled { color: var(--muted); cursor: default; }
+.fb-list .fb-row { content-visibility: auto; contain-intrinsic-size: auto 45px; }
+.fb-list.fb-grid .fb-row { contain-intrinsic-size: auto 120px; }
+/* 预览窄的时候（停靠在对话旁边、手机）：标题栏让出位置给文件名 */
+.fb-preview { container: fbpv / inline-size; }
+.fb-preview-head > b.grow { min-width: 5em; }
+@container fbpv (max-width: 620px) { .fb-preview-head .fv-size, .fb-preview-head .fv-enc { display: none; } }
+.chat-file-dock:focus { outline: none; }

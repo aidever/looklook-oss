@@ -1,6 +1,6 @@
 // 会话（首页）：左侧栏里的项目和会话列表、右边打开的会话。新会话是草稿页（Draft.jsx）：点“新会话”、项目上的 +
 // 马上出现在当前项目里，写下第一句、回车才启动；草稿在侧栏这个项目最上面、标签栏最后各有一行。
-// 项目下面是这个文件夹里的全部会话：在运行的，加上 Claude Code、Codex、OpenCode 存着的以前的对话（点一下接着聊），
+// 项目下面是这个文件夹里的全部会话：在运行的，加上 Claude Code、Codex 存着的以前的对话（点一下接着聊），
 // 侧栏每个项目只列最近几个，其余在项目页（Project.jsx）。
 // 项目 = 某台电脑上的一个文件夹（见 shared/sessions.jsx）。电脑用颜色 + 系统图标区分（shared/brands.jsx）。
 // 电脑上会话在右边打开，最近打开的几个在后台保持连接；手机上整页打开 /t/{id}（有按键条）。
@@ -11,7 +11,7 @@ import { useTranslation } from 'react-i18next';
 import { useStatus } from '../App.jsx';
 import { api, deviceApi, rememberTerminals, rtcMode, terminalDevice } from '../shared/api.js';
 import { setFocusedDevice } from '../shared/conn.js';
-import { CHAT_LAUNCHES, isDshWeb } from '../shared/chat.js';
+import { CHAT_LAUNCHES } from '../shared/chat.js';
 import { DeviceAvatar, deviceColor, DeviceTag, LaunchIcon, SessionIcon } from '../shared/brands.jsx';
 import { deviceName, osLabel, RenameDeviceDialog, useDevices } from '../shared/devices.jsx';
 import { errorText } from '../shared/i18n.js';
@@ -25,20 +25,20 @@ import { isMod, keyLabel } from '../shared/hotkeys.js';
 import KeyHint from '../shared/KeyHint.jsx';
 import { openSshHost, sshAddr, useSshHosts } from '../shared/sshHosts.js';
 import { ErrorNote, Spinner, useToast } from '../shared/ui.jsx';
+import { usePressActivate } from '../shared/press.js';
 import { AddProjectDialog } from './AddProject.jsx';
 import { HomeScreenTip, Onboarding } from './Onboarding.jsx';
 import { TipBar, useTip } from '../shared/tips.jsx';
 import { CAN_FORK } from './History.jsx';
 import { BackendNote, InstanceDialog, LogsDialog, useInstanceActions } from './Terminals.jsx';
 import { TermPane } from './TerminalView.jsx';
-import { WebPane } from './WebPane.jsx';
 import { useContextMenu } from '../shared/ContextMenu.jsx';
 import { touchUi, useLayer } from '../shared/layers.js';
 
 // 项目“⋯”里换个类型新建
-export const QUICK_LAUNCHES = ['claude', 'codex', 'agy', 'opencode', 'shell'];
-export const AI_TOOLS = ['codex', 'claude', 'opencode', 'dsh', 'agy'];
-export const FULL_ACCESS = ['codex', 'claude', 'opencode', 'agy'];
+export const QUICK_LAUNCHES = ['claude', 'codex', 'agy', 'shell'];
+export const AI_TOOLS = ['codex', 'claude', 'agy'];
+export const FULL_ACCESS = ['codex', 'claude', 'agy'];
 
 /**
  * 新会话默认带不带全部权限（各人习惯不同）：这个项目里最近一个 AI 会话怎么开的就怎么开；项目里没有 AI 会话时，
@@ -107,8 +107,8 @@ export function SessionUiProvider({ children }) {
   // 草稿页开着时它在哪个项目（{ device, workdir, container }）：侧栏、标签栏显示“新会话 · 草稿”
   const [draftAt, setDraftAt] = useState(null);
   const openSession = (id) => {
-    // 手机上整页打开；网页类型（DSH）打开的是它的网页
-    if (!opensInPage()) return navigate(isDshWeb(s.byId(id)) ? `/t/${id}?web` : `/t/${id}`);
+    // 手机上整页打开
+    if (!opensInPage()) return navigate(`/t/${id}`);
     s.openTab(id);
     s.openRecent(id);
     s.requestFocus(id);
@@ -253,27 +253,6 @@ export function SessionUiProvider({ children }) {
       {adding && <AddProjectDialog want={adding} onClose={() => setAdding(null)} />}
     </UiCtx.Provider>
   );
-}
-
-/**
- * 鼠标按下就切换，不等 click：macOS App（WKWebView）里触控板“轻点”时按下和松开几乎同时到达，焦点正从终端 iframe
- * 回到管理台，click 有时被吞掉（要点两下或用力按）。按下时已切过的，随后的 click 不再切；键盘回车只有 click，照常切换。
- * 按下时不让按钮拿走焦点，好把焦点交给会话的输入框。
- */
-export function usePressActivate(fn, disabled) {
-  const downAt = useRef(0);
-  return {
-    onPointerDown: (e) => {
-      if (e.pointerType !== 'mouse' || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || disabled) return;
-      downAt.current = Date.now();
-      fn();
-    },
-    onMouseDown: (e) => e.button === 0 && e.preventDefault(),
-    onClick: () => {
-      if (Date.now() - downAt.current < 1500) return;
-      fn();
-    },
-  };
 }
 
 /** 一个会话行 / 会话顶栏的操作（打开、更多菜单）。 */
@@ -500,7 +479,7 @@ function DeviceDots({ members }) {
  */
 /**
  * 项目菜单里“直接新建”的几项。写明开出来的是对话界面还是终端：Claude Code、Codex 在能常驻的电脑上默认开对话界面，
- * 容器里、OpenCode 都是终端。
+ * 容器里是终端。
  */
 export function quickLaunchItems(t, p, status, allowed, ui) {
   const chat = !p.container && Boolean(status.capabilities?.persistent);
@@ -1410,21 +1389,6 @@ export function SessionStage({ activeId }) {
       {ids.map((id) => {
         // 电脑离线时用最后一次看到的：终端不卸载，内容还能看
         const inst = s.known(id);
-        if (isDshWeb(inst)) {
-          return (
-            <WebPane
-              key={id}
-              id={id}
-              inst={inst}
-              missing={missing(id)}
-              active={id === activeId}
-              lead={<LaunchIcon launch="dsh" size={16} />}
-              sub={<SessionLead inst={inst} />}
-              named={!opensInPage()}
-              menu={<SessionMenu inst={inst} />}
-            />
-          );
-        }
         return (
           <TermPane
             key={id}

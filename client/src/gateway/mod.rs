@@ -15,7 +15,6 @@ pub use api::create_session;
 mod assets;
 mod chat;
 mod chat_mux;
-mod dsh;
 mod input_tap;
 mod notify;
 pub mod assistant;
@@ -142,15 +141,6 @@ pub fn router(app: App) -> Router {
         .route("/i/{id}", get(|axum::extract::Path(id): axum::extract::Path<String>| async move { Redirect::permanent(&format!("/i/{id}/")) }))
         .route("/i/{id}/", any(terminal))
         .route("/i/{id}/{*rest}", any(terminal))
-        // DSH 的网页界面（会话标签里打开），见 dsh.rs
-        .route(
-            "/w/{id}",
-            get(|axum::extract::Path(id): axum::extract::Path<String>, uri: axum::http::Uri| async move {
-                Redirect::permanent(&format!("/w/{id}/{}", uri.query().map(|q| format!("?{q}")).unwrap_or_default()))
-            }),
-        )
-        .route("/w/{id}/", any(dsh::web))
-        .route("/w/{id}/{*rest}", any(dsh::web))
         // 插件的页面和画面（`/p/<名>/…` → 插件的 Unix Socket），见 plugins.rs
         .merge(plugins::page_routes())
         .route(looklook_protocol::rtc::OFFER_PATH, axum::routing::post(crate::rtc::offer))
@@ -246,7 +236,10 @@ pub async fn local_guard(State(app): State<App>, mut req: Request, next: Next) -
     if tls && req.method() == Method::GET && req.uri().path() == dp::MUX_PATH {
         return crate::rtc::mux::entry(&app, peer_ip, req).await;
     }
-    if peer == access::Peer::Public && !app.direct.cookie_ok(cookie(req.headers(), crate::direct_tls::COOKIE), &cfg, &app.account) {
+    // HTML 预览的静态目录（fsview.rs）：页面在不同源的沙盒 iframe 里，它取相对资源时浏览器不带 SameSite Cookie；
+    // 地址里 128 位随机令牌本身就是凭证（10 分钟、只读、只限那个文件夹），不再要访问码。来源 IP、Host 照常检查
+    let site = req.method() == Method::GET && req.uri().path().starts_with("/api/fs/site/");
+    if !site && peer == access::Peer::Public && !app.direct.cookie_ok(cookie(req.headers(), crate::direct_tls::COOKIE), &cfg, &app.account) {
         if req.uri().path() == access::FORM_PATH && req.method() == Method::POST {
             return submit_public_code(&app, &cfg, peer_ip, req).await;
         }
@@ -257,7 +250,7 @@ pub async fn local_guard(State(app): State<App>, mut req: Request, next: Next) -
         let short = (!crate::direct_tls::public_code_ok(&cfg)).then_some("short");
         return assets::code_page(next_path, short);
     }
-    if peer.needs_code(&cfg) && !cookie(req.headers(), access::COOKIE).is_some_and(|v| ct_eq(v, &cfg.cookie_value())) {
+    if !site && peer.needs_code(&cfg) && !cookie(req.headers(), access::COOKIE).is_some_and(|v| ct_eq(v, &cfg.cookie_value())) {
         if req.uri().path() == access::FORM_PATH && req.method() == Method::POST {
             return submit_code(&app, &cfg, peer_ip, req).await;
         }

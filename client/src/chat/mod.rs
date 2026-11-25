@@ -26,9 +26,6 @@ pub mod codex_rollout;
 pub mod codex_screen;
 pub mod codex_worktree;
 pub mod commands;
-pub mod dsh_app;
-pub mod dsh_chat;
-pub mod dsh_log;
 pub mod hooks;
 pub mod manage;
 pub mod mentions;
@@ -199,8 +196,6 @@ struct State {
     suggestion: Option<String>,
     /// Codex（app-server）的这一轮、上下文窗口、累计 token
     codex: codex_chat::CodexSt,
-    /// DSH（dsh web）的跟读、排队的消息、用量
-    dsh: dsh_chat::DshSt,
     /// Antigravity（agy acp）的会话设置、排队的消息、用量
     agy: agy_chat::AgySt,
     /// 走 stream-json 的 Claude Code（claude_chat.rs）的进程和状态
@@ -337,8 +332,6 @@ pub struct Chat {
     insts: Mutex<HashMap<String, Arc<Inst>>>,
     /// Codex 的 app-server
     codex: codex_chat::Hub,
-    /// DSH 的 dsh web
-    dsh: dsh_chat::Hub,
     /// Antigravity 的 agy acp
     agy: agy_chat::Hub,
     /// stream-json 的 Claude Code
@@ -379,7 +372,6 @@ impl Chat {
             next_id: AtomicU64::new(1),
             insts: Mutex::new(HashMap::new()),
             codex: Default::default(),
-            dsh: Default::default(),
             agy: Default::default(),
             sdk: Default::default(),
             addr: Mutex::new(None),
@@ -439,7 +431,6 @@ impl Chat {
                         dialog: None,
                         suggestion: None,
                         codex: Default::default(),
-                        dsh: Default::default(),
                         agy: Default::default(),
                         sdk: Default::default(),
                         odd_screen: None,
@@ -499,11 +490,6 @@ impl Chat {
                 }
                 self.codex_release(&inst).await;
             }
-            "dsh" => {
-                if let Err(e) = self.dsh_interrupt(id).await {
-                    tracing::debug!(id, error = ?e, "停会话：DSH 这一轮没停下");
-                }
-            }
             "agy" => {
                 if let Err(e) = self.agy_interrupt(id).await {
                     tracing::debug!(id, error = ?e, "停会话：agy 这一轮没停下");
@@ -527,12 +513,6 @@ impl Chat {
                 let thread = st.binding.as_ref().map(|b| b.session_id.clone());
                 if let Some(me) = self.me.upgrade() {
                     tokio::spawn(async move { me.codex_forget(thread).await });
-                }
-            }
-            if inst.agent.launch() == "dsh" {
-                let session = st.binding.as_ref().map(|b| b.session_id.clone());
-                if let (Some(me), id) = (self.me.upgrade(), id.to_string()) {
-                    tokio::spawn(async move { me.dsh_forget(&id, session).await });
                 }
             }
             if inst.agent.launch() == "agy" {
@@ -599,9 +579,9 @@ impl Chat {
             "context": st.context,
             "title": st.title,
             // Codex：这段对话实际在哪个目录（在托管工作树里时和终端的工作目录不同）
-            "cwd": st.codex.cwd.as_ref().or(st.dsh.cwd.as_ref()),
+            "cwd": st.codex.cwd.as_ref(),
             // Claude Code 队列里的（读 transcript）；Codex 是插话（`turn/steer`）发出去、还没进对话的
-            "queued": st.queued.iter().chain(&st.codex.steered).chain(&st.dsh.queued).collect::<Vec<_>>(),
+            "queued": st.queued.iter().chain(&st.codex.steered).collect::<Vec<_>>(),
             // Codex / agy：排到这一轮之后的（这一轮结束后作为下一轮发出，可逐条取回）
             "later": st.codex.later.iter().chain(&st.agy.queued).map(|(t, i)| json!({ "text": t, "images": i.len() })).collect::<Vec<_>>(),
             "limit": (st.limit_wait.is_some() || st.limit_auto_at.is_some() || st.sdk.limit_resume.is_some())
@@ -622,7 +602,7 @@ impl Chat {
             "stats": st.stats,
             "activity": st.live.activity,
             "preview": st.live.text,
-            // 正在输出的回复是 Markdown 原文（stream-json、Codex、DSH 的增量）；TUI 的 Claude Code 是从屏幕上抓的、已经排过版的文字
+            // 正在输出的回复是 Markdown 原文（stream-json、Codex 的增量）；TUI 的 Claude Code 是从屏幕上抓的、已经排过版的文字
             "preview_md": inst.agent.launch() != "claude" || st.sdk.proc.is_some(),
             "pending": st.pending.as_ref().map(|p| json!({
                 "id": p.id,
@@ -1218,23 +1198,6 @@ impl Chat {
         if inst.agent.launch() == "agy" {
             self.agy_snapshot_attach(id).await;
         }
-        if inst.agent.launch() == "dsh" {
-            if let Err(e) = self.dsh_attach(id).await {
-                let mut st = lock(&inst.st);
-                st.error = e.params.get("detail").and_then(Value::as_str).map(|d| d.chars().take(500).collect()).or(Some(e.code.to_string()));
-                let reason = if e.code == "DSH_NOT_FOUND" { "dsh_not_found" } else { "dsh_unavailable" };
-                Self::set_phase(&inst, &mut st, Phase::Detached, Some(reason));
-            } else {
-                // 刚开始跟读：等快照到了再取（最多两秒）
-                let log = lock(&inst.st).binding.as_ref().map(|b| dsh_log::shared(&b.session_id));
-                for _ in 0..40 {
-                    if log.as_ref().is_none_or(|l| lock(l).seeded()) {
-                        break;
-                    }
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                }
-            }
-        }
         self.poll(&inst).await;
         let tr = inst.tr.lock().await;
         let (total, items) = match tr.as_ref().map(Reader::get) {
@@ -1282,10 +1245,6 @@ impl Chat {
     /// 用户消息 `key` 里的第 `n` 张图片：类型和内容。Claude Code 的图片直接存在 transcript 里，Codex 的在 rollout 里
     pub async fn user_image(&self, id: &str, key: &str, n: usize) -> Result<(&'static str, Vec<u8>), LocalError> {
         self.require(id)?;
-        if self.is_dsh(id) {
-            let rec = self.item(id, key).await?;
-            return self.dsh_user_image(id, &rec, n).await;
-        }
         if self.is_agy(id) {
             let inst = self.inst(id);
             let session = lock(&inst.st).binding.as_ref().map(|b| b.session_id.clone()).ok_or_else(LocalError::not_found)?;
@@ -1321,16 +1280,12 @@ impl Chat {
         let mut tick = 0u32;
         loop {
             while inst.viewers.load(Ordering::SeqCst) > 0 {
-                // DSH：连接断了（DSH 重启）就重新接上
-                if tick.is_multiple_of(10) && inst.agent.launch() == "dsh" {
-                    self.dsh_keep(&inst.id).await;
-                }
                 if tick.is_multiple_of(10) && inst.agent.launch() == "agy" {
                     self.agy_keep(&inst.id).await;
                 }
                 self.poll(&inst).await;
-                // Codex、DSH 的状态来自它们的后台服务，不用看屏幕
-                if tick.is_multiple_of(3) && !matches!(inst.agent.launch(), "codex" | "dsh" | "agy") && !inst.sdk.load(Ordering::Relaxed) {
+                // Codex、agy 的状态来自它们的后台服务，不用看屏幕
+                if tick.is_multiple_of(3) && !matches!(inst.agent.launch(), "codex" | "agy") && !inst.sdk.load(Ordering::Relaxed) {
                     self.check_screen(&inst, true).await;
                     if lock(&inst.st).dialog.as_ref().is_some_and(screen::Dialog::is_limit) {
                         self.guard_limit(&inst);
@@ -1636,7 +1591,7 @@ impl Chat {
             tick = tick.wrapping_add(1);
             let insts: Vec<Arc<Inst>> = lock(&self.insts).values().cloned().collect();
             for inst in insts {
-                // Codex、DSH 的状态来自它们的后台服务，不看屏幕
+                // Codex、agy 的状态来自它们的后台服务，不看屏幕
                 let sdk = inst.sdk.load(Ordering::Relaxed);
                 if sdk {
                     self.sdk_upgrade(&inst);
@@ -1646,7 +1601,7 @@ impl Chat {
                 if tick.is_multiple_of(20) && inst.agent.launch() == "codex" {
                     self.codex_reap(&inst).await;
                 }
-                let claude = !matches!(inst.agent.launch(), "codex" | "dsh" | "agy") && !sdk;
+                let claude = !matches!(inst.agent.launch(), "codex" | "agy") && !sdk;
                 let phase = lock(&inst.st).phase;
                 let due = match phase {
                     Phase::Running | Phase::Approval | Phase::Tui => true,
@@ -1711,9 +1666,6 @@ impl Chat {
     /// 输入 / 时提示的自定义命令和技能
     pub async fn commands(&self, id: &str) -> Result<Value, LocalError> {
         self.require(id)?;
-        if self.is_dsh(id) {
-            return self.dsh_commands(id).await;
-        }
         if self.is_agy(id) {
             return self.agy_commands(id).await;
         }
@@ -1893,7 +1845,7 @@ impl Chat {
     }
 
     /// 给对话改名（会话列表、对话页标题、以前的对话里都用它）。Claude Code 跟 TUI 的 `/rename` 一样往 transcript 追加 `custom-title`
-    /// （之后不再自动起名）；Codex 用 `thread/name/set`。还没开始对话的、DSH：只改会话名。会话名也跟着改，列表上不会两个名字。
+    /// （之后不再自动起名）；Codex 用 `thread/name/set`。还没开始对话的：只改会话名。会话名也跟着改，列表上不会两个名字。
     pub async fn rename(self: &Arc<Self>, id: &str, name: &str) -> Result<Value, LocalError> {
         self.require(id)?;
         let name: String = name.trim().chars().filter(|c| !c.is_control()).take(200).collect();
@@ -2022,9 +1974,6 @@ impl Chat {
                 return self.codex_later(id, text, images).await;
             }
             return self.codex_input(id, text, images).await;
-        }
-        if inst.agent.launch() == "dsh" {
-            return self.dsh_input(id, text, images).await;
         }
         if inst.agent.launch() == "agy" {
             return self.agy_input(id, text, images).await;
@@ -2180,9 +2129,6 @@ impl Chat {
         if self.is_codex(id) {
             return self.codex_interrupt(id).await;
         }
-        if self.is_dsh(id) {
-            return self.dsh_interrupt(id).await;
-        }
         if self.is_agy(id) {
             return self.agy_interrupt(id).await;
         }
@@ -2228,13 +2174,6 @@ impl Chat {
         }
         let mut st = lock(&inst.st);
         let Some(p) = st.pending.as_mut().filter(|p| p.id == req.id) else { return Err(LocalError::new("CHAT_STALE")) };
-        // DSH：答复是 waterfall 的结果；不替用户回答时交给 DSH 自己的界面
-        if inst.agent.launch() == "dsh" {
-            let result = dsh_chat::decision(p.kind, &p.input, req)?;
-            p.resolve(result.map(|r| r.to_string()).unwrap_or_default());
-            Self::settle(&inst, &mut st, Phase::Running);
-            return Ok(());
-        }
         // Codex：答复直接是 app-server 请求的结果
         if inst.agent.launch() == "codex" {
             // 命令规则标出来的：只能这一次允许
@@ -2279,10 +2218,6 @@ impl Chat {
     /// 3 是“告诉 Claude 要改什么”：按 3 后光标停在这一项的输入框里，打字、回车，Claude 照着改计划（实测 2.1.304）。
     pub async fn plan(&self, id: &str, choice: u8, feedback: Option<&str>) -> Result<(), LocalError> {
         self.require(id)?;
-        if self.is_dsh(id) {
-            let feedback = feedback.map(str::trim).filter(|f| !f.is_empty()).map(|f| f.chars().take(2000).collect::<String>());
-            return self.dsh_plan(id, choice, feedback.as_deref());
-        }
         if self.is_sdk(id) {
             return self.sdk_plan(&self.inst(id), choice, feedback);
         }
@@ -2319,9 +2254,6 @@ impl Chat {
         if self.is_codex(id) {
             return self.codex_attach(id).await.map(|_| ());
         }
-        if self.is_dsh(id) {
-            return self.dsh_attach(id).await.map(|_| ());
-        }
         if self.is_agy(id) {
             lock(&self.inst(id).st).agy.generation = 0;
             return self.agy_attach(id).await.map(|_| ());
@@ -2346,9 +2278,6 @@ impl Chat {
         self.require(id)?;
         if self.is_codex(id) {
             return self.codex_attach(id).await.map(|_| ());
-        }
-        if self.is_dsh(id) {
-            return self.dsh_attach(id).await.map(|_| ());
         }
         if self.is_agy(id) {
             lock(&self.inst(id).st).agy.generation = 0;
@@ -2715,9 +2644,6 @@ impl Chat {
             }
             return self.codex_setting(id, kind, value);
         }
-        if inst.agent.launch() == "dsh" {
-            return self.dsh_setting(id, kind, value).await;
-        }
         if inst.agent.launch() == "agy" {
             return self.agy_setting(id, kind, value).await;
         }
@@ -2943,9 +2869,6 @@ impl Chat {
         if self.is_codex(id) {
             return self.codex_models(id).await;
         }
-        if self.is_dsh(id) {
-            return self.dsh_models(id).await;
-        }
         if self.is_agy(id) {
             return self.agy_models(id).await;
         }
@@ -3005,9 +2928,6 @@ impl Chat {
 
     pub async fn usage(&self, id: &str) -> Result<Value, LocalError> {
         self.require(id)?;
-        if self.is_dsh(id) {
-            return Ok(self.dsh_usage(id));
-        }
         if self.is_agy(id) {
             return Ok(self.agy_usage(id));
         }

@@ -1,6 +1,6 @@
 // 草稿新会话：点“新会话”（侧栏、Ctrl+Shift+O、项目上的 +、标签栏的 +、手机右下角）马上出现，在当前项目里；
 // 写下第一句、回车才新建并启动，不发出去不会启动任何东西。上面换项目（按电脑分组、可以搜），输入框上换类型、账号、全部权限，
-// ⋯ 里是名字、Shell、开机自动启动、Docker；AI 工具旁边有常用任务模板（PromptTemplates.jsx）。终端、DSH 点了马上开，不用草稿。
+// ⋯ 里是名字、Shell、开机自动启动、Docker；AI 工具旁边有常用任务模板（PromptTemplates.jsx）。终端点了马上开，不用草稿。
 // 发出去后会话马上打开：Claude Code、Codex 的第一句（连同图片）等对话起来了再发（shared/firstSend.js），
 // 其他的交给电脑在启动时带上（prompt）。没写完的字按项目存在浏览器里。
 import { ArrowLeft, ArrowUp, AtSign, Brain, Container, FolderOpen, Folder, FileText, FolderPlus, MoreHorizontal, Paperclip, Plus, Search, ShieldCheck, Sparkles, TerminalSquare, X } from 'lucide-react';
@@ -9,7 +9,7 @@ import { useTranslation } from 'react-i18next';
 
 import { SafetyNote, useStatus } from '../App.jsx';
 import { deviceApi, rememberTerminals, terminalDevice } from '../shared/api.js';
-import { ATTACH_FILE_MAX, ATTACH_MAX, CHAT_LAUNCHES, effortsFor, groupModelOptions, isDshWeb } from '../shared/chat.js';
+import { ATTACH_FILE_MAX, ATTACH_MAX, CHAT_LAUNCHES, effortsFor, groupModelOptions } from '../shared/chat.js';
 import { formatBytes } from '../shared/xfer.js';
 import { DeviceAvatar, deviceColor, LaunchIcon } from '../shared/brands.jsx';
 import { deviceName, osLabel, useDevices } from '../shared/devices.jsx';
@@ -32,10 +32,10 @@ import Select from '../shared/Select.jsx';
 import { useComposeAssist } from '../shared/composeAssist.jsx';
 import { useLayer } from '../shared/layers.js';
 
-// 留在草稿里的类型（写好第一句再开始）；终端、DSH 点了马上开
-const DRAFT_LAUNCHES = ['claude', 'codex', 'agy', 'opencode', 'dsh'];
+// 留在草稿里的类型（写好第一句再开始）；终端点了马上开
+const DRAFT_LAUNCHES = ['claude', 'codex', 'agy'];
 // 第一句话能用在哪些类型上（AI 工具作为第一条消息，普通终端当作启动后运行的命令）
-const PROMPT_LAUNCHES = ['claude', 'codex', 'agy', 'opencode', 'shell'];
+const PROMPT_LAUNCHES = ['claude', 'codex', 'agy', 'shell'];
 const DRAFTS_KEY = 'looklook.new-drafts';
 const RECENT_N = 3;
 
@@ -425,8 +425,8 @@ function DraftForm() {
   const typeText = missing(launch) ? `${toolName} · ${t('sess.not_installed')}` : launch === 'custom' ? toolName : `${toolName} · ${modeName}`;
   const typeIconOnly = narrow && !missing(launch);
   const plusItems = [
-    assist.on && launch !== 'opencode' && { icon: AtSign, label: t('chat.mention'), hint: t('chat.mention_hint'), onClick: () => assist.trigger('@') },
-    assist.on && launch !== 'opencode' && {
+    assist.on && { icon: AtSign, label: t('chat.mention'), hint: t('chat.mention_hint'), onClick: () => assist.trigger('@') },
+    assist.on && {
       icon: Sparkles,
       label: t('chat.skill_pick'),
       hint: t(launch === 'codex' ? 'chat.skill_pick_codex' : 'chat.skill_pick_hint'),
@@ -475,10 +475,9 @@ function DraftForm() {
   const blocked = !allowed ? t('sess.why_locked') : offline ? t('draft.offline', { device: devObj ? deviceName(t, devObj) : '' }) : !where ? t('sess.why_no_folder') : null;
   const target = () =>
     project ?? (container ? { device, workdir: '', container: { name: container.name, dir: container.dir.trim() || '/' }, items: [] } : { device, workdir, container: null, items: [], shell, auto_start: autoStart });
-  // 终端、DSH：点了就开，不用草稿
+  // 终端：点了就开，不用草稿
   const openNow = async (l) => {
     if (blocked) return toast(blocked, 'error');
-    if (l === 'dsh-web') return dshWeb && ui.openSession(dshWeb.id);
     await ui.quickCreate(target(), l);
   };
   const go = async () => {
@@ -561,8 +560,6 @@ function DraftForm() {
   const empty = !text.trim() && !files.length;
   const guideRemote = useGuideShowsRemote();
   const newcomer = s.items.length < 3;
-  // 以前开的网页版 DSH（每台电脑一个）：还能从这里打开它的网页；新开的 DSH 都是对话模式
-  const dshWeb = s.items.find((i) => isDshWeb(i) && (!devices.multi || terminalDevice(i.id) === device));
   const persistent = Boolean(status.capabilities?.persistent);
   // 有对话界面的（容器里、不能常驻的电脑上没有）；其余都在终端里跑
   const chatLaunches = container || !persistent ? [] : CHAT_LAUNCHES;
@@ -580,10 +577,9 @@ function DraftForm() {
     chatLaunches.length > 0 && { head: t('draft.group_chat') },
     ...chatLaunches.map((l) => typeItem(l, false)),
     { head: t('draft.group_term') },
-    ...DRAFT_LAUNCHES.filter((l) => l !== 'dsh').map((l) => typeItem(l, true)),
+    ...DRAFT_LAUNCHES.map((l) => typeItem(l, true)),
     { icon: (p) => <LaunchIcon launch="shell" {...p} />, label: t('launch.shell.title'), hint: t('draft.shell_hint'), checked: false, onClick: () => openNow('shell') },
     { icon: (p) => <LaunchIcon launch="custom" {...p} />, label: t('draft.custom'), hint: t('draft.custom_hint'), checked: launch === 'custom', onClick: () => setLaunch('custom') },
-    !container && dshWeb && { icon: (p) => <LaunchIcon launch="dsh" {...p} />, label: t('draft.dsh_web'), hint: t('draft.dsh_open'), checked: false, onClick: () => openNow('dsh-web') },
   ];
   const ph = launch === 'custom' ? t('sess.ph_custom') : t('draft.ph', { tool: toolName });
   const installing = job?.tool === launch && job.state === 'running';
@@ -773,7 +769,7 @@ function DraftForm() {
               )
             ) : (
               <>
-                {assist.on && launch !== 'opencode' && (
+                {assist.on && (
                   <>
                     <button type="button" className="btn btn-plain btn-icon draft-attach" onMouseDown={(e) => e.preventDefault()} onClick={() => assist.trigger('@')} aria-label={t('chat.mention')} title={t('chat.mention_hint')}>
                       <AtSign size={17} />

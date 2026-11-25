@@ -84,6 +84,7 @@ licenses() { # licenses <目录> <平台>
 | [JetBrains Mono](https://github.com/JetBrains/JetBrainsMono) 2.304 | 终端英文字体 | SIL OFL 1.1 |
 | [霞鹜文楷等宽 LXGW WenKai Mono](https://github.com/lxgw/LxgwWenKai) 1.522 | 终端中文字体（按字频分片） | SIL OFL 1.1 |
 | [trzsz-go](https://github.com/trzsz/trzsz-go) 1.2.0（trzsz/trz、tsz） | 终端里上传下载文件（也能经 SSH） | MIT（trzsz-LICENSE.txt） |
+| [onlyoffice-x2t-wasm](https://github.com/cryptpad/onlyoffice-x2t-wasm) 8.3.0+0（不在安装包里，第一次预览 doc / ppt 时从 GitHub 下载到数据目录 office/） | 在浏览器里把旧版 doc / ppt 转成 docx / pptx 来预览 | AGPL-3.0（源码见链接） |
 EOF
 }
 

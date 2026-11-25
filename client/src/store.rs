@@ -42,6 +42,9 @@ const MIGRATIONS: &[&str] = &[
      );
      CREATE INDEX sync_record_origin ON sync_record(origin, seq);
      CREATE TABLE sync_seen (origin TEXT PRIMARY KEY, max_seq INTEGER NOT NULL);",
+    // v5：撤下 OpenCode、DSH：已有的 OpenCode 会话改成自定义命令，照样能用；DSH 会话改成普通终端
+    "UPDATE instances SET launch = 'custom', command = 'opencode' WHERE launch = 'opencode';
+     UPDATE instances SET launch = 'shell', command = '' WHERE launch = 'dsh';",
 ];
 
 pub struct Store {
@@ -53,7 +56,7 @@ pub struct InstanceRow {
     pub id: String,
     pub name: String,
     pub workdir: String,
-    /// `shell` | `codex` | `claude` | `opencode` | `dsh` | `custom`
+    /// `shell` | `codex` | `claude` | `agy` | `custom`
     pub launch: String,
     pub command: String,
     /// 使用的 shell：空为默认（Windows 依次 pwsh → Windows PowerShell → cmd；其他系统为登录 shell），

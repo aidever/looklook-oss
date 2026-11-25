@@ -182,6 +182,47 @@ pub fn diff(store: &Store, inst: &str, workdir: &Path, id: i64) -> R<Value> {
     }))
 }
 
+/// 对比模式的基准（docs/FILES_REDO_DESIGN_2026-11-24.md §4.3）：这个文件在会话第一个检查点（`turn`：最近一个，
+/// 即这一轮开始时）里的内容；没有检查点退到 HEAD；都没有（新文件、不是仓库）是空。
+/// 返回 `{ source: "checkpoint" | "head" | "none", text, encoding, label, id }`，二进制 / 太大时 text 为 null。
+pub fn base(store: &Store, inst: &str, workdir: &Path, path: &str, turn: bool) -> R<Value> {
+    let none = json!({ "source": "none", "text": "", "encoding": null });
+    let Some(root) = toplevel(workdir)? else { return Ok(none) };
+    let file = Path::new(path);
+    let rel = file
+        .strip_prefix(&root)
+        .ok()
+        .map(Path::to_path_buf)
+        .or_else(|| {
+            let dir = file.parent()?.canonicalize().ok()?;
+            Some(dir.strip_prefix(&root).ok()?.join(file.file_name()?))
+        });
+    let Some(rel) = rel else { return Ok(none) };
+    let rel = rel.to_string_lossy().replace('\\', "/");
+    if rel.is_empty() || rel.split('/').any(|s| s == "..") {
+        return Ok(none);
+    }
+    let root_s = root.display().to_string();
+    let list: Vec<Cp> = saved(store, inst).into_iter().filter(|c| c.root == root_s && !c.before_restore).collect();
+    let cp = if turn { list.last() } else { list.first() };
+    let show = |rev: &str| -> Option<Vec<u8>> {
+        let spec = format!("{rev}:{rel}");
+        let out = run_env(&root, &["cat-file", "blob", &spec], &[], GIT_TIMEOUT).ok()?;
+        out.status.success().then_some(out.stdout)
+    };
+    let (source, bytes, label, id) = match cp {
+        Some(c) => ("checkpoint", show(&c.commit), c.label.clone(), Some(c.id)),
+        None => ("head", show("HEAD"), String::new(), None),
+    };
+    let Some(bytes) = bytes else {
+        // 那时还没有这个文件
+        return Ok(json!({ "source": source, "text": "", "encoding": null, "label": label, "id": id, "absent": true }));
+    };
+    let det = (bytes.len() as u64 <= crate::textfile::EDIT_MAX).then(|| crate::textfile::detect(&bytes, true)).flatten();
+    let text = det.map(|d| d.encoding.decode_without_bom_handling(&bytes[if d.bom { encoding_rs::Encoding::for_bom(&bytes).map_or(0, |(_, n)| n) } else { 0 }..]).0.into_owned());
+    Ok(json!({ "source": source, "text": text, "encoding": det.map(|d| d.encoding.name()), "label": label, "id": id }))
+}
+
 /// 回到检查点：先拍“恢复前”，再恢复改过、删掉的文件，删掉之后新增的文件
 pub fn restore(store: &Store, inst: &str, workdir: &Path, id: i64) -> R<Value> {
     let cp = find(store, inst, id)?;

@@ -334,7 +334,7 @@ pub fn for_instance(store: &Store, instance: &str) -> Profile {
 }
 
 /// 第三方接口而且 Key 在：能用
-fn usable(home: &Path, p: &Profile) -> bool {
+pub fn usable(home: &Path, p: &Profile) -> bool {
     p.base_url.as_deref().is_some_and(|u| crate::model::check_base_url(u).is_ok()) && key_set(home, &p.id)
 }
 

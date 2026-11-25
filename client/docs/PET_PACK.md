@@ -65,7 +65,7 @@ JSON（允许 `//` 注释和尾逗号，按 JSONC 解析）。下面每个字段
     { "role": "原角色", "name": "…", "url": "…" },
     { "role": "动画", "name": "…" }
   ],
-  "agents": ["claude"],              // 可选：建议搭配哪种对话（claude / codex / dsh / opencode），选宠物时排在前面
+  "agents": ["claude"],              // 可选：建议搭配哪种对话（claude / codex），选宠物时排在前面
   "renderer": "video"                // 必需：video 或 sprite
 }
 ```

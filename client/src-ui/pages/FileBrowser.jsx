@@ -1,20 +1,17 @@
 // 文件浏览：终端页的“文件”标签（传 id：从终端的当前目录开始）和管理台的“文件”页（不传 id：从主目录开始）。
 // 浏览这台电脑上的文件，预览代码和文字（CodeMirror，CodeView.jsx）、图片（点开看大图）、音视频（Vidstack，MediaPlayer.jsx）、Markdown
-// 和办公文件（PDF、Word、Excel、CSV，OfficePreview.jsx），下载、把路径填进终端 / 对话输入框；新建文件夹、重命名、删除、上传（拖进列表也行）。
+// 和办公文件（PDF、Word、Excel、PowerPoint、CSV，含旧版 doc / xls / ppt，OfficePreview.jsx），下载、把路径填进终端 / 对话输入框；新建文件夹、重命名、删除、上传（拖进列表也行）。
 // 和会话联动（docs/FILES_LINKAGE_2026-11-07.md）：每个会话的文件标签记住看到哪（文件夹、打开的文件、隐藏文件开关），
 // 会话里 Git 改过的文件标出来，对话里点开的文件能“在文件中显示”，文件夹上能直接开新会话。
 // 终端标签的浏览、预览、下载挂在 /api/instances/{id}/… 下面，多台电脑时按终端路由到它所在的电脑（服务端 edge/route.rs）；
 // “文件”页与文件管理用 /api/fs/…，多台电脑时发给选中的那台（X-LL-Device）。
-import { ArrowUp, ArrowUpDown, BookOpen, CirclePlay, ChevronDown, ChevronLeft, ChevronRight, ChevronUp, ClipboardPaste, Clock, Code2, Copy, CopyPlus, Download, Eye, EyeOff, File, FileArchive, FilePen, FileAudio, FileCode, FileSpreadsheet, FileText, FileVideo, Folder, FolderInput, FolderPlus, Home, Image as ImageIcon, Link2, LocateFixed, Maximize2, MessageSquarePlus, MessagesSquare, PenLine, RefreshCw, Save, Scissors, ScrollText, Search, Share2, Sparkles, Star, TextCursorInput, Trash2, Upload, WrapText, X, Zap } from 'lucide-react';
-import { lazy, Suspense, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
+import { ArrowUp, ArrowUpDown, BookOpen, ChevronDown, ChevronLeft, ChevronRight, ChevronUp, ClipboardPaste, Clock, Copy, CopyPlus, Download, Eye, EyeOff, File, FileArchive, FileAudio, FileCode, FileSpreadsheet, FileText, FileVideo, Folder, FilePlus, FolderInput, FolderPlus, Home, LayoutGrid, List as ListIcon, Image as ImageIcon, Link2, LocateFixed, MessageSquarePlus, MessagesSquare, PenLine, RefreshCw, Scissors, Search, Star, TextCursorInput, Trash2, Upload, X, Zap } from 'lucide-react';
+import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 import { useTranslation } from 'react-i18next';
 
 import { deviceApi, fetchRaw, plainLinksWork, rtcMode, saveViaFrame, selectedDevice, terminalDevice } from '../shared/api.js';
 import { connManaged, isOnline, useDeviceConn } from '../shared/conn.js';
 import { errorText } from '../shared/i18n.js';
-import ImageViewer from '../shared/ImageViewer.jsx';
-import Markdown, { isMarkdown } from '../shared/Markdown.jsx';
-import { OFFICE_MAX, officeKind, parseCsv, WHOLE } from '../shared/office.js';
 import { relativeTime } from '../shared/time.js';
 import { useContextMenu } from '../shared/ContextMenu.jsx';
 import { Button, ErrorNote, Field, Modal, useConfirm, useToast } from '../shared/ui.jsx';
@@ -23,18 +20,11 @@ import { touchUi, useLayer } from '../shared/layers.js';
 import { sendToChat } from '../shared/chatInsert.js';
 import { sessionMode, sessionTitle, useSessions } from '../shared/sessions.jsx';
 import { formatBytes, quotePath } from '../shared/xfer.js';
-import { renderOffice, SheetView } from './OfficePreview.jsx';
 
-const IMAGE = /\.(png|jpe?g|gif|webp|bmp|ico|avif)$/i;
-/** 像日志的文件：预览时提供“跟随” */
-const LOGLIKE = /\.(log|out|err|jsonl|ndjson)$|(^|[._-])log$/i;
-export const VIDEO = /\.(mp4|m4v|webm|mov|mkv|ogv)$/i;
-export const AUDIO = /\.(mp3|m4a|aac|wav|flac|ogg|oga|opus)$/i;
-/** 远程又不能用普通链接时（多台电脑、不经 WebRTC）音视频只能整个取回来再放：太大就不放了 */
-const MEDIA_FETCH_MAX = 512 * 1024 * 1024;
-const Player = lazy(() => import('../shared/MediaPlayer.jsx'));
-const CodeView = lazy(() => import('../shared/CodeView.jsx'));
-const PREVIEW_MAX = 1024 * 1024; // 与 transfer::PREVIEW_MAX 一致
+import { AUDIO, IMAGE, mediaSrc, Preview, VIDEO } from '../files/Preview.jsx';
+import { Thumb } from '../files/thumbs.jsx';
+
+export { AUDIO, mediaSrc, Preview, VIDEO };
 const ACTIVE = ['queued', 'uploading', 'retrying'];
 
 /** 终端标签（id）或“文件”页（无 id）用的接口地址。 */
@@ -69,416 +59,6 @@ export function parentDir(path) {
   if (i < 0) return '';
   const dir = path.slice(0, i);
   return !dir ? sep : /^[A-Za-z]:$/.test(dir) ? `${dir}\\` : dir;
-}
-
-/**
- * 音视频的播放地址：能用普通链接时直接指向下载接口（`inline=1`，边下边播）；远程经 WebRTC 时同样，
- * 用 `__lldev` 指定电脑（Service Worker 转发，Range 照常）。都不行时返回 null（只能取回来再放）。
- */
-export function mediaSrc(ep, path, device) {
-  const href = `/api${ep.download(path)}&inline=1`;
-  if (rtcMode) return device ? `${href}&__lldev=${encodeURIComponent(device)}` : href;
-  return ep.plain ? href : null;
-}
-
-/** 文本预览：按 UTF-8 解码，含 NUL 或解不出来就当二进制。 */
-function decodeText(buf) {
-  const bytes = new Uint8Array(buf);
-  if (bytes.subarray(0, 8192).includes(0)) return null;
-  try {
-    return new TextDecoder('utf-8', { fatal: true }).decode(bytes);
-  } catch {
-    // 截断可能切在多字节字符中间：去掉末尾几个字节再试
-    try {
-      return new TextDecoder('utf-8', { fatal: true }).decode(bytes.subarray(0, Math.max(0, bytes.length - 3)));
-    } catch {
-      return null;
-    }
-  }
-}
-
-/** 下载：能用普通链接时直接打开；远程多台电脑时先取回再保存（普通链接带不了 X-LL-Device）。 */
-function DownloadLink({ ep, entry, size = 15 }) {
-  const { t } = useTranslation();
-  const toast = useToast();
-  const label = t('files.download');
-  if (ep.plain) {
-    return (
-      <a className="btn btn-plain btn-icon" href={`/api${ep.download(entry.path)}`} download={entry.name} aria-label={label} title={label} onClick={() => toast(t('fb.dl_start_one', { name: entry.name }))}>
-        <Download size={size} />
-      </a>
-    );
-  }
-  const save = async () => {
-    toast(t('fb.dl_start_one', { name: entry.name }));
-    // 远程（WebRTC）：经 iframe 边收边存，不整个取进内存
-    if (rtcMode) return saveViaFrame(`/api${ep.download(entry.path)}`, selectedDevice());
-    try {
-      const blob = await (await fetchRaw(ep.download(entry.path))).blob();
-      const url = URL.createObjectURL(blob);
-      const a = Object.assign(document.createElement('a'), { href: url, download: entry.name });
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-      setTimeout(() => URL.revokeObjectURL(url), 30000);
-    } catch (e) {
-      toast(errorText(t, e), 'error');
-    }
-  };
-  return (
-    <button type="button" className="btn btn-plain btn-icon" onClick={save} aria-label={label} title={label}>
-      <Download size={size} />
-    </button>
-  );
-}
-
-/**
- * 一个文件的预览（“文件”页右边；对话页里点到的文件也用它，见 ChatView 的 FileViewer）。
- * 对话页另外传：focus（{ from, to }：标出这几行并滚过去）、extra（标题栏关闭按钮前的按钮）。
- * `device`：文件在哪台电脑（远程播放音视频时用）；`active`：看不见时（切到别的标签、别的会话）把正在放的停下。
- * `insertLabel`：填路径按钮的说明（对话会话里填进输入框，其他填进终端）。
- * `edit`：打开就进编辑（对话页 /memory 刚新建的空 CLAUDE.md）。
- */
-export function Preview({ ep, entry, onClose, onInsert, insertLabel, sep, focus = null, extra = null, device = null, active = true, onAsk, edit = false }) {
-  const { t } = useTranslation();
-  const toast = useToast();
-  const confirm = useConfirm();
-  const [state, setState] = useState({ loading: true });
-  const dev = device ?? (ep.id ? terminalDevice(ep.id) : selectedDevice());
-  const ops = deviceApi(dev ?? undefined);
-  // 编辑（§9.4 J5）：草稿放在 ref 里（每个字都 setState 会让编辑器重建）；dirty 只用来显示“未保存”
-  const [editing, setEditing] = useState(false);
-  const [editBase, setEditBase] = useState('');
-  const draft = useRef('');
-  const [dirty, setDirty] = useState(false);
-  const [saving, setSaving] = useState(false);
-  const [sel, setSel] = useState(null);
-  const [follow, setFollow] = useState(false);
-  const shareFile = useRef(null);
-  // 没传 onAsk：对话里点开的文件，“让 AI 改”填进这个会话的对话输入框；传 null 表示不提供
-  const ask = onAsk === undefined ? (ep.id ? (text) => {
-    window.dispatchEvent(new CustomEvent(`ll-chat-insert:${ep.id}`, { detail: text }));
-    onClose?.();
-  } : null) : onAsk;
-  const [wrap, setWrap] = useState(true);
-  const md = isMarkdown(entry.name);
-  const office = officeKind(entry.name);
-  const csv = office === 'csv';
-  // Markdown 看排版效果 / 源码，CSV 看表格 / 源码；要标出某几行时先看源码
-  const [rendered, setRendered] = useState(!focus?.from);
-  const image = IMAGE.test(entry.name);
-  const video = VIDEO.test(entry.name);
-  const audio = !video && AUDIO.test(entry.name);
-  const media = video || audio;
-  const whole = WHOLE.includes(office);
-  const [zoom, setZoom] = useState(false);
-  useEffect(() => {
-    let alive = true;
-    let url = null;
-    if (media) {
-      const src = mediaSrc(ep, entry.path, device);
-      if (src) setState({ media: src });
-      else if ((entry.size ?? 0) > MEDIA_FETCH_MAX) setState({ office: 'media_big' });
-      else {
-        setState({ loading: true });
-        fetchRaw(ep.download(entry.path))
-          .then((r) => r.blob())
-          .then((b) => {
-            url = URL.createObjectURL(b);
-            if (alive) setState({ media: url });
-          })
-          .catch((error) => alive && setState({ error }));
-      }
-      return () => {
-        alive = false;
-        if (url) URL.revokeObjectURL(url);
-      };
-    }
-    // 浏览器不能在页面里显示 PDF（安卓上的 Chrome 等）时不取回来，提示下载
-    const noPdf = office === 'pdf' && navigator.pdfViewerEnabled === false;
-    if (office === 'other' || noPdf || (whole && entry.size > OFFICE_MAX)) {
-      setState({ office: office === 'other' ? 'other' : noPdf ? 'no_pdf' : 'too_big' });
-      return undefined;
-    }
-    setState({ loading: true });
-    // 图片、PDF、Word、Excel 取整个文件（预览接口只给前 1 MiB）
-    fetchRaw(image || whole ? ep.download(entry.path) : ep.preview(entry.path))
-      .then(async (res) => {
-        if (image) {
-          url = URL.createObjectURL(await res.blob());
-          if (alive) setState({ url });
-          return;
-        }
-        if (whole) {
-          const view = await renderOffice(office, await res.blob()).catch(() => null);
-          url = view?.url ?? null;
-          if (alive) setState(view ? { view } : { office: 'failed' });
-          return;
-        }
-        const size = Number(res.headers.get('x-looklook-size') ?? entry.size ?? 0);
-        const mtime = Number(res.headers.get('x-looklook-mtime') ?? 0) || null;
-        const text = decodeText(await res.arrayBuffer());
-        if (alive) setState({ text, truncated: size > PREVIEW_MAX, size, mtime });
-      })
-      .catch((error) => alive && setState({ error }));
-    return () => {
-      alive = false;
-      if (url) URL.revokeObjectURL(url);
-    };
-  }, [entry.path]);
-  const dir = entry.path.slice(0, Math.max(0, entry.path.lastIndexOf(sep))) || sep;
-  const showMd = md && rendered && state.text != null;
-  const showSheet = csv && rendered && state.text != null;
-  const csvSheets = useMemo(() => (showSheet ? parseCsv(state.text, entry.name) : null), [showSheet, state.text, entry.name]);
-  const insertText = insertLabel ?? t('fb.insert');
-  // 跟随日志（§9.4 J4）：每 2 秒取新增的内容接在后面，滚到最后；看不见时停
-  useEffect(() => {
-    if (!follow || !active || state.text == null) return undefined;
-    let alive = true;
-    let from = state.truncated ? 0 : state.size ?? 0;
-    let timer = 0;
-    const tick = () =>
-      ops
-        .get(`/fs/tail?path=${encodeURIComponent(entry.path)}&from=${from}`)
-        .then((r) => {
-          if (!alive) return;
-          from = r.size;
-          if (r.reset || r.text) setState((st) => ({ ...st, text: (r.reset ? r.text : st.text + r.text).slice(-2_000_000), truncated: false, size: r.size }));
-        })
-        .catch((e) => {
-          if (!alive) return;
-          setFollow(false);
-          toast(errorText(t, e.status === 404 ? { code: 'CLIENT_TOO_OLD' } : e), 'error');
-        })
-        .finally(() => {
-          if (alive) timer = setTimeout(tick, 2000);
-        });
-    tick();
-    return () => {
-      alive = false;
-      clearTimeout(timer);
-    };
-  }, [follow, active, entry.path]);
-  const plainText = state.text != null && !image && !media && !state.view && !state.office;
-  const canEdit = plainText && !state.truncated && (state.size ?? entry.size ?? 0) <= PREVIEW_MAX && !follow;
-  const canFollow = plainText && !editing && (LOGLIKE.test(entry.name) || (entry.mtime_ms && Date.now() - entry.mtime_ms < 10 * 60_000));
-  const startEdit = () => {
-    draft.current = state.text;
-    setEditBase(state.text);
-    setDirty(false);
-    setRendered(false);
-    setEditing(true);
-  };
-  // 要求一打开就编辑：内容读到、能编辑时进一次
-  const autoEdit = useRef(edit);
-  useEffect(() => {
-    if (autoEdit.current && !state.loading && canEdit && !editing) {
-      autoEdit.current = false;
-      startEdit();
-    }
-  }, [state.loading, canEdit]);
-  const stopEdit = async () => {
-    if (dirty && !(await confirm({ title: t('fb.edit_discard_title'), body: t('fb.edit_discard_body'), confirm: t('fb.edit_discard'), danger: true }))) return false;
-    setEditing(false);
-    setDirty(false);
-    return true;
-  };
-  const save = async (force = false) => {
-    if (saving) return;
-    setSaving(true);
-    try {
-      const r = await ops.post('/fs/write', { path: entry.path, content: draft.current, if_mtime: force ? undefined : state.mtime ?? undefined });
-      setState((st) => ({ ...st, text: draft.current, mtime: r.mtime_ms, size: new TextEncoder().encode(draft.current).length }));
-      setDirty(false);
-      setEditing(false);
-      toast(t('fb.saved', { name: entry.name }));
-    } catch (e) {
-      if (e.code === 'FILE_CHANGED') {
-        setSaving(false);
-        if (await confirm({ title: t('fb.conflict_title'), body: t('fb.conflict_body', { name: entry.name }), confirm: t('fb.overwrite'), danger: true })) return save(true);
-        return undefined;
-      }
-      toast(errorText(t, e.status === 404 ? { code: 'CLIENT_TOO_OLD' } : e), 'error');
-    }
-    setSaving(false);
-    return undefined;
-  };
-  const close = async () => {
-    if (editing && !(await stopEdit())) return;
-    onClose?.();
-  };
-  const askAi = () => {
-    if (!ask || !sel) return;
-    const code = sel.text.length > 6000 ? `${sel.text.slice(0, 6000)}\n…` : sel.text;
-    ask(t('fb.ask_ai_text', { path: entry.path, lines: sel.from === sel.to ? `${sel.from}` : `${sel.from}-${sel.to}`, code }));
-  };
-  const canShare = touchUi && typeof navigator.canShare === 'function' && !media;
-  const share = async () => {
-    try {
-      if (!shareFile.current) {
-        const blob = await (await fetchRaw(ep.download(entry.path))).blob();
-        shareFile.current = new File([blob], entry.name, { type: blob.type || 'application/octet-stream' });
-      }
-      const data = { files: [shareFile.current], title: entry.name };
-      if (!navigator.canShare(data)) {
-        toast(t('fb.share_unsupported'), 'error');
-        return;
-      }
-      await navigator.share(data);
-    } catch (e) {
-      if (e?.name === 'AbortError') return;
-      // 取文件花了太久，浏览器不认这次点击了：文件已经在手里，再点一次就能分享
-      if (e?.name === 'NotAllowedError' && shareFile.current) toast(t('fb.share_again'));
-      else toast(errorText(t, e), 'error');
-    }
-  };
-  return (
-    <div className="fb-preview" role="region" aria-label={entry.name}>
-      <div className="fb-preview-head">
-        {media ? <CirclePlay size={16} aria-hidden="true" /> : image ? <ImageIcon size={16} aria-hidden="true" /> : office === 'xlsx' || csv ? <FileSpreadsheet size={16} aria-hidden="true" /> : <FileText size={16} aria-hidden="true" />}
-        <b className="ellipsis grow" title={entry.path}>{entry.name}</b>
-        {entry.size != null && <span className="muted small">{formatBytes(entry.size)}</span>}
-        {(md || csv) && state.text != null && (
-          <button
-            type="button"
-            className="btn btn-plain btn-icon"
-            onClick={() => setRendered(!rendered)}
-            aria-pressed={!rendered}
-            aria-label={t(rendered ? 'fb.md_source' : csv ? 'fb.csv_table' : 'fb.md_rendered')}
-            title={t(rendered ? 'fb.md_source' : csv ? 'fb.csv_table' : 'fb.md_rendered')}
-          >
-            {rendered ? <Code2 size={16} /> : csv ? <FileSpreadsheet size={16} /> : <BookOpen size={16} />}
-          </button>
-        )}
-        {image && state.url && (
-          <button type="button" className="btn btn-plain btn-icon" onClick={() => setZoom(true)} aria-label={t('fb.zoom')} title={t('fb.zoom')}>
-            <Maximize2 size={16} />
-          </button>
-        )}
-        {!image && !showMd && !showSheet && state.text != null && (
-          <button type="button" className={`btn btn-plain btn-icon ${wrap ? 'on' : ''}`} onClick={() => setWrap(!wrap)} aria-pressed={wrap} aria-label={t('fb.wrap')} title={t('fb.wrap')}>
-            <WrapText size={16} />
-          </button>
-        )}
-        {editing ? (
-          <>
-            {dirty && <span className="muted small">{t('fb.unsaved')}</span>}
-            <button type="button" className="btn btn-plain btn-sm" onClick={stopEdit} disabled={saving}>
-              {t('fb.edit_cancel')}
-            </button>
-            <button type="button" className="btn btn-primary btn-sm" onClick={() => save()} disabled={saving || !dirty} title={t('fb.save_hint')}>
-              <Save size={15} aria-hidden="true" />
-              {t(saving ? 'fb.saving' : 'fb.save')}
-            </button>
-          </>
-        ) : (
-          <>
-            {ask && sel && (
-              <button type="button" className="btn btn-plain btn-sm fb-ask" onClick={askAi} title={t('fb.ask_ai_hint')}>
-                <Sparkles size={15} aria-hidden="true" />
-                {t('fb.ask_ai')}
-              </button>
-            )}
-            {canFollow && (
-              <button type="button" className={`btn btn-plain btn-icon ${follow ? 'on' : ''}`} onClick={() => setFollow(!follow)} aria-pressed={follow} aria-label={t('fb.follow')} title={t('fb.follow_hint')}>
-                <ScrollText size={16} />
-              </button>
-            )}
-            {canEdit && (
-              <button type="button" className="btn btn-plain btn-icon" onClick={startEdit} aria-label={t('fb.edit')} title={t('fb.edit')}>
-                <FilePen size={16} />
-              </button>
-            )}
-            {onInsert && (
-              <button type="button" className="btn btn-plain btn-icon" onClick={() => onInsert(entry.path)} aria-label={insertText} title={insertText}>
-                <TextCursorInput size={16} />
-              </button>
-            )}
-            {extra}
-            {canShare && (
-              <button type="button" className="btn btn-plain btn-icon" onClick={share} aria-label={t('fb.share')} title={t('fb.share')}>
-                <Share2 size={16} />
-              </button>
-            )}
-            <DownloadLink ep={ep} entry={entry} size={16} />
-          </>
-        )}
-        <button type="button" className="btn btn-plain btn-icon" onClick={close} aria-label={t('fb.close_preview')} title={t('fb.close_preview')}>
-          <X size={17} />
-        </button>
-      </div>
-      <div className="fb-preview-body">
-        {state.loading ? (
-          <p className="muted small fb-pad">{t('fb.loading')}</p>
-        ) : state.error ? (
-          <p className="fb-pad small" style={{ color: 'var(--danger)' }}>{t(`files.err.${state.error.code}`, { defaultValue: errorText(t, state.error) })}</p>
-        ) : state.media ? (
-          <Suspense fallback={<p className="muted small fb-pad">{t('fb.loading')}</p>}>
-            {active ? <Player key={state.media} src={state.media} name={entry.name} audio={audio} onError={() => setState({ office: 'media_failed' })} /> : <p className="muted small fb-pad">{t('fb.media_paused')}</p>}
-          </Suspense>
-        ) : image ? (
-          <>
-            <button type="button" className="fb-img" onClick={() => setZoom(true)} aria-label={t('fb.zoom')}>
-              <img src={state.url} alt={entry.name} />
-            </button>
-            {zoom && <ImageViewer images={[{ url: state.url, name: entry.name }]} onClose={() => setZoom(false)} />}
-          </>
-        ) : state.office ? (
-          <p className="muted small fb-pad">{t(`fb.office_${state.office}`, { size: formatBytes(OFFICE_MAX) })}</p>
-        ) : state.view?.url ? (
-          <iframe className="fb-pdf" src={state.view.url} title={entry.name} />
-        ) : state.view?.html === '' ? (
-          <p className="muted small fb-pad">{t('fb.empty_file')}</p>
-        ) : state.view?.html != null ? (
-          // eslint-disable-next-line react/no-danger -- 已用 DOMPurify 清洗（OfficePreview.jsx）
-          <div className="md" dangerouslySetInnerHTML={{ __html: state.view.html }} />
-        ) : state.view?.sheets ? (
-          <SheetView sheets={state.view.sheets} />
-        ) : state.text == null ? (
-          <p className="muted small fb-pad">{t('fb.binary')}</p>
-        ) : (
-          <>
-            {state.truncated && <p className="muted small fb-pad fb-note">{t('fb.truncated', { size: formatBytes(PREVIEW_MAX) })}</p>}
-            {showSheet ? (
-              <SheetView sheets={csvSheets} />
-            ) : showMd ? (
-              <Markdown text={state.text} imageUrl={ep.plain ? (src) => `/api${ep.preview(resolve(dir, src, sep))}` : null} />
-            ) : !state.text && !editing ? (
-              <pre className="fb-text">{t('fb.empty_file')}</pre>
-            ) : (
-              <Suspense fallback={<pre className={`fb-text ${wrap ? 'fb-wrap' : ''}`}>{state.text}</pre>}>
-                <CodeView
-                  text={editing ? editBase : state.text}
-                  name={entry.name}
-                  wrap={wrap}
-                  focus={follow || editing ? null : focus}
-                  editable={editing}
-                  atEnd={follow}
-                  onChange={(v) => {
-                    draft.current = v;
-                    if (!dirty) setDirty(true);
-                  }}
-                  onSave={() => save()}
-                  onSelect={ask ? setSel : undefined}
-                />
-              </Suspense>
-            )}
-          </>
-        )}
-      </div>
-    </div>
-  );
-}
-
-/** Markdown 里的相对图片路径 → 这台电脑上的绝对路径。 */
-function resolve(dir, rel, sep) {
-  const parts = dir.split(/[\\/]/);
-  for (const seg of rel.split(/[\\/]/)) {
-    if (seg === '..') parts.length > 1 && parts.pop();
-    else if (seg && seg !== '.') parts.push(seg);
-  }
-  const out = parts.join(sep);
-  return out || sep;
 }
 
 /** 新建文件夹 / 重命名：一个输入框。 */
@@ -538,6 +118,9 @@ function NameDialog({ dialog, onClose }) {
 // ---------------- 列表：排序、类型图标、时间（docs/CHAT_UX_2026-11-06.md §6） ----------------
 
 const SORT_KEY = 'll-fb-sort';
+const GRID_KEY = 'll-fb-grid';
+/** 一次取多少项（很大的文件夹分页） */
+const PAGE = 1000;
 const WIDTH_KEY = 'll-fb-preview-w';
 const WEEK_MS = 7 * 86_400_000;
 /** 一次最多下载几个文件、一共多大（多了浏览器会卡、也容易被当成恶意连续下载） */
@@ -1150,7 +733,7 @@ export default function FileBrowser({ id, active = true, onInsert, insertTo = 't
     let alive = true;
     setState((s) => ({ ...s, loading: true }));
     ops
-      .get(ep.list(path, hidden))
+      .get(`${ep.list(path, hidden)}&limit=${PAGE}`)
       .then((data) => alive && setState({ data }))
       .catch((error) => alive && setState((s) => ({ data: s.data, error })));
     return () => {
@@ -1159,6 +742,26 @@ export default function FileBrowser({ id, active = true, onInsert, insertTo = 't
   }, [id, device, path, hidden, tick, active, quick]);
   const data = quick ? null : state.data;
   const sep = data?.os === 'windows' ? '\\' : '/';
+  // 很大的文件夹一次取 PAGE 项，“再显示 N 项”接着取（排序只对已经取到的）
+  const [more, setMore] = useState(false);
+  const loadMore = async () => {
+    if (!data || more) return;
+    setMore(true);
+    try {
+      const r = await ops.get(`${ep.list(data.path, hidden)}&offset=${data.entries.length}&limit=${PAGE}`);
+      setState((st) => (st.data?.path === r.path ? { data: { ...st.data, entries: [...st.data.entries, ...r.entries], total: r.total } } : st));
+    } catch (e) {
+      toast(errorText(t, e), 'error');
+    }
+    setMore(false);
+  };
+  // 列表 / 图标（图片、视频显示缩略图）
+  const [grid, setGridState] = useState(() => readStore(GRID_KEY, false));
+  const setGrid = (v) => {
+    setGridState(v);
+    writeStore(GRID_KEY, v);
+  };
+  const workdir = useSessions()?.known(id)?.workdir ?? null;
   const marks = useGitMarks(id, ops, data?.path, sep, tick, active);
   // 记住看到哪：真正到了的文件夹（不是“空 = 当前目录”），打开的文件
   useEffect(() => {
@@ -1264,6 +867,25 @@ export default function FileBrowser({ id, active = true, onInsert, insertTo = 't
         reload();
       },
     });
+  const newFile = () =>
+    setDialog({
+      title: t('fv.new_file'),
+      confirm: t('fb.create'),
+      initial: '',
+      run: async (name) => {
+        const p = join(data.path, name, sep);
+        await ops.post('/fs/write', { path: p, content: '', create: true });
+        reload();
+        setOpen({ name, path: p, size: 0, mtime_ms: Date.now(), edit: true });
+      },
+    });
+  // 预览里另存为、解压之后：打开新的文件 / 去新的文件夹
+  const openPath = (p, isDir) => (isDir ? go(p) : openAt(p));
+  // 相对会话目录的路径（会话的“文件”标签里）
+  const relOf = (p) => {
+    const root = workdir?.replace(/[\\/]+$/, '');
+    return root && p.startsWith(`${root}${sep}`) ? p.slice(root.length + 1) : null;
+  };
   const rename = (entry) =>
     setDialog({
       title: t('fb.rename_title', { name: entry.name }),
@@ -1422,6 +1044,7 @@ export default function FileBrowser({ id, active = true, onInsert, insertTo = 't
       picks.some((x) => !x.is_dir) && { icon: Download, label: t('files.download'), onClick: () => batch.run(picks) },
       insert && !many && { icon: TextCursorInput, label: insertLabel, onClick: () => insert(e.path) },
       { icon: Copy, label: t('fb.copy_path'), onClick: () => copyPaths(picks.map((x) => x.path)) },
+      picks.every((x) => relOf(x.path)) && { icon: Copy, label: t('fv.copy_rel'), onClick: () => copyPaths(picks.map((x) => relOf(x.path))) },
       'sep',
       !many && { icon: PenLine, label: t('fb.rename'), disabled: offline, onClick: () => rename(e) },
       { icon: Trash2, label: t('fb.delete'), danger: true, disabled: offline, onClick: () => remove(picks) },
@@ -1637,6 +1260,9 @@ export default function FileBrowser({ id, active = true, onInsert, insertTo = 't
         >
           <Search size={17} />
         </button>
+        <button type="button" className="btn btn-plain btn-icon" onClick={() => setGrid(!grid)} aria-label={t(grid ? 'fv.view_list' : 'fv.view_grid')} title={t(grid ? 'fv.view_list' : 'fv.view_grid')}>
+          {grid ? <ListIcon size={17} /> : <LayoutGrid size={17} />}
+        </button>
         <button type="button" className={`btn btn-plain btn-icon ${hidden ? 'on' : ''}`} onClick={() => setHidden(!hidden)} aria-pressed={hidden} aria-label={t('fb.hidden')} title={t('fb.hidden')}>
           {hidden ? <Eye size={17} /> : <EyeOff size={17} />}
         </button>
@@ -1648,6 +1274,9 @@ export default function FileBrowser({ id, active = true, onInsert, insertTo = 't
         <button type="button" className="btn btn-plain fb-act" disabled={!canWrite} onClick={mkdir} aria-label={t('fb.new_folder')} title={t('fb.new_folder')}>
           <FolderPlus size={17} aria-hidden="true" />
           <span className="fb-act-label">{t('fb.new_folder')}</span>
+        </button>
+        <button type="button" className="btn btn-plain btn-icon" disabled={!canWrite} onClick={newFile} aria-label={t('fv.new_file')} title={t('fv.new_file')}>
+          <FilePlus size={17} aria-hidden="true" />
         </button>
         <button type="button" className="btn btn-plain fb-act" disabled={!canWrite} onClick={() => fileInput.current?.click()} aria-label={t('fb.upload')} title={t('fb.upload_hint')}>
           <Upload size={17} aria-hidden="true" />
@@ -1717,7 +1346,7 @@ export default function FileBrowser({ id, active = true, onInsert, insertTo = 't
       )}
       {!touchUi && pickbar}
       <div className="fb-main" ref={mainRef}>
-        <div className="fb-list" role="grid" aria-busy={state.loading} aria-rowcount={entries.length} tabIndex={0} ref={listRef} onKeyDown={onKey}>
+        <div className={`fb-list ${grid ? 'fb-grid' : ''}`} role="grid" aria-busy={state.loading} aria-rowcount={entries.length} tabIndex={0} ref={listRef} onKeyDown={onKey}>
           {data && !data.denied && entries.length > 0 && (
             <div className="fb-head" role="row">
               <span className="fb-c-check" role="columnheader">
@@ -1779,7 +1408,11 @@ export default function FileBrowser({ id, active = true, onInsert, insertTo = 't
                   }}
                   title={e.path}
                 >
-                  <Icon size={18} aria-hidden="true" className={`fb-ico fb-ico-${kind}`} />
+                  {grid && !e.is_dir && (IMAGE.test(e.name) || VIDEO.test(e.name)) ? (
+                    <Thumb path={e.path} mtime={e.mtime_ms} device={device ?? (id ? terminalDevice(id) : selectedDevice())} fallback={<Icon size={34} aria-hidden="true" className={`fb-ico fb-ico-${kind}`} />} />
+                  ) : (
+                    <Icon size={grid ? 34 : 18} aria-hidden="true" className={`fb-ico fb-ico-${kind}`} />
+                  )}
                   <span className="fb-name-text">
                     <span className="fb-name-main">
                       {e.name}
@@ -1818,6 +1451,11 @@ export default function FileBrowser({ id, active = true, onInsert, insertTo = 't
               </div>
             );
           })}
+          {!deepOn && !filter && data?.total > data?.entries?.length && (
+            <button type="button" className="fb-more-rows" onClick={loadMore} disabled={more}>
+              {more ? t('fb.loading') : t('fv.load_more', { shown: data.entries.length, total: data.total })}
+            </button>
+          )}
         </div>
         {open && <Splitter box={mainRef} width={previewW} onWidth={setWidth} />}
         {open && (
@@ -1834,6 +1472,8 @@ export default function FileBrowser({ id, active = true, onInsert, insertTo = 't
               device={device}
               active={active}
               onAsk={insert && insertTo === 'chat' ? onInsert : openSession ? setChatPick : null}
+              edit={Boolean(open.edit)}
+              onOpenPath={openPath}
             />
           </div>
         )}

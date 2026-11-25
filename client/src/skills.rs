@@ -4,15 +4,14 @@
 //!
 //! | 根目录 | 谁会读 | 能删 |
 //! | --- | --- | --- |
-//! | `<Claude 配置目录>/skills` | Claude Code（OpenCode 也读） | 能；`synced/` 是 claude.ai 同步的，不列 |
+//! | `<Claude 配置目录>/skills` | Claude Code | 能；`synced/` 是 claude.ai 同步的，不列 |
 //! | `$CODEX_HOME/skills` | Codex | 能；`.system/` 单独列成“内置”，只能看 |
-//! | `~/.agents/skills` | Codex、OpenCode | 能 |
-//! | `<OpenCode 配置目录>/skill(s)` | OpenCode | 能 |
-//! | `$DSH_HOME/skills` | DSH | 能 |
+//! | `~/.agents/skills` | Codex | 能 |
+//! | `~/.gemini/config/skills` | Antigravity | 能 |
 //! | Claude Code 用户级插件的 `<安装目录>/skills` | Claude Code | 只能看（要删得卸载插件） |
 //!
 //! 对话页的 /skills 另外带上会话的项目目录（`?instance=`）：从工作目录往上到 Git 仓库根，每一层的 `.claude/skills`
-//! （Claude Code，OpenCode 也读）、`.agents/skills`（Codex、OpenCode）、`.opencode/skill(s)`（OpenCode），只能看
+//! （Claude Code）、`.agents/skills`（Codex、Antigravity），只能看
 //! （是仓库里的文件，改、删走文件标签或 git）。
 //!
 //! 同一个技能目录可能出现在几个根下面（软链、公共目录），按真实路径去重，`tools` 里列出所有会用到它的工具。
@@ -49,7 +48,7 @@ pub enum Source {
 
 #[derive(Debug, Clone)]
 struct Root {
-    /// 接口里的根标识：`claude`、`codex`、`agents`、`opencode`、`opencode-skill`、`dsh`、`codex-system`、`plugin.<名字>`
+    /// 接口里的根标识：`claude`、`codex`、`agents`、`agy`、`codex-system`、`agy-builtin`、`plugin.<名字>`
     key: String,
     dir: PathBuf,
     tools: Vec<&'static str>,
@@ -65,8 +64,6 @@ struct Dirs {
     claude: PathBuf,
     codex: PathBuf,
     agents: PathBuf,
-    opencode: PathBuf,
-    dsh: PathBuf,
     /// Antigravity（agy）：`~/.gemini/config`
     agy: PathBuf,
     /// Antigravity（agy）数据目录：`~/.gemini/antigravity-cli`
@@ -82,8 +79,6 @@ impl Dirs {
             claude: Agent::Claude.dir(),
             codex: Agent::Codex.dir(),
             agents: home.join(".agents"),
-            opencode: Agent::OpenCode.dir(),
-            dsh: Agent::Dsh.dir(),
             agy: Agent::Agy.dir(),
             agy_data: crate::agents::agy_data_dir(),
             project: vec![],
@@ -98,21 +93,10 @@ impl Dirs {
 
     fn roots(&self) -> Vec<Root> {
         let user = |key: &str, dir: PathBuf, tools: Vec<&'static str>| Root { key: key.into(), dir, tools, source: Source::User, plugin: None, skip: &[] };
-        // OpenCode 也读 Claude 和 ~/.agents 的技能：装了 OpenCode 才标上
-        let oc = self.opencode.is_dir();
-        let with_oc = |mut v: Vec<&'static str>| {
-            if oc {
-                v.push("opencode");
-            }
-            v
-        };
         let mut out = vec![
-            Root { skip: &["synced"], ..user("claude", self.claude.join("skills"), with_oc(vec!["claude"])) },
+            Root { skip: &["synced"], ..user("claude", self.claude.join("skills"), vec!["claude"]) },
             user("codex", self.codex.join("skills"), vec!["codex"]),
-            user("agents", self.agents.join("skills"), with_oc(vec!["codex"])),
-            user("opencode", self.opencode.join("skills"), vec!["opencode"]),
-            user("opencode-skill", self.opencode.join("skill"), vec!["opencode"]),
-            user("dsh", self.dsh.join("skills"), vec!["dsh"]),
+            user("agents", self.agents.join("skills"), vec!["codex"]),
             user("agy", self.agy.join("skills"), vec!["agy"]),
             Root { source: Source::System, ..user("codex-system", self.codex.join("skills").join(".system"), vec!["codex"]) },
             Root { source: Source::System, ..user("agy-builtin", self.agy_data.join("builtin").join("skills"), vec!["agy"]) },
@@ -120,10 +104,8 @@ impl Dirs {
         // 项目里的：键带层数（0 = 工作目录），同一个项目每次拼出来一样，详情接口能按键找回来
         for (n, d) in self.project.iter().enumerate() {
             let proj = |key: &str, dir: PathBuf, tools: Vec<&'static str>| Root { source: Source::Project, ..user(&format!("project{n}-{key}"), dir, tools) };
-            out.push(proj("claude", d.join(".claude").join("skills"), with_oc(vec!["claude"])));
-            out.push(proj("agents", d.join(".agents").join("skills"), with_oc(vec!["codex", "agy"])));
-            out.push(proj("opencode", d.join(".opencode").join("skills"), vec!["opencode"]));
-            out.push(proj("opencode-skill", d.join(".opencode").join("skill"), vec!["opencode"]));
+            out.push(proj("claude", d.join(".claude").join("skills"), vec!["claude"]));
+            out.push(proj("agents", d.join(".agents").join("skills"), vec!["codex", "agy"]));
         }
         for (name, path) in claude_plugins(&self.claude) {
             out.push(Root {
@@ -519,8 +501,6 @@ mod tests {
             claude: p.join(".claude"),
             codex: p.join(".codex"),
             agents: p.join(".agents"),
-            opencode: p.join("oc"),
-            dsh: p.join(".dsh"),
             agy: p.join(".gemini").join("config"),
             agy_data: p.join(".gemini").join("antigravity-cli"),
             project: vec![],
@@ -583,7 +563,6 @@ mod tests {
     #[test]
     fn dedupes_links_and_deletes_only_link() {
         let (d, dirs) = setup();
-        std::fs::create_dir_all(&dirs.opencode).unwrap();
         skill(&dirs.agents.join("skills"), "shared", "# 共用");
         std::fs::create_dir_all(dirs.claude.join("skills")).unwrap();
         std::os::unix::fs::symlink(dirs.agents.join("skills/shared"), dirs.claude.join("skills/shared")).unwrap();
@@ -591,7 +570,7 @@ mod tests {
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].id, "claude/shared");
         assert!(items[0].link);
-        assert_eq!(items[0].tools, ["claude", "opencode", "codex"]);
+        assert_eq!(items[0].tools, ["claude", "codex"]);
         let trash = d.path().join("trash");
         let entry = delete_in(&dirs, &trash, "claude", "shared", SystemTime::now()).unwrap();
         assert!(std::fs::symlink_metadata(dirs.claude.join("skills/shared")).is_err());
@@ -604,28 +583,28 @@ mod tests {
     #[test]
     fn delete_moves_to_trash_and_purges() {
         let (d, dirs) = setup();
-        skill(&dirs.dsh.join("skills"), "a", "# a");
-        std::fs::write(dirs.dsh.join("skills/a/x.txt"), "1234").unwrap();
+        skill(&dirs.agy.join("skills"), "a", "# a");
+        std::fs::write(dirs.agy.join("skills/a/x.txt"), "1234").unwrap();
         let trash = d.path().join("trash");
         let old = SystemTime::now() - Duration::from_secs(8 * 24 * 3600);
-        delete_in(&dirs, &trash, "dsh", "a", old).unwrap();
-        assert!(!dirs.dsh.join("skills/a").exists());
+        delete_in(&dirs, &trash, "agy", "a", old).unwrap();
+        assert!(!dirs.agy.join("skills/a").exists());
         assert_eq!(std::fs::read_dir(&trash).unwrap().count(), 1);
         // 再删一个（现在）：8 天前那个被清掉
-        skill(&dirs.dsh.join("skills"), "b", "# b");
-        delete_in(&dirs, &trash, "dsh", "b", SystemTime::now()).unwrap();
+        skill(&dirs.agy.join("skills"), "b", "# b");
+        delete_in(&dirs, &trash, "agy", "b", SystemTime::now()).unwrap();
         let left: Vec<String> = std::fs::read_dir(&trash).unwrap().flatten().map(|e| e.file_name().into_string().unwrap()).collect();
         assert_eq!(left.len(), 1);
         let meta: TrashMeta = serde_json::from_slice(&std::fs::read(trash.join(&left[0]).join("meta.json")).unwrap()).unwrap();
-        assert_eq!((meta.root.as_str(), meta.name.as_str()), ("dsh", "b"));
+        assert_eq!((meta.root.as_str(), meta.name.as_str()), ("agy", "b"));
         // 撤销：挪回原处，文件都在；原处又有同名的就拒绝
-        skill(&dirs.dsh.join("skills"), "c", "# c");
-        let e = delete_in(&dirs, &trash, "dsh", "c", SystemTime::now()).unwrap();
-        skill(&dirs.dsh.join("skills"), "c", "# 新的");
+        skill(&dirs.agy.join("skills"), "c", "# c");
+        let e = delete_in(&dirs, &trash, "agy", "c", SystemTime::now()).unwrap();
+        skill(&dirs.agy.join("skills"), "c", "# 新的");
         assert_eq!(restore_in(&dirs, &trash, &e).unwrap_err().code, "SKILL_EXISTS");
-        std::fs::remove_dir_all(dirs.dsh.join("skills/c")).unwrap();
+        std::fs::remove_dir_all(dirs.agy.join("skills/c")).unwrap();
         restore_in(&dirs, &trash, &e).unwrap();
-        assert_eq!(std::fs::read_to_string(dirs.dsh.join("skills/c/SKILL.md")).unwrap(), "# c");
+        assert_eq!(std::fs::read_to_string(dirs.agy.join("skills/c/SKILL.md")).unwrap(), "# c");
         for bad in ["../x", "", "a/b"] {
             assert!(restore_in(&dirs, &trash, bad).is_err());
         }

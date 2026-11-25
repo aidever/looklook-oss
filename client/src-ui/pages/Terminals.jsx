@@ -30,7 +30,7 @@ import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 
 import { useStatus } from "../App.jsx";
-import { api, deviceApi, isLocalDevice, rememberTerminals, rtcMode, selectedDevice, terminalDevice } from "../shared/api.js";
+import { api, deviceApi, rememberTerminals, terminalDevice } from "../shared/api.js";
 import { deviceName, osLabel, useDevices } from "../shared/devices.jsx";
 import { urlHost } from "../shared/host.js";
 import { LaunchIcon } from "../shared/brands.jsx";
@@ -57,14 +57,14 @@ import {
   useLoad,
   useToast,
 } from "../shared/ui.jsx";
-import { CHAT_LAUNCHES, isDshWeb } from "../shared/chat.js";
+import { CHAT_LAUNCHES } from "../shared/chat.js";
 import { RemoteUpsell, remoteAllowed } from "../shared/Remote.jsx";
 import Select from '../shared/Select.jsx';
 
-const LAUNCHES = ["shell", "codex", "claude", "agy", "opencode", "dsh", "custom"];
+const LAUNCHES = ["shell", "codex", "claude", "agy", "custom"];
 // 能一键安装的 AI 工具（没装时提示安装）；能以全部权限启动的
-const AI_TOOLS = ["codex", "claude", "opencode", "dsh"];
-const FULL_ACCESS = ["codex", "claude", "opencode", "agy"];
+const AI_TOOLS = ["codex", "claude"];
+const FULL_ACCESS = ["codex", "claude", "agy"];
 
 export function RemoteCard({ initialOpen = false }) {
   const { t } = useTranslation();
@@ -241,42 +241,6 @@ function stateOf(i) {
 // 新窗口打开管理台的终端页（带文件面板、粘贴、拖放），不再直接打开裸 /i/{id}/。
 const tabUrl = (inst) => `/t/${inst.id}`;
 
-/** DSH 网页界面的地址 /w/{id}/（见 src/gateway/dsh.rs）。多台电脑时带上它所在的电脑（__lldev，启动页 / 本机客户端按它转给那台电脑，之后的请求按会话 id 转）。 */
-export function webSrc(id) {
-  const device = terminalDevice(id) ?? (rtcMode ? selectedDevice() : null);
-  return device && !isLocalDevice(device) ? `/w/${id}/?__lldev=${encodeURIComponent(device)}` : `/w/${id}/`;
-}
-
-// 在浏览器中单独打开 DSH（平时在会话标签里打开，见 WebPane.jsx）。
-// 桌面应用里交给看看用系统浏览器直接打开 DSH 自己的本机地址（带口令；应用窗口里登录不上 DSH）；
-// 浏览器里打开网关的 /w/{id}/（本机、局域网、远程都能用，远程经管理台的通道）：先在点击里同步开一个空白窗口
-// （不会被当作弹窗拦截），后台确保 DSH 能登录上再跳过去。
-export async function openDsh(inst, t, toast) {
-  const dev = deviceApi(terminalDevice(inst.id));
-  if (window.__LOOKLOOK_DESKTOP__) {
-    try {
-      const r = await dev.post(`/instances/${inst.id}/page?open=1`);
-      if (!r.opened) toast(t("dsh.not_opened"), "error");
-    } catch (e) {
-      toast(errorText(t, e), "error");
-    }
-    return;
-  }
-  const w = window.open("about:blank", "_blank");
-  try {
-    const r = await dev.post(`/instances/${inst.id}/page`);
-    // 没登录上时打开了也只是 DSH 的“需要认证”页
-    if (!r.ready) {
-      w?.close();
-      toast(t("dsh.not_opened"), "error");
-    } else if (w) w.location.href = webSrc(inst.id);
-    else window.open(webSrc(inst.id), "_blank", "noopener");
-  } catch (e) {
-    w?.close();
-    toast(errorText(t, e), "error");
-  }
-}
-
 /**
  * 一个终端的各种操作（卡片、列表行、工作台侧栏共用）：打开、新窗口、停止、重启、删除……
  * onOpenHere(id)：在本页打开（电脑上进工作台，手机上整页打开）。
@@ -293,7 +257,6 @@ export function useInstanceActions(inst, { onChanged, onRemember, onEdit, onLogs
   const live = inst.running || Boolean(inst.task_alive);
   const persistent = status.capabilities.persistent;
   const allowed = status.account.allowed;
-  const dsh = isDshWeb(inst);
   const act = async (fn, okText) => {
     setBusy(true);
     try {
@@ -324,12 +287,6 @@ export function useInstanceActions(inst, { onChanged, onRemember, onEdit, onLogs
   // 在本页打开（不改变标签页地址）。
   const openHere = async () => {
     if (await ensureRunning()) onOpenHere(inst.id);
-  };
-  const openPage = async () => {
-    setBusy(true);
-    await openDsh(inst, t, toast);
-    setBusy(false);
-    onChanged();
   };
   // 新标签页打开：未运行时先同步开一个空白窗口（避免被拦截），启动后再导航过去。
   const openTab = async () => {
@@ -388,7 +345,7 @@ export function useInstanceActions(inst, { onChanged, onRemember, onEdit, onLogs
   };
   // 复制会话：同一台电脑上照原样（启动方式、文件夹、shell、权限）新建一个并启动，然后在本页打开。
   // 默认是空白的新会话（同一个项目再开一个干别的）；聊过的 Claude Code / Codex 会话另有“复制一份接着聊”
-  // （fork，换个方向试，原来的不动）。不复制开机自动运行，免得重启后一下子多跑一份；DSH 一台电脑只有一个，不能复制。
+  // （fork，换个方向试，原来的不动）。不复制开机自动运行，免得重启后一下子多跑一份。
   const conv = ["claude", "codex"].includes(inst.launch) && inst.chat?.turn && inst.chat?.session_id;
   const duplicate = async (fork = false) => {
     const dev = terminalDevice(inst.id);
@@ -429,13 +386,12 @@ export function useInstanceActions(inst, { onChanged, onRemember, onEdit, onLogs
       .catch((e) => toast(errorText(t, e), "error"));
   // “更多”菜单。full：列表行和侧栏没有单独的按钮，把打开方式、停止也放进来
   const menu = (full) => [
-    full && dsh && { icon: ExternalLink, label: t("dsh.open_browser"), onClick: openPage, disabled: busy || !allowed },
-    full && !dsh && { icon: ExternalLink, label: t("instance.new_window"), onClick: openTab, disabled: busy || !allowed },
+    full && { icon: ExternalLink, label: t("instance.new_window"), onClick: openTab, disabled: busy || !allowed },
     // 对话会话列表上显示的是对话的标题，“修改”里改会话名看不出变化：单独给个改名，连对话标题一起改
     inst.chat_ui && { icon: TextCursorInput, label: t("instance.rename"), onClick: rename, disabled: busy },
     { icon: Pencil, label: t("instance.edit"), onClick: () => onEdit(inst) },
-    !dsh && { icon: CopyPlus, label: t("instance.duplicate"), onClick: () => duplicate(false), disabled: busy || !allowed },
-    !dsh && conv && { icon: GitFork, label: t("instance.duplicate_conv"), onClick: () => duplicate(true), disabled: busy || !allowed },
+    { icon: CopyPlus, label: t("instance.duplicate"), onClick: () => duplicate(false), disabled: busy || !allowed },
+    conv && { icon: GitFork, label: t("instance.duplicate_conv"), onClick: () => duplicate(true), disabled: busy || !allowed },
     inst.running && { icon: RotateCcw, label: t("instance.restart"), onClick: restart },
     // 停了的会话：也能在这里启动（不用先点开）
     !live && { icon: Play, label: t("instance.start"), onClick: () => act(() => api.post(`/instances/${inst.id}/start`), t("instance.started")), disabled: busy || !allowed },
@@ -448,9 +404,9 @@ export function useInstanceActions(inst, { onChanged, onRemember, onEdit, onLogs
       danger: true,
     },
   ];
-  // 点名称 / 整行：在本页打开（DSH 在会话标签里显示它的网页，见 WebPane.jsx）
+  // 点名称 / 整行：在本页打开
   const primary = openHere;
-  return { busy, state, live, dsh, allowed, openHere, openPage, openTab, stop, duplicate, menu, primary };
+  return { busy, state, live, allowed, openHere, openTab, stop, duplicate, menu, primary };
 }
 
 const sepOf = (p) =>
@@ -797,9 +753,8 @@ const shellLabel = (data, value) =>
  * value 为空表示自动/默认。inherit：设置里的默认 shell（只在新建终端时传入）。
  */
 // 不填名字时电脑上取的名字（src/instances.rs 的 default_name；重名时那边再加序号）：`my-app · Claude Code`，普通终端就是文件夹名。
-const TOOL_NAMES = { codex: "Codex", claude: "Claude Code", opencode: "OpenCode", agy: "Antigravity" };
+const TOOL_NAMES = { codex: "Codex", claude: "Claude Code", agy: "Antigravity" };
 function guessName(launch, workdir) {
-  if (launch === "dsh") return "DSH";
   const dir = (workdir || "").trim().replace(/[\\/]+$/, "").split(/[\\/]/).pop()?.trim();
   if (!dir || dir === "~" || dir.endsWith(":")) return "";
   return TOOL_NAMES[launch] ? `${dir} · ${TOOL_NAMES[launch]}` : dir;
@@ -888,7 +843,7 @@ export function ShellPicker({ value, onChange, data, inherit }) {
   );
 }
 
-const STEP_NAMES = { node: "Node.js", claude: "Claude Code", codex: "Codex", opencode: "OpenCode", dsh: "DSH", "lark-cli": "lark-cli" };
+const STEP_NAMES = { node: "Node.js", claude: "Claude Code", codex: "Codex", "lark-cli": "lark-cli" };
 const STEP_MARK = { ok: "✓", failed: "✗", skipped: "–", running: "…", pending: "" };
 /** 分几步装的（先装 Node.js 再装工具、一键装全套）：一行步骤，每步的状态 */
 export function InstallSteps({ steps }) {
@@ -1001,10 +956,7 @@ export function InstanceDialog({ open, onClose, initial, preset, workdir: wantWo
   const canFull = FULL_ACCESS.includes(launch);
   // 对话界面要靠会话保持（tmux）往同一个 Claude Code 里送输入
   const canChat = CHAT_LAUNCHES.includes(launch) && Boolean(status.capabilities?.persistent);
-  // DSH 带着自己的端口和网页映射，编辑时不能和别的启动方式互换
-  const launches = editing
-    ? LAUNCHES.filter((l) => (l === "dsh") === (initial.launch === "dsh"))
-    : LAUNCHES;
+  const launches = LAUNCHES;
   const missing =
     tools && AI_TOOLS.includes(launch) && !tools.tools[launch];
   const submit = async (e) => {
@@ -1162,12 +1114,10 @@ export function InstanceDialog({ open, onClose, initial, preset, workdir: wantWo
         <Field label={t('form.name')} hint={t('form.name_hint')}>
           <input value={name} onChange={(e) => setName(e.target.value)} maxLength={40} placeholder={guessName(launch, workdir) || t(`launch.${launch}.title`)} />
         </Field>
-        {launch === "dsh" && !(canChat && chatUi) && <Note>{t("dsh.form_note")}</Note>}
         <FolderField
           value={workdir}
           onChange={editWorkdir}
           client={client}
-          hint={launch === "dsh" && !(canChat && chatUi) ? t("dsh.workdir_hint") : undefined}
         />
         <ShellPicker
           value={shell}
@@ -1214,8 +1164,7 @@ export function InstanceDialog({ open, onClose, initial, preset, workdir: wantWo
             </label>
           </div>
         )}
-        {/* DSH 的网页版和对话模式建好后不能互换 */}
-        {canChat && !(editing && launch === "dsh") && (
+        {canChat && (
           <label
             className="row"
             style={{ alignItems: "flex-start", gap: 8, cursor: "pointer", marginBottom: 12 }}
@@ -1229,7 +1178,7 @@ export function InstanceDialog({ open, onClose, initial, preset, workdir: wantWo
             <span>
               <b style={{ fontSize: 14 }}>{t("form.chat_ui")}</b>
               <span className="field-hint" style={{ display: "block" }}>
-                {launch === "codex" ? t("form.chat_ui_hint_codex") : launch === "dsh" ? t("form.chat_ui_hint_dsh") : launch === "agy" ? t("form.chat_ui_hint_agy") : t(editing && !initial?.chat_ui ? "form.chat_ui_hint_restart" : "form.chat_ui_hint")}
+                {launch === "codex" ? t("form.chat_ui_hint_codex") : launch === "agy" ? t("form.chat_ui_hint_agy") : t(editing && !initial?.chat_ui ? "form.chat_ui_hint_restart" : "form.chat_ui_hint")}
               </span>
             </span>
           </label>

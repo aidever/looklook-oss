@@ -1,4 +1,4 @@
-//! 以前的对话：读出这台电脑上 Claude Code、Codex、OpenCode 自己存的对话记录，会话页里列出来、接着聊。
+//! 以前的对话：读出这台电脑上 Claude Code、Codex、Antigravity 自己存的对话记录，会话页里列出来、接着聊。
 //! 只读，不改它们的文件。
 //!
 //! - **Claude Code**：`<配置目录>/projects/<文件夹>/<会话号>.jsonl`。文件夹名是工作目录把非字母数字换成 `-`，
@@ -9,8 +9,6 @@
 //! **别处的程序起的对话**（[`Conv::origin`]）：`codex exec` / Codex SDK、Codex MCP、Claude Code 的 Codex 插件、
 //! 别的程序直接连 app-server 开的（`originator` 不是 Codex 自己的客户端，也不是看看），以及 `claude -p` / Agent SDK
 //! （看看对话模式自己起的除外）。这些不是你在聊的，默认不列；`others=true` 时也列出来并标上来源（以前的对话页折叠在最后）。
-//! - **OpenCode**：数据目录（`$XDG_DATA_HOME/opencode`，默认 `~/.local/share/opencode`）里的 `opencode.db`
-//!   （新版）或 `storage/session/*/*.json`（旧版），只取标题、目录、时间。
 //!
 //!   新版 Codex 会把旧的记录压成 `rollout-*.jsonl.zst`（原来的 `.jsonl` 删掉）：也列，读的时候整个解压。
 //!
@@ -89,7 +87,7 @@ pub struct Query {
 }
 
 /// 能接着的工具
-pub const AGENTS: [&str; 4] = ["claude", "codex", "opencode", "agy"];
+pub const AGENTS: [&str; 3] = ["claude", "codex", "agy"];
 
 /// 会话号只允许字母、数字、`-`、`_`（要拼进命令行）。
 pub fn valid_id(id: &str) -> bool {
@@ -156,10 +154,6 @@ fn claude_dir() -> PathBuf {
 
 fn codex_dir() -> PathBuf {
     env_dir("CODEX_HOME").unwrap_or_else(|| home().join(".codex"))
-}
-
-fn opencode_dir() -> PathBuf {
-    env_dir("XDG_DATA_HOME").unwrap_or_else(|| home().join(".local").join("share")).join("opencode")
 }
 
 /// 列出对话：最近有消息的排前面。
@@ -274,9 +268,6 @@ fn list_blocking(q: &Query) -> Vec<Conv> {
         if cache.len() > 4096 {
             cache.retain(|p, _| p.exists());
         }
-    }
-    if want("opencode") {
-        out.extend(opencode_list());
     }
     if want("agy") {
         out.extend(agy_apply_deep(agy_list(), workdir, deep, agy_transcript));
@@ -673,80 +664,6 @@ fn mtime_ms(path: &Path) -> Option<i64> {
     Some(t.duration_since(UNIX_EPOCH).ok()?.as_millis() as i64)
 }
 
-// ---------------- OpenCode ----------------
-
-fn opencode_conv(id: &str, title: &str, dir: &str, updated_ms: i64) -> Option<Conv> {
-    if !valid_id(id) || dir.is_empty() {
-        return None;
-    }
-    let now = crate::util::system_ms();
-    Some(Conv {
-        agent: "opencode",
-        id: id.to_string(),
-        title: clip(if title.trim().is_empty() { id } else { title }, TEXT_MAX),
-        workdir: dir.to_string(),
-        branch: None,
-        last: None,
-        updated_at: crate::util::fmt_ms(updated_ms),
-        updated_ms,
-        live: now - updated_ms < (LIVE_SECS * 1000) as i64,
-        instance_id: None,
-        started_at: None,
-        snippet: None,
-        sdk: false,
-        origin: None,
-    })
-}
-
-fn opencode_list() -> Vec<Conv> {
-    let dir = opencode_dir();
-    let db = dir.join("opencode.db");
-    if db.is_file() {
-        if let Some(v) = opencode_db(&db) {
-            return v;
-        }
-    }
-    // 旧版：storage/session/<项目>/<会话>.json
-    let mut out = vec![];
-    let Ok(projects) = std::fs::read_dir(dir.join("storage").join("session")) else { return out };
-    for p in projects.flatten() {
-        let Ok(files) = std::fs::read_dir(p.path()) else { continue };
-        for f in files.flatten() {
-            let path = f.path();
-            if path.extension().is_none_or(|x| x != "json") {
-                continue;
-            }
-            let Some(v) = std::fs::read(&path).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok()) else { continue };
-            // 子会话（子代理）不列
-            if v["parentID"].is_string() {
-                continue;
-            }
-            let updated = v["time"]["updated"].as_i64().or_else(|| v["time"]["created"].as_i64()).unwrap_or(0);
-            if let Some(c) = opencode_conv(v["id"].as_str().unwrap_or(""), v["title"].as_str().unwrap_or(""), v["directory"].as_str().unwrap_or(""), updated) {
-                out.push(c);
-            }
-        }
-    }
-    out
-}
-
-/// 新版的 SQLite：表结构可能会变，按列名找，找不到就当没有。
-fn opencode_db(db: &Path) -> Option<Vec<Conv>> {
-    use rusqlite::{Connection, OpenFlags};
-    let conn = Connection::open_with_flags(db, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX).ok()?;
-    let _ = conn.busy_timeout(Duration::from_millis(500));
-    let cols: Vec<String> = conn.prepare("PRAGMA table_info(session)").ok()?.query_map([], |r| r.get::<_, String>(1)).ok()?.flatten().collect();
-    let pick = |names: &[&str]| names.iter().find(|n| cols.iter().any(|c| c == *n)).map(|s| s.to_string());
-    let dir = pick(&["directory"])?;
-    let updated = pick(&["time_updated", "updated_at", "time_created"])?;
-    let parent = pick(&["parent_id", "parentID"]);
-    let filter = parent.map(|p| format!(" WHERE {p} IS NULL")).unwrap_or_default();
-    let sql = format!("SELECT id, COALESCE(title, ''), {dir}, {updated} FROM session{filter} ORDER BY {updated} DESC LIMIT 500");
-    let mut stmt = conn.prepare(&sql).ok()?;
-    let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, i64>(3)?))).ok()?;
-    Some(rows.flatten().filter_map(|(id, title, dir, t)| opencode_conv(&id, &title, &dir, t)).collect())
-}
-
 // ---------------- Antigravity（agy） ----------------
 //
 // `~/.gemini/antigravity-cli/conversation_summaries.db`（agy 自己的 SQLite，只读打开）：标题、第一句话、目录、时间。
@@ -1011,7 +928,6 @@ fn preview_blocking(agent: &str, id: &str, full: bool) -> Option<Vec<Message>> {
             let p = codex_files().into_iter().map(|(p, _)| p).find(|p| plain_name(p).strip_suffix(".jsonl").is_some_and(|s| s.ends_with(id)))?;
             (p, codex_msg, CODEX_MSGS)
         }
-        "opencode" => return Some(vec![]),
         "agy" => (agy_transcript(id).filter(|p| p.is_file())?, agy_msg, AGY_MSGS),
         _ => return None,
     };

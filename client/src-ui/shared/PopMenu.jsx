@@ -7,6 +7,7 @@ import { createPortal } from 'react-dom';
 import { useTranslation } from 'react-i18next';
 
 import { useLayer } from './layers.js';
+import { pressMenu } from './press.js';
 
 /**
  * items：[{ icon, label, onClick, danger, disabled, hint, checked }]，假值会被跳过，'sep' 是一条分隔线，{ head } 是一组的小标题。
@@ -139,7 +140,7 @@ export default function PopMenu({ items, className = 'btn btn-ghost btn-icon', i
           setOpen(!open);
         }}
       >
-        {children ?? <Icon size={text ? 14 : 18} aria-hidden="true" />}
+        {children ?? (Icon && <Icon size={text ? 14 : 18} aria-hidden="true" />)}
         {!children && text && (
           <>
             <span className="ellipsis">{text}</span>
@@ -158,6 +159,7 @@ export default function PopMenu({ items, className = 'btn btn-ghost btn-icon', i
           onMouseEnter={hoverIn}
           onMouseLeave={hoverOut}
           {...(asSheet ? drag : {})}
+          {...pressMenu}
         >
           {asSheet && (
             <li className="menu-pop-sheet-head" role="presentation">

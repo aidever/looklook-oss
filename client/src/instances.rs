@@ -32,7 +32,7 @@ pub const PORT_RANGE: (u16, u16) = (41000, 41999);
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const TMUX_SOCKET: &str = "looklook";
-const LAUNCHES: &[&str] = &["shell", "codex", "claude", "opencode", "dsh", "agy", "custom"];
+const LAUNCHES: &[&str] = &["shell", "codex", "claude", "agy", "custom"];
 /// 设了 `TMUX_TMPDIR`、目录却不在了（测试的临时目录被删）：tmux 会退回 /tmp，连到这台机器上别的看看的服务。
 /// 先把目录建回来
 fn ensure_tmux_tmpdir() {
@@ -48,7 +48,7 @@ fn ensure_tmux_tmpdir() {
 const ORPHAN_SWEEP: Duration = Duration::from_secs(60);
 /// 有对话界面的启动类型（Claude Code：docs/CLAUDE_UI.md；Codex：docs/CODEX_UI.md）；
 /// 前端 `src-ui/shared/chat.js` 的 `CHAT_LAUNCHES` 要一起改。
-pub const CHAT_LAUNCHES: &[&str] = &["claude", "codex", "dsh", "agy"];
+pub const CHAT_LAUNCHES: &[&str] = &["claude", "codex", "agy"];
 
 fn has_chat(launch: &str) -> bool {
     CHAT_LAUNCHES.contains(&launch)
@@ -234,12 +234,10 @@ pub struct View {
     pub input_at: Option<String>,
     pub error: Option<String>,
     pub url: String,
-    /// 以全部权限启动（仅 Codex / Claude Code / OpenCode）
+    /// 以全部权限启动（仅 Codex / Claude Code / Antigravity）
     pub full_access: bool,
     /// 用户已确认以 root 身份带全部权限启动
     pub root_confirmed: bool,
-    /// DSH：网页界面监听的本机端口
-    pub web_port: Option<u16>,
     /// Claude Code 带对话界面启动（docs/CLAUDE_UI.md）
     pub chat_ui: bool,
     /// 名字是用户自己起的（新建时填了名称、之后改过名）；界面上 agent 的会话名为主，它为辅
@@ -271,9 +269,6 @@ pub struct Opts {
     pub full_access: bool,
     #[serde(default)]
     pub root_confirmed: bool,
-    /// DSH 网页界面的端口（新建时选定，之后不变）
-    #[serde(default)]
-    pub web_port: Option<u16>,
     /// Claude Code：注入 hooks 启动，管理台多一个“对话”视图（docs/CLAUDE_UI.md）
     #[serde(default)]
     pub chat_ui: bool,
@@ -291,9 +286,6 @@ pub struct Opts {
 
 /// 第一句话最长多少个字符（太长的请在会话里粘贴）
 const PROMPT_MAX: usize = 4000;
-
-/// DSH 网页界面的端口从这里开始找（`dsh web` 自己默认 3080）；避开终端用的 41000–41999。
-const WEB_PORT_START: u16 = 3080;
 
 fn opts_key(id: &str) -> String {
     format!("instance_opts.{id}")
@@ -340,9 +332,6 @@ pub struct Input {
     pub prompt: Option<String>,
     /// 接着以前的对话（只在新建时有效，和第一句话不能同时用）
     pub resume: Option<Resume>,
-    /// DSH 网页界面的端口（只在新建时由网关填写，不接受请求里的值）
-    #[serde(skip)]
-    pub web_port: Option<u16>,
     /// 名字是用户自己填的（不是按第一句话、对话标题取的）
     pub name_custom: Option<bool>,
     /// 在 Docker 容器里运行：容器名和容器里的目录（只在新建时有效）
@@ -540,7 +529,6 @@ impl Instances {
             termd: use_termd,
             full_access: opts.full_access,
             root_confirmed: opts.root_confirmed,
-            web_port: opts.web_port,
             chat_ui: opts.chat_ui,
             name_custom: opts.name_custom,
             agent_title: None,
@@ -708,7 +696,7 @@ impl Instances {
             None if self.claude_sdk_mode(&v.row) => Some("claude"),
             None if self.codex_app_mode(&v.row) => Some("codex"),
             None if v.container.is_some() || !has_pane => {
-                crate::history::AGENTS.iter().chain(["dsh"].iter()).find(|a| **a == v.row.launch).copied()
+                crate::history::AGENTS.iter().find(|a| **a == v.row.launch).copied()
             }
             None => None,
         }
@@ -788,32 +776,6 @@ impl Instances {
         (PORT_RANGE.0..=PORT_RANGE.1).contains(&port)
     }
 
-    /// 这台电脑上网页版的 DSH（只有一个：一个 `dsh web` 进程管理所有项目文件夹）。对话模式的 DSH 不算，可以有很多个。
-    pub fn dsh(&self) -> Result<Option<InstanceRow>, LocalError> {
-        Ok(self.store.instances()?.into_iter().find(|r| r.launch == "dsh" && !self.opts(&r.id).chat_ui))
-    }
-
-    /// 给 DSH 网页界面挑一个现在没被占用的端口：3080 起往后找，都不行再让系统分配。
-    pub fn pick_web_port() -> Result<u16, LocalError> {
-        let bind = |p: u16| TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, p))).ok();
-        if let Some(p) = (WEB_PORT_START..WEB_PORT_START + 100).find(|p| bind(*p).is_some()) {
-            return Ok(p);
-        }
-        bind(0).and_then(|l| l.local_addr().ok()).map(|a| a.port()).ok_or_else(|| LocalError::new("NO_FREE_PORT"))
-    }
-
-    /// 这个进程是不是这个终端里运行的（会话里的程序及其子孙）
-    pub async fn owns_pid(&self, id: &str, pid: u32) -> bool {
-        self.task_processes(id).await.contains(pid)
-    }
-
-    /// DSH 换端口（原来的被别的程序占了）：下次启动时用
-    pub fn set_web_port(&self, id: &str, port: u16) -> Result<(), LocalError> {
-        let mut opts = self.opts(id);
-        opts.web_port = Some(port);
-        Ok(self.store.set(&opts_key(id), &opts)?)
-    }
-
     // ---------------- 增删改 ----------------
 
     fn validate(&self, row: &mut InstanceRow) -> Result<(), LocalError> {
@@ -851,7 +813,7 @@ impl Instances {
         if !crate::docker::valid_dir(dir) {
             return Err(LocalError::new("WORKDIR_NOT_FOUND").with("path", dir));
         }
-        if !matches!(launch, "shell" | "claude" | "codex" | "opencode" | "custom") {
+        if !matches!(launch, "shell" | "claude" | "codex" | "custom") {
             return Err(LocalError::invalid("launch", "invalid"));
         }
         let p = crate::docker::probe(name).await?;
@@ -861,20 +823,12 @@ impl Instances {
         Ok(crate::docker::Container { name: name.to_string(), dir: dir.to_string(), root: p.root })
     }
 
-    /// 全部权限选项：只对 Codex / Claude Code / OpenCode 有意义（DSH 的权限在它自己的网页里设置）；
-    /// root 运行时必须确认。网页版的 DSH 必须有网页端口；对话模式的 DSH 用看看共用的 `dsh web`，没有自己的端口。
+    /// 全部权限选项：只对 Codex / Claude Code / Antigravity 有意义；root 运行时必须确认。
     fn validate_opts(row: &InstanceRow, opts: &mut Opts) -> Result<(), LocalError> {
-        if row.launch == "dsh" && !opts.chat_ui {
-            if opts.web_port.is_none() {
-                return Err(LocalError::invalid("web_port", "required"));
-            }
-        } else {
-            opts.web_port = None;
-        }
         if !has_chat(&row.launch) {
             opts.chat_ui = false;
         }
-        if !matches!(row.launch.as_str(), "codex" | "claude" | "opencode" | "agy") {
+        if !matches!(row.launch.as_str(), "codex" | "claude" | "agy") {
             opts.full_access = false;
             opts.root_confirmed = false;
             return Ok(());
@@ -924,10 +878,6 @@ impl Instances {
         }
         self.validate(&mut row)?;
         let persistent_new = self.is_persistent();
-        let dsh_web = row.launch == "dsh" && !input.chat_ui.unwrap_or(persistent_new);
-        if dsh_web && self.dsh()?.is_some() {
-            return Err(LocalError::new("DSH_EXISTS"));
-        }
         let claude_profile = input.claude_profile.filter(|s| !s.is_empty());
         if let Some(p) = &claude_profile {
             if crate::claude_profiles::get(&self.store, p).is_none() {
@@ -949,7 +899,6 @@ impl Instances {
         let mut opts = Opts {
             full_access: input.full_access.unwrap_or(false),
             root_confirmed: input.root_confirmed.unwrap_or(false),
-            web_port: input.web_port,
             // 新建的终端默认带对话界面（需要会话保持：tmux 或 termd）
             chat_ui: input.chat_ui.unwrap_or(persistent_new),
             name_custom,
@@ -967,7 +916,7 @@ impl Instances {
             if p.chars().count() > PROMPT_MAX {
                 return Err(LocalError::invalid("prompt", "too_long"));
             }
-            if !matches!(row.launch.as_str(), "shell" | "claude" | "codex" | "opencode" | "agy") {
+            if !matches!(row.launch.as_str(), "shell" | "claude" | "codex" | "agy") {
                 return Err(LocalError::invalid("prompt", "invalid"));
             }
         }
@@ -978,8 +927,8 @@ impl Instances {
             if !crate::history::valid_id(&r.id) || !crate::history::AGENTS.contains(&row.launch.as_str()) || prompt.is_some() {
                 return Err(LocalError::invalid("resume", "invalid"));
             }
-            // OpenCode、agy 不能从以前的对话分叉
-            if r.fork && matches!(row.launch.as_str(), "opencode" | "agy") {
+            // agy 不能从以前的对话分叉
+            if r.fork && row.launch == "agy" {
                 return Err(LocalError::invalid("resume", "invalid"));
             }
             // 直接运行模式下命令在每次打开终端时运行，没法只接着一次
@@ -1027,10 +976,6 @@ impl Instances {
             row.workdir = v;
         }
         if let Some(v) = input.launch {
-            // DSH 带着自己的端口和网页映射，不能和别的启动方式互相改
-            if (v == "dsh") != (row.launch == "dsh") {
-                return Err(LocalError::invalid("launch", "invalid"));
-            }
             row.launch = v;
         }
         if let Some(v) = input.command {
@@ -1051,10 +996,6 @@ impl Instances {
             opts.root_confirmed = v;
         }
         if let Some(v) = input.chat_ui {
-            // DSH 的网页版和对话模式不能互相改（网页版带着自己的端口和网页映射）
-            if row.launch == "dsh" && v != opts.chat_ui {
-                return Err(LocalError::invalid("chat_ui", "invalid"));
-            }
             // 重新打开对话界面的 Claude Code 换成 stream-json（重启终端后生效）
             if v && !opts.chat_ui && row.launch == "claude" {
                 opts.sdk = true;
@@ -1091,7 +1032,7 @@ impl Instances {
     }
 
     /// 用户在这个会话里输入了（终端里按键、粘贴，见 gateway/input_tap.rs；
-    /// 对话里发消息、编辑重发、回答确认和提问、停下；飞书里发来的；DSH 网页版里发消息）
+    /// 对话里发消息、编辑重发、回答确认和提问、停下；飞书里发来的）
     pub fn note_input(&self, id: &str) {
         let now = crate::util::system_ms();
         let save = {
@@ -1463,7 +1404,7 @@ impl Instances {
     }
 
     /// 同 [`Instances::program_for`]，带上新建时的第一句话：AI 工具接在启动命令后面作为参数
-    /// （`claude '…'`、`codex '…'`、`opencode --prompt '…'`，都会以这句话开始一次交互式会话），普通终端把它当作启动后运行的命令。
+    /// （`claude '…'`、`codex '…'`，都会以这句话开始一次交互式会话），普通终端把它当作启动后运行的命令。
     /// 要接着以前的对话时换成各工具接着的命令（[`Instances::resume_command`]）。
     fn program_with(&self, row: &InstanceRow, prompt: Option<&str>, resume: Option<&Resume>) -> Result<(Vec<String>, Option<String>), LocalError> {
         let shell = crate::shells::resolve(&row.shell, &Settings::load(&self.store).default_shell)?;
@@ -1482,7 +1423,6 @@ impl Instances {
             None => self.launch_command(row),
             Some(p) => match row.launch.as_str() {
                 "shell" => Some(p.to_string()),
-                "opencode" => self.launch_command(row).map(|c| format!("{c} --prompt {}", crate::shells::quote_arg(p, shell.family))),
                 "claude" | "codex" => self.launch_command(row).map(|c| format!("{c} {}", crate::shells::quote_arg(p, shell.family))),
                 // agy：`-i` 以这句话开始一次交互式会话
                 "agy" => self.launch_command(row).map(|c| format!("{c} -i {}", crate::shells::quote_arg(p, shell.family))),
@@ -1510,7 +1450,6 @@ impl Instances {
     fn container_inner(&self, row: &InstanceRow, c: &crate::docker::Container, prompt: Option<&str>) -> Option<String> {
         let base = launch_command_line(row, self.opts(&row.id), c.root)?;
         Some(match (prompt, row.launch.as_str()) {
-            (Some(p), "opencode") => format!("{base} --prompt {}", crate::docker::quote_inner(p)),
             (Some(p), "claude" | "codex") => format!("{base} {}", crate::docker::quote_inner(p)),
             _ => base,
         })
@@ -1561,7 +1500,7 @@ impl Instances {
     }
 
     /// 接着以前的对话的命令（含“全部权限”参数）：`claude --resume <id> [--fork-session]`、
-    /// `codex resume|fork <id>`、`opencode --session <id>`。
+    /// `codex resume|fork <id>`、`agy --conversation <id>`。
     fn resume_command(&self, row: &InstanceRow, r: &Resume) -> Option<String> {
         let base = launch_command_line(row, self.opts(&row.id), crate::platform::is_root())?;
         let fork = if r.fork { " --fork-session" } else { "" };
@@ -1578,7 +1517,6 @@ impl Instances {
                 let flags = base.strip_prefix("codex").unwrap_or("").trim();
                 Some(format!("codex {sub}{}{} {}", if flags.is_empty() { "" } else { " " }, flags, r.id))
             }
-            "opencode" => Some(format!("{base} --session {}", r.id)),
             // 对话模式由 agy acp 接着（见 gateway 的新建），终端里是 shell
             "agy" if self.agy_acp_mode(row) => None,
             "agy" => Some(format!("{base} --conversation {}", r.id)),
@@ -2383,9 +2321,6 @@ pub fn ttyd_args(row: &InstanceRow, secret: &str, s: &Settings, command: &[Strin
 /// Claude Code：`--dangerously-skip-permissions`；它在 root 下会拒绝运行，需要同时设置 `IS_SANDBOX=1`。
 /// 没开全部权限时加 `--allow-dangerously-skip-permissions`：默认还是普通模式，但“全部权限”进了 Shift+Tab 的轮换，
 /// 对话界面的权限菜单能切过去（不加时切不到）。2.1.310 实测 root 下它同样拒绝运行，也要带 `IS_SANDBOX=1`。
-/// OpenCode：`--auto`（没有明确拒绝的权限都自动同意）。
-/// DSH：`dsh web` 只监听 127.0.0.1 的网页界面，经本机网页映射打开（本机、远程都是同一个地址）；
-/// 工作目录是默认项目，别的项目文件夹在网页里添加。
 pub fn launch_command_line(row: &InstanceRow, opts: Opts, root: bool) -> Option<String> {
     match row.launch.as_str() {
         "codex" if opts.full_access => Some("codex --yolo".into()),
@@ -2394,11 +2329,6 @@ pub fn launch_command_line(row: &InstanceRow, opts: Opts, root: bool) -> Option<
         "claude" if opts.full_access => Some("claude --dangerously-skip-permissions".into()),
         "claude" if root => Some("IS_SANDBOX=1 claude --allow-dangerously-skip-permissions".into()),
         "claude" => Some("claude --allow-dangerously-skip-permissions".into()),
-        "opencode" if opts.full_access => Some("opencode --auto".into()),
-        "opencode" => Some("opencode".into()),
-        // 对话模式的 DSH：终端里是 shell（对话走看看共用的 dsh web）
-        "dsh" if opts.chat_ui => None,
-        "dsh" => opts.web_port.map(|p| format!("dsh web --no-open --port {p}")),
         "agy" if opts.full_access => Some("agy --dangerously-skip-permissions".into()),
         "agy" => Some("agy".into()),
         "custom" => Some(row.command.clone()),
@@ -2472,7 +2402,7 @@ fn clip_title(t: &str) -> String {
     format!("{}…", t.chars().take(TITLE_MAX - 1).collect::<String>())
 }
 
-/// agent 设置的终端标题：去掉前面的状态符号（Claude Code 的 ✳、转圈的 ⠂ 等），OpenCode 的 `OC | ` 前缀；
+/// agent 设置的终端标题：去掉前面的状态符号（Claude Code 的 ✳、转圈的 ⠂ 等）；
 /// 没设置过的（tmux 默认是主机名）、只是工具名或 shell 名、像路径和 `用户@主机:目录` 的提示符标题都不算。
 fn clean_pane_title(title: &str, host: &str) -> Option<String> {
     let raw = title.trim();
@@ -2480,10 +2410,9 @@ fn clean_pane_title(title: &str, host: &str) -> Option<String> {
         return None;
     }
     let t = raw.trim_start_matches(|c: char| !c.is_alphanumeric()).trim();
-    let t = t.strip_prefix("OC | ").unwrap_or(t).trim();
     let lower = t.to_lowercase();
     let host = host.trim().to_lowercase();
-    const GENERIC: [&str; 15] = ["claude code", "claude", "codex", "openai codex", "opencode", "agy", "antigravity", "bash", "zsh", "sh", "fish", "pwsh", "powershell", "tmux", "node"];
+    const GENERIC: [&str; 14] = ["claude code", "claude", "codex", "openai codex", "agy", "antigravity", "bash", "zsh", "sh", "fish", "pwsh", "powershell", "tmux", "node"];
     if t.is_empty() || lower == host || host.split('.').next() == Some(lower.as_str()) || GENERIC.contains(&lower.as_str()) {
         return None;
     }
@@ -2496,9 +2425,7 @@ fn default_name(launch: &str, workdir: &str, taken: &HashSet<&str>) -> String {
     let tool = match launch {
         "codex" => Some("Codex"),
         "claude" => Some("Claude Code"),
-        "opencode" => Some("OpenCode"),
         "agy" => Some("Antigravity"),
-        "dsh" => return "DSH".into(),
         _ => None,
     };
     let base = match (folder_name(workdir), tool) {
@@ -2782,7 +2709,6 @@ mod tests {
     fn pane_titles_from_agents() {
         assert_eq!(super::clean_pane_title("✳ 修登录页", "box").as_deref(), Some("修登录页"));
         assert_eq!(super::clean_pane_title("⠂ Fix the login page", "box").as_deref(), Some("Fix the login page"));
-        assert_eq!(super::clean_pane_title("OC | 重构设置页", "box").as_deref(), Some("重构设置页"));
         for t in ["box", "box.local", "✳ Claude Code", "codex", "~/w/app", "/home/a", "me@box:~/w", ""] {
             assert_eq!(super::clean_pane_title(t, "box.local"), None, "{t}");
         }
@@ -2814,7 +2740,7 @@ mod tests {
     }
 
     /// tmux 服务整个没了（终端里敲了 `tmux kill-server`）：没人打开的 AI 终端接着原来的对话重新启动；普通终端不动。
-    /// 用 opencode（这里没装：命令失败后面板回到 shell，会话照样在），不会真的跑起一个 AI 工具。
+    /// 用 agy（这里没装：命令失败后面板回到 shell，会话照样在），不会真的跑起一个 AI 工具。
     #[tokio::test]
     async fn recovers_ai_sessions_after_tmux_server_dies() {
         let home = tempfile::tempdir().unwrap();
@@ -2825,7 +2751,7 @@ mod tests {
         }
         let wd = home.path().display().to_string();
         let mut ids = vec![];
-        for (i, launch) in ["opencode", "opencode", "shell"].into_iter().enumerate() {
+        for (i, launch) in ["agy", "agy", "shell"].into_iter().enumerate() {
             let r = InstanceRow { id: random_id(8), launch: launch.into(), workdir: wd.clone(), want_running: true, port: 41001 + i as u16, ..row() };
             inst.store.insert_instance(&r).unwrap();
             inst.store.set(&resume_key(&r.id), &format!("ses_{}", r.id)).unwrap();
@@ -2943,10 +2869,10 @@ mod tests {
         assert_eq!(cmd(v, true), format!("{sandbox}claude --allow-dangerously-skip-permissions --settings \"{}\" --resume 019a-x_1 --fork-session", term.display()));
         let written: serde_json::Value = serde_json::from_slice(&std::fs::read(&term).unwrap()).unwrap();
         assert_eq!(written, serde_json::json!({ "skipDangerousModePermissionPrompt": true }));
-        let v = inst.create(mk("opencode", false, false)).await.unwrap();
+        let v = inst.create(mk("agy", false, false)).await.unwrap();
         assert_eq!(inst.store.get::<String>(&resume_key(&v.row.id)).unwrap().as_deref(), Some(id));
-        assert_eq!(cmd(v, false), "opencode --session 019a-x_1");
-        assert!(inst.create(mk("opencode", false, true)).await.is_err(), "OpenCode 不能复制一份");
+        assert_eq!(cmd(v, false), "agy --conversation 019a-x_1");
+        assert!(inst.create(mk("agy", false, true)).await.is_err(), "agy 不能复制一份");
         assert!(inst.create(mk("shell", false, false)).await.is_err());
         let mut bad = mk("claude", false, false);
         bad.resume = Some(Resume { id: "x; rm -rf ~".into(), fork: false });
@@ -3025,14 +2951,6 @@ mod tests {
         assert_eq!(launch_command_line(&r, on, true).as_deref(), Some("IS_SANDBOX=1 claude --dangerously-skip-permissions"));
         assert_eq!(launch_command_line(&r, Opts::default(), false).as_deref(), Some("claude --allow-dangerously-skip-permissions"));
         assert_eq!(launch_command_line(&r, Opts::default(), true).as_deref(), Some("IS_SANDBOX=1 claude --allow-dangerously-skip-permissions"));
-        r.launch = "opencode".into();
-        assert_eq!(launch_command_line(&r, on, true).as_deref(), Some("opencode --auto"));
-        assert_eq!(launch_command_line(&r, Opts::default(), false).as_deref(), Some("opencode"));
-        r.launch = "dsh".into();
-        let web = Opts { web_port: Some(3080), ..Opts::default() };
-        assert_eq!(launch_command_line(&r, web, false).as_deref(), Some("dsh web --no-open --port 3080"));
-        let chat = Opts { chat_ui: true, ..Opts::default() };
-        assert_eq!(launch_command_line(&r, chat, false), None, "对话模式的 DSH 终端里是 shell");
     }
 
     #[test]
@@ -3048,15 +2966,6 @@ mod tests {
         let mut o = Opts { full_access: true, root_confirmed: false, ..Opts::default() };
         Instances::validate_opts(&r, &mut o).unwrap();
         assert!(o.root_confirmed, "全部权限就是确认，root 下不用再确认");
-        r.launch = "dsh".into();
-        let mut o = Opts { full_access: true, root_confirmed: true, ..Opts::default() };
-        assert!(Instances::validate_opts(&r, &mut o).is_err(), "DSH 必须有网页端口");
-        let mut o = Opts { full_access: true, root_confirmed: true, web_port: Some(3080), ..Opts::default() };
-        Instances::validate_opts(&r, &mut o).unwrap();
-        assert!(o == Opts { web_port: Some(3080), ..Opts::default() }, "DSH 没有全部权限选项");
-        let mut o = Opts { full_access: true, root_confirmed: false, web_port: Some(3080), chat_ui: true, ..Opts::default() };
-        Instances::validate_opts(&r, &mut o).unwrap();
-        assert!(o == Opts { chat_ui: true, ..Opts::default() }, "对话模式的 DSH 不要网页端口");
     }
 
     #[test]
@@ -3093,9 +3002,9 @@ mod tests {
         r.launch = "codex".into();
         Instances::validate_opts(&r, &mut o).unwrap();
         assert!(o.chat_ui, "Codex 也有对话界面");
-        r.launch = "opencode".into();
+        r.launch = "custom".into();
         Instances::validate_opts(&r, &mut o).unwrap();
-        assert!(!o.chat_ui, "OpenCode 没有对话界面");
+        assert!(!o.chat_ui, "自定义命令没有对话界面");
     }
 
     #[test]
@@ -3104,7 +3013,6 @@ mod tests {
         assert_eq!(default_name("claude", "/srv/my-app", &none), "my-app · Claude Code");
         assert_eq!(default_name("shell", "/srv/my-app/", &none), "my-app");
         assert_eq!(default_name("codex", r"D:\code\web", &none), "web · Codex");
-        assert_eq!(default_name("dsh", "/srv/my-app", &none), "DSH");
         let taken = HashSet::from(["my-app · Claude Code", "my-app · Claude Code 2", "Claude Code 1"]);
         assert_eq!(default_name("claude", "/srv/my-app", &taken), "my-app · Claude Code 3");
         // 主目录、根目录：用工具名加序号

@@ -13,11 +13,11 @@ import { useSubmitLock } from './submitLock.js';
 
 // 额度菜单里“等重置后自动继续”（Claude Code 的原文，同客户端 screen.rs 的 LIMIT_AUTO）
 const LIMIT_AUTO = 'Wait here, then continue automatically';
-// 能答“本次会话都允许”的（DSH 只能允许 / 拒绝）
+// 能答“本次会话都允许”的
 const SESSION_ALLOW = ['claude', 'codex'];
 
 /**
- * `id`：会话；`attn`：它在等的事；`agent`：显示名（Claude / Codex）；`launch`：claude / codex / dsh；`limit`：额度状态；
+ * `id`：会话；`attn`：它在等的事；`agent`：显示名（Claude / Codex）；`launch`：claude / codex / agy；`limit`：额度状态；
  * `open`：打开会话的按钮（放在操作那一行最后）；`compact`：窄的地方（助理页右栏、提醒条）用小一号的
  */
 export default function AttnPeek({ id, attn: a, agent, launch, limit, open = null, compact = false, className = '' }) {

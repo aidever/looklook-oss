@@ -18,8 +18,8 @@ import { More } from '../shared/page.jsx';
 import { Button, Card, CopyButton, Drawer, Empty, ErrorNote, Skeleton, Time, useConfirm, useLoad, useToast } from '../shared/ui.jsx';
 import { formatBytes } from '../shared/xfer.js';
 
-export const TOOL_NAMES = { claude: 'Claude Code', codex: 'Codex', opencode: 'OpenCode', dsh: 'DSH', agy: 'Antigravity' };
-const TOOL_ORDER = ['claude', 'codex', 'opencode', 'dsh', 'agy'];
+export const TOOL_NAMES = { claude: 'Claude Code', codex: 'Codex', agy: 'Antigravity' };
+const TOOL_ORDER = ['claude', 'codex', 'agy'];
 const SEARCH_FROM = 8;
 
 const skillUrl = (id) => `/skills/${id.split('/').map(encodeURIComponent).join('/')}`;

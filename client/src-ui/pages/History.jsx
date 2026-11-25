@@ -1,4 +1,4 @@
-// 以前的对话：电脑上 Claude Code、Codex、OpenCode 自己存的对话（客户端 src/history.rs），点一下在看看里接着聊。
+// 以前的对话：电脑上 Claude Code、Codex、Antigravity 自己存的对话（客户端 src/history.rs），点一下在看看里接着聊。
 // “所有以前的对话”页面（/history）；侧栏、项目页、草稿页里的也从这里接着聊。
 // 点一行先展开看最后几句，再点“继续”；正开在看看会话里的直接打开那个会话；
 // 可能正开在别处（文件两分钟内还在变）的默认“复制一份继续”，原来那份不动。
@@ -36,7 +36,7 @@ function OriginBadge({ origin }) {
   );
 }
 
-// 能“复制一份继续”的（OpenCode 没有这个功能）
+// 能“复制一份继续”的（Antigravity 没有这个功能）
 export const CAN_FORK = ['claude', 'codex'];
 // 页面里每个文件夹先列几个
 const GROUP_SHOW = 5;

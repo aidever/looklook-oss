@@ -1,4 +1,4 @@
-// AI 助手页的 MCP 接口：打开后，Codex / Claude Code / OpenCode / DSH 可以自己查看、添加本机网页，
+// AI 助手页的 MCP 接口：打开后，Codex / Claude Code / Antigravity 可以自己查看、添加本机网页，
 // 在允许 AI 使用的 SSH 主机上运行命令（工具清单和开关见 Ai.jsx）。
 // 远程打开也能看令牌、装进 AI 助手（有两步验证），和本机一样。
 import { RefreshCw, Trash2 } from 'lucide-react';
@@ -10,7 +10,7 @@ import { errorText } from '../shared/i18n.js';
 import { More } from '../shared/page.jsx';
 import { Button, Card, CopyButton, ErrorNote, Seg, Skeleton, Switch, useConfirm, useLoad, useToast } from '../shared/ui.jsx';
 
-const AGENT_NAME = { claude: 'Claude Code', codex: 'Codex', opencode: 'OpenCode', dsh: 'DSH (DeepSeek Harness)', agy: 'Antigravity (agy)' };
+const AGENT_NAME = { claude: 'Claude Code', codex: 'Codex', agy: 'Antigravity (agy)' };
 
 function AgentRow({ a, skill, enabled, busy, onInstall, onRemove }) {
   const { t } = useTranslation();

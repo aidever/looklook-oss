@@ -8,8 +8,12 @@ test('officeKind', () => {
   assert.equal(officeKind('报告.docx'), 'docx');
   assert.equal(officeKind('x.xlsx'), 'xlsx');
   assert.equal(officeKind('x.tsv'), 'csv');
-  assert.equal(officeKind('slides.pptx'), 'other');
-  assert.equal(officeKind('old.doc'), 'other');
+  assert.equal(officeKind('slides.pptx'), 'pptx');
+  assert.equal(officeKind('old.doc'), 'doc');
+  assert.equal(officeKind('old.PPT'), 'ppt');
+  assert.equal(officeKind('old.xls'), 'xls');
+  assert.equal(officeKind('a.ods'), 'xls');
+  assert.equal(officeKind('a.odt'), 'other');
   assert.equal(officeKind('main.rs'), null);
 });
 

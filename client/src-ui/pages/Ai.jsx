@@ -1,7 +1,7 @@
 // AI 助手：和 AI 有关的设置都在这一页，按“想做什么”分五块，顶上五张卡片就是目录，各写着现在的状态：
 // - 账号与模型：AI 工具的版本与更新（AgentUpdates.jsx）、Claude Code / Codex 账号（换账号、第三方模型服务）、用量；
 // - 离开电脑也能用：AI 做完、要确认时通知你（飞书、Webhook），飞书机器人里直接和会话聊；
-// - 工具与权限：MCP 接口（令牌、一键装进 Codex / Claude Code / OpenCode / DSH）和它给 AI 助手的工具，自动审批；
+// - 工具与权限：MCP 接口（令牌、一键装进 Codex / Claude Code / Antigravity）和它给 AI 助手的工具，自动审批；
 // - 宠物：对话界面角落的宠物。
 // 以前在“设置”里的 #ai、#notify、#pet、#claude-accounts 等链接都转到这里（Settings.jsx）。
 // MCP 开关远程也能改；令牌和装进 AI 助手只能直接在这台电脑上看、做（见 PagesMcp.jsx）。

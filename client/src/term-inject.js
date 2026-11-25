@@ -12,7 +12,7 @@
 //    能嵌入这里的来源已由本机的 CSP frame-ancestors 限定，所以写错了来源只会收不到消息。
 // 9. ⇧↵ 换行（发 Ctrl+J）；Windows / Linux 上 Ctrl+V 只粘贴、不再把 ^V 发给程序。见 setupKeys。
 // 10. 复制：⌘C（macOS）/ Ctrl+Shift+C（Windows / Linux）复制选中的文字。见 setupCopy。
-//     链接：⌘ / Ctrl + 点击直接打开；普通点击在旁边弹出“打开 / 复制链接”。见 setupLinks。
+//     链接：⌘ / Ctrl + 点击与普通点击一样在旁边弹出“打开 / 复制链接”。见 setupLinks。
 // 15. 连接状态告诉管理台（looklook:conn）；连不上、正在连接时手机上可以下拉刷新整页。见 setupPullRefresh。
 //     管理台说终端所在的电脑离线了（looklook:offline）：连接断着时终端只能看、不能输入，提示由管理台显示；
 //     电脑回来后马上重连。见 setOffline。
@@ -922,9 +922,13 @@
     var inFrame = false;
     try { inFrame = Boolean(window.parent && window.parent !== window); } catch (e) { inFrame = true; }
     var press = { t: 0, x: 0, y: 0, mod: false };
-    document.addEventListener('mouseup', function (e) {
-      press = { t: Date.now(), x: e.clientX, y: e.clientY, mod: e.metaKey || e.ctrlKey };
-    }, true);
+    // 新版终端（xterm 6）的链接可能在 mousedown / pointerup / click 任一阶段触发，都记一次
+    ['mousedown', 'pointerdown', 'mouseup', 'pointerup', 'click'].forEach(function (n) {
+      document.addEventListener(n, function (e) {
+        if (e.pointerType === 'touch') return;
+        press = { t: Date.now(), x: e.clientX, y: e.clientY, mod: e.metaKey || e.ctrlKey };
+      }, true);
+    });
     document.addEventListener('touchend', function (e) {
       var c = e.changedTouches && e.changedTouches[0];
       press = { t: Date.now(), x: c ? c.clientX : window.innerWidth / 2, y: c ? c.clientY : window.innerHeight / 2, mod: false };
@@ -960,7 +964,7 @@
       p.style.top = (press.y + 14 + h < window.innerHeight ? press.y + 14 : Math.max(8, press.y - h - 14)) + 'px';
     }
     // 是不是刚才那一下点击打开的链接（嵌在管理台时触屏同样上报给父窗口弹底部菜单）
-    function fromClick() { return Date.now() - press.t < 800 && (inFrame || !touch); }
+    function fromClick() { return Date.now() - press.t < 1500 && (inFrame || !touch); }
     function handle(url) {
       if (inFrame && /^https?:/i.test(url)) {
         try {
@@ -969,8 +973,7 @@
         } catch (e) {}
       }
       if (!/^(https?|ftp|mailto):/i.test(url)) return false;
-      if (press.mod) openUrl(url);
-      else offer(url);
+      offer(url);
       return true;
     }
     window.open = function (url) {
@@ -1042,7 +1045,7 @@
 
   // 在捕获阶段拦下几个键，不替换 ttyd 自己的按键处理。输入法正在组字时不管。
   // - ⇧↵ 换行：xterm.js 把 Shift+Enter 也当回车（\r）发出去，AI 编程助手就直接提交了。
-  //   改发 Ctrl+J（\n）：Claude Code、Codex、OpenCode 都把它当输入框里的换行，普通 shell 里与回车一样。
+  //   改发 Ctrl+J（\n）：Claude Code、Codex 都把它当输入框里的换行，普通 shell 里与回车一样。
   // - Ctrl+V（Windows / Linux 的粘贴键）：xterm.js 除了粘贴文字，还会把 ^V 发给程序，Claude Code 收到 ^V
   //   就去读那台电脑的剪贴板找图片，提示“No image found in clipboard”。这里只让浏览器粘贴，不发 ^V；
   //   图片由管理台上传后填路径。macOS 上粘贴是 ⌘V，^V 照常发送（vim 的列选择等）。

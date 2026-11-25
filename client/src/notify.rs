@@ -618,7 +618,6 @@ impl Notifier {
         let agent = match brief["agent"].as_str() {
             Some("codex") => "Codex",
             Some("agy") => "Antigravity",
-            Some("dsh") => "DSH",
             _ => "Claude",
         };
         let title = brief["title"].as_str().filter(|t| !t.is_empty()).unwrap_or(&row.name).to_string();

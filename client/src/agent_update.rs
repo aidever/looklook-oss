@@ -1,18 +1,18 @@
-//! AI 编程工具（Claude Code、Codex、DSH、Antigravity）的新版本检查和更新：AI 助手页“AI 工具版本”卡片（Ai.jsx）。
+//! AI 编程工具（Claude Code、Codex、Antigravity）的新版本检查和更新：AI 助手页“AI 工具版本”卡片（Ai.jsx）。
 //!
 //! - **查新版本**：后台每 [`CHECK_EVERY`] 查一次 npm 上的最新版（`latest` 标签；npmmirror 连不上再试官方源），
-//!   界面上也能点“检查更新”立刻查。前三个工具都发在 npm 上，别的安装方式（安装脚本、Homebrew）也拿它当新版本号。
+//!   界面上也能点“检查更新”立刻查。Claude Code、Codex 都发在 npm 上，别的安装方式（安装脚本、Homebrew）也拿它当新版本号。
 //!   Antigravity（agy）不在 npm 上：问它自己的更新服务（[`AGY_UPDATER`] 首页写着 `Stable Version: x.y.z`），
 //!   更新用 `agy update`（agy 自己下载、换掉）。
 //! - **按用户实际的安装方式更新**（[`locate`] 看程序装在哪）：
 //!   - npm / pnpm / bun 全局装的：同一个包管理器装到查到的那个版本，用查到版本的那个源（国内连得上）；
 //!   - Claude Code 官方安装脚本装的（`~/.local/share/claude/versions/<版本>`）、认不出来的 Claude Code：`claude update`；
 //!   - Homebrew：`brew upgrade [--cask] <名字>`；
-//!   - Claude 桌面版自带的 Claude Code：桌面版自己更新，这里不动；认不出的 Codex、DSH：提示用户按自己的方式更新。
+//!   - Claude 桌面版自带的 Claude Code：桌面版自己更新，这里不动；认不出的 Codex：提示用户按自己的方式更新。
 //! - **自动更新**：每个工具一个开关（默认关，存在本机，不同步——各台电脑装法不一样）。开着的、有新版本时，
 //!   等到没有会话正在用它（AI 在回复、等你确认、后台有任务；Windows 上只要有它的进程在运行就等，文件被占用换不掉）再装，
-//!   不打断在跑的会话。已经打开、停着的会话不受影响，下次启动才用新版本（Codex 对话模式的 app-server 空闲时自己换，
-//!   DSH 的网页服务没在忙时重启一下）。同一个版本更新失败的，[`RETRY_MS`] 后再试；装完版本没变的（渠道还没有这个版本）不再试。
+//!   不打断在跑的会话。已经打开、停着的会话不受影响，下次启动才用新版本（Codex 对话模式的 app-server 空闲时自己换）。
+//!   同一个版本更新失败的，[`RETRY_MS`] 后再试；装完版本没变的（渠道还没有这个版本）不再试。
 //! - 安装任务和“一键安装”共用 tools.rs 的后台任务（同一个工具同时只跑一个），进度看 `GET /tools/install/{tool}`。
 
 use std::collections::BTreeMap;
@@ -28,7 +28,7 @@ use crate::error::LocalError;
 use crate::instances::Instances;
 use crate::store::Store;
 
-pub const AGENTS: [&str; 4] = ["claude", "codex", "dsh", "agy"];
+pub const AGENTS: [&str; 3] = ["claude", "codex", "agy"];
 /// agy 自己的更新服务（agy 程序里写的地址）：首页是 `Antigravity CLI auto updater is running! Stable Version: 1.5.13. Rolled out to 100%`
 const AGY_UPDATER: &str = "https://antigravity-cli-auto-updater-974169037036.us-central1.run.app/";
 /// 多久查一次新版本
@@ -216,8 +216,7 @@ pub async fn installed(shell: &str) -> BTreeMap<&'static str, Option<Installed>>
         let path = match tool {
             "claude" => d.claude.clone(),
             "codex" => d.codex.clone(),
-            "agy" => d.agy.clone(),
-            _ => d.dsh.clone(),
+            _ => d.agy.clone(),
         };
         let found = match path {
             Some(p) => {
@@ -406,7 +405,7 @@ async fn usage(instances: &Instances, chat: &Chat) -> BTreeMap<&'static str, Usa
 
 // ---------------- 更新 ----------------
 
-/// 开始更新（`auto`：自动更新起的）。装完在后台收尾：记下结果，Codex 让对话模式换新的，DSH 没在忙时重启网页服务
+/// 开始更新（`auto`：自动更新起的）。装完在后台收尾：记下结果，Codex 让对话模式换新的
 pub async fn start(store: Arc<Store>, instances: Arc<Instances>, chat: Arc<Chat>, tool: &str, auto: bool) -> Result<crate::tools::Job, LocalError> {
     let tool: &'static str = AGENTS.iter().copied().find(|t| *t == tool).ok_or_else(|| LocalError::invalid("tool", "enum"))?;
     if crate::tools::job(tool).is_some_and(|j| j.state == "running") {
@@ -446,14 +445,14 @@ pub async fn start(store: Arc<Store>, instances: Arc<Instances>, chat: Arc<Chat>
             tracing::warn!(error = ?e, "记不下 AI 工具的更新结果");
         }
         if ok {
-            after_update(tool, now.as_deref(), &instances, &chat).await;
+            after_update(tool, now.as_deref(), &chat).await;
         }
     });
     Ok(job)
 }
 
-/// 装好以后：Claude Code 对话模式的进程、Codex 对话模式的 app-server 空闲时换成新的；DSH 的网页服务（一直开着的）没在忙就重启，换上新版本
-async fn after_update(tool: &str, version: Option<&str>, instances: &Instances, chat: &Chat) {
+/// 装好以后：Claude Code 对话模式的进程、Codex 对话模式的 app-server 空闲时换成新的
+async fn after_update(tool: &str, version: Option<&str>, chat: &Chat) {
     match tool {
         "claude" => {
             if let Some(v) = version {
@@ -462,16 +461,6 @@ async fn after_update(tool: &str, version: Option<&str>, instances: &Instances, 
         }
         "codex" => chat.codex_installed(),
         "agy" => chat.agy_installed(),
-        "dsh" => {
-            let Ok(Some(row)) = instances.dsh() else { return };
-            let Ok(v) = instances.get(&row.id).await else { return };
-            if (v.running || v.task_alive == Some(true)) && !crate::idle_stop::busy(chat, &v) {
-                match instances.restart(&row.id).await {
-                    Ok(_) => tracing::info!("DSH 更新好了，重启了网页服务"),
-                    Err(e) => tracing::warn!(error = ?e, "DSH 更新好了，但重启网页服务失败"),
-                }
-            }
-        }
         _ => {}
     }
 }
@@ -710,19 +699,20 @@ mod tests {
         let i = locate("codex", &c);
         assert_eq!((i.method, i.version.as_deref()), ("brew", Some("0.160.0")));
         assert_eq!(update_command("codex", &i, "0.165.0", "npmmirror").unwrap().0, "brew upgrade --cask codex");
-        // 认不出的 DSH：不自己更新
-        let d = dir.join("bin/dsh");
+        // 认不出的 Codex：不自己更新
+        let d = dir.join("opt/mine/codex");
+        std::fs::create_dir_all(d.parent().unwrap()).unwrap();
         std::fs::write(&d, "").unwrap();
-        let i = locate("dsh", &d);
+        let i = locate("codex", &d);
         assert_eq!(i.method, "unknown");
-        assert!(update_command("dsh", &i, "0.3.0", "npmmirror").is_none());
+        assert!(update_command("codex", &i, "0.165.0", "npmmirror").is_none());
         // bun
-        let b = dir.join(".bun/install/global/node_modules/@deepseek-ai/dsh");
-        std::fs::create_dir_all(b.join("lib")).unwrap();
-        std::fs::write(b.join("package.json"), r#"{"version":"0.2.1"}"#).unwrap();
-        std::fs::write(b.join("lib/bin.js"), "").unwrap();
-        let i = locate("dsh", &b.join("lib/bin.js"));
-        assert_eq!((i.method, i.version.as_deref()), ("bun", Some("0.2.1")));
+        let b = dir.join(".bun/install/global/node_modules/@openai/codex");
+        std::fs::create_dir_all(b.join("bin")).unwrap();
+        std::fs::write(b.join("package.json"), r#"{"version":"0.160.0"}"#).unwrap();
+        std::fs::write(b.join("bin/codex.js"), "").unwrap();
+        let i = locate("codex", &b.join("bin/codex.js"));
+        assert_eq!((i.method, i.version.as_deref()), ("bun", Some("0.160.0")));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -58,6 +58,9 @@ pub struct Hub {
     /// 文件改动的审批里要显示改了什么：`item/started` 的 fileChange 先到，按 item id 记下
     patches: Mutex<HashMap<String, Value>>,
     models: Mutex<Option<(Instant, Value)>>,
+    /// 用第三方接口的会话里点了登录（ChatGPT 设备码）：终端 id → 开始时 `account/read` 的账号。账号变了（登录好了）就把这个
+    /// 会话换到官方账号（见 [`Chat::codex_login_switch`]），不然登录了模型菜单还是第三方服务商的
+    login_switch: Mutex<HashMap<String, Value>>,
     /// 上次 `account/read` 的结果（开快速模式时查登录方式用，见 [`ACCOUNT_TTL`]）：每次点都现查要等好几秒
     account: Mutex<Option<(Instant, Value)>>,
     limits: Mutex<Option<(Instant, Value)>>,
@@ -2320,7 +2323,22 @@ impl Chat {
         let (server, list) = self.codex_hooks_list(id).await?;
         let skipped: Vec<String> = self.store.get(HOOKS_SKIPPED)?.unwrap_or_default();
         let hooks: Vec<Value> = list.iter().filter(|h| !skipped.contains(&hook_id(h))).map(hook_view).collect();
-        let login_required = server.call("account/read", json!({})).await.is_ok_and(|a| a["requiresOpenaiAuth"] == true && a["account"].is_null());
+        // 共用的 app-server 按官方配置起，account/read 总说要 OpenAI 登录；这个会话用的是第三方接口（Key 在）时
+        // 线程按它的服务商起（thread_params），不用登录
+        let mut api = crate::codex_profiles::usable(&self.paths.home, &crate::codex_profiles::for_instance(&self.store, id));
+        let mut switched = false;
+        let before = lock(&self.codex.login_switch).get(id).cloned();
+        if let Some(before) = before.filter(|_| api) {
+            // 在这个会话里点了设备码登录：登录好了（账号变了）就换到官方账号
+            if let Ok(a) = server.call("account/read", json!({})).await {
+                if !a["account"].is_null() && a["account"] != before && self.codex_login_switch(id).await? {
+                    (api, switched) = (false, true);
+                }
+            }
+        } else if !api {
+            lock(&self.codex.login_switch).remove(id);
+        }
+        let login_required = !api && server.call("account/read", json!({})).await.is_ok_and(|a| a["requiresOpenaiAuth"] == true && a["account"].is_null());
         // 目标：打开对话、每轮做完时顺便取一次（换了对话、别处改过）
         let inst = self.inst(id);
         let thread = lock(&inst.st).binding.as_ref().map(|b| b.session_id.clone());
@@ -2335,7 +2353,26 @@ impl Chat {
             }
         }
         let update = self.codex_update_info().await;
-        Ok(json!({ "hooks": hooks, "login_required": login_required, "update": update }))
+        Ok(json!({ "hooks": hooks, "login_required": login_required, "update": update, "switched": switched }))
+    }
+
+    /// 用第三方接口的会话里登录了 OpenAI 账号：这个会话改用官方账号（和用量面板里换配置一样，重新接上对话），
+    /// 模型菜单跟着换成 OpenAI 的。在跑、在等审批时先不换（返回 false），下次取 setup 时再换
+    async fn codex_login_switch(&self, id: &str) -> Result<bool, LocalError> {
+        if self.busy(id) {
+            return Ok(false);
+        }
+        lock(&self.codex.login_switch).remove(id);
+        crate::codex_profiles::pin(&self.store, id, Some(crate::codex_profiles::OFFICIAL))?;
+        {
+            // 选过的是服务商的模型名，OpenAI 不认：清掉，重新接上对话时按官方配置的模型来
+            let inst = self.inst(id);
+            let mut st = lock(&inst.st);
+            (st.model_set_at, st.model, st.actual_model) = (None, None, None);
+            Self::emit_status(&inst, &st);
+        }
+        self.codex_reload(id).await;
+        Ok(true)
     }
 
     /// 在对话页登录 Codex（TUI 启动时的登录页）：`device` = ChatGPT 设备码（远程也能用：在任何浏览器打开网址填码），
@@ -2353,8 +2390,26 @@ impl Chat {
             }
             _ => return Err(LocalError::invalid("how", "invalid")),
         };
+        let api = crate::codex_profiles::usable(&self.paths.home, &crate::codex_profiles::for_instance(&self.store, id));
+        let before = if api && how == "device" { Some(server.call("account/read", json!({})).await.map(|a| a["account"].clone()).unwrap_or(Value::Null)) } else { None };
         let r = server.call("account/login/start", params).await?;
-        Ok(json!({ "login_id": r["loginId"], "url": r["verificationUrl"], "code": r["userCode"] }))
+        // 用第三方接口的会话里登录：点登录就是要在这个会话里用这个 OpenAI 账号。API Key 当场就登录好了，直接换；
+        // 设备码要等浏览器那边，记下现在的账号，取 setup 时看到变了再换
+        let mut switched = false;
+        if api {
+            match before {
+                Some(b) => {
+                    lock(&self.codex.login_switch).insert(id.to_string(), b);
+                }
+                None => {
+                    switched = self.codex_login_switch(id).await?;
+                    if !switched {
+                        lock(&self.codex.login_switch).insert(id.to_string(), Value::Null);
+                    }
+                }
+            }
+        }
+        Ok(json!({ "login_id": r["loginId"], "url": r["verificationUrl"], "code": r["userCode"], "switched": switched }))
     }
 
     /// Codex 的 MCP 服务器（TUI 的 /mcp）：连接状态、登录状态、工具数
@@ -2402,6 +2457,7 @@ impl Chat {
             return Err(LocalError::not_found());
         }
         let server = self.codex_ready(id).await?;
+        lock(&self.codex.login_switch).remove(id);
         server.call("account/login/cancel", json!({ "loginId": login_id })).await?;
         Ok(())
     }

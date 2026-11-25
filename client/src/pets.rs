@@ -29,7 +29,9 @@ const STATES: &[&str] = &[
     // 看得懂在干什么（§3.4.1）：没配时按 FALLBACK 用 done / error，都没有就只说话
     "testPass", "testFail", "commit", "hello", "levelUp",
 ];
-const AGENTS: &[&str] = &["claude", "codex", "dsh", "opencode"];
+const AGENTS: &[&str] = &["claude", "codex"];
+/// 撤下的对话类型：以前的宠物包里写了也照样能装（不报错，只是没用）
+const RETIRED_AGENTS: &[&str] = &["dsh", "opencode"];
 const SETTINGS_KEY: &str = "pet";
 /// 装进 `pets/<id>/` 时记下从哪来的（现在只有 GitHub：`{"github": "owner/repo", "ref", "path"}`）
 pub(crate) const ORIGIN: &str = ".origin.json";
@@ -655,7 +657,7 @@ pub fn validate(m: &Manifest) -> Result<(), PackError> {
     if lic.commercial.is_none() {
         return Err(perr("field", "license.commercial"));
     }
-    if let Some(a) = m.agents.iter().find(|a| !AGENTS.contains(&a.as_str())) {
+    if let Some(a) = m.agents.iter().find(|a| !AGENTS.contains(&a.as_str()) && !RETIRED_AGENTS.contains(&a.as_str())) {
         return Err(perr("field", format!("agents: {a}")));
     }
     if m.name.as_ref().is_none_or(Text::is_blank) {

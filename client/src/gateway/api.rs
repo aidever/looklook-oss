@@ -15,7 +15,7 @@ use super::access::{self, Peer};
 use super::{origin_matches, Access, App, CLIENT_HEADER};
 use crate::account::VERSION;
 use crate::error::LocalError;
-use crate::instances::{log_tail, Input, Instances};
+use crate::instances::{log_tail, Input};
 use crate::settings::Settings;
 use crate::ssh_transfer as xfer;
 use crate::tools;
@@ -114,9 +114,7 @@ pub fn routes(app: App) -> Router<App> {
         .route("/instances/{id}/checkpoints", get(list_checkpoints))
         .route("/instances/{id}/checkpoints/{cp}/diff", get(checkpoint_diff))
         .route("/instances/{id}/checkpoints/{cp}/restore", post(restore_checkpoint))
-        .route("/instances/{id}/page", post(instance_page))
-        .route("/instances/{id}/web", post(instance_web))
-        .route("/instances/{id}/dsh/progress", get(dsh_progress))
+        .route("/instances/{id}/checkpoints/base", get(checkpoint_base))
         .route("/instances/{id}/chat", get(super::chat::snapshot))
         .route("/instances/{id}/chat/events", get(super::chat::events))
         .route("/chat/ws", get(super::chat_mux::ws))
@@ -204,6 +202,8 @@ pub fn routes(app: App) -> Router<App> {
         .route("/fs/list", get(fs_list))
         .route("/fs/download", get(fs_download))
         .route("/fs/preview", get(fs_preview))
+        .route("/office/engine", get(office_engine).post(office_engine_start))
+        .route("/office/engine/{file}", get(office_engine_file))
         .route("/fs/mkdir", post(fs_mkdir))
         .route("/fs/rename", post(fs_rename))
         .route("/fs/delete", post(fs_delete))
@@ -215,7 +215,17 @@ pub fn routes(app: App) -> Router<App> {
         .route("/fs/search", get(fs_search))
         .route("/fs/recent", post(fs_recent))
         .route("/fs/zip", get(fs_zip))
-        .route("/fs/write", post(fs_write).layer(DefaultBodyLimit::max(4 << 20)))
+        .route("/fs/write", post(fs_write).layer(DefaultBodyLimit::max(10 << 20)))
+        .route("/fs/read", get(fs_read))
+        .route("/fs/stat", get(fs_stat))
+        .route("/fs/exists", post(fs_exists))
+        .route("/fs/site", post(fs_site_open))
+        .route("/fs/site/{token}/{*rest}", get(fs_site_file))
+        .route("/fs/thumb", get(fs_thumb))
+        .route("/fs/archive", get(fs_archive))
+        .route("/fs/archive/read", get(fs_archive_read))
+        .route("/fs/archive/extract", post(fs_archive_extract))
+        .route("/fs/head", get(fs_head))
         .route("/fs/tail", get(fs_tail))
         .route("/relay/reconnect", post(relay_reconnect))
         .route("/relays", get(list_relays))
@@ -717,17 +727,7 @@ pub async fn create_session(app: &App, input: Input, start: bool) -> R<crate::in
             return Ok(if start && !v.running { app.instances.start(&id).await? } else { v });
         }
     }
-    // DSH：网页版（每台电脑一个，带网页端口）走 create_dsh；对话模式（默认）和别的一样，可以有很多个
-    let dsh_web = input.launch.as_deref() == Some("dsh") && input.chat_ui == Some(false);
-    if input.launch.as_deref() == Some("dsh") && !dsh_web {
-        // 对话走这台电脑上共用的 dsh web，容器里用不了
-        if input.container.is_some() {
-            return Err(LocalError::invalid("container", "invalid").into());
-        }
-        require_persistent(app)?;
-        require_dsh(app).await?;
-    }
-    let v = if dsh_web { create_dsh(app, input).await? } else { app.instances.create(input).await? };
+    let v = app.instances.create(input).await?;
     // stream-json 的 Claude Code：第一句话、接着哪段对话交给对话界面起的进程（终端里是 shell）
     if app.instances.claude_sdk_mode(&v.row) && (prompt.is_some() || resume.is_some()) {
         app.instances.forget_first(&v.row.id);
@@ -757,131 +757,6 @@ pub async fn create_session(app: &App, input: Input, start: bool) -> R<crate::in
         app.chat.codex_warm(&v.row.workdir).await;
     }
     Ok(if start { app.instances.start(&v.row.id).await? } else { v })
-}
-
-// ---------------- DSH（网页界面） ----------------
-//
-// DSH 不是终端界面：`dsh web` 只监听 127.0.0.1 的一个端口，经网关的 `/w/{id}/` 打开（会话标签里、新标签页里；
-// 远程走管理台的 WebRTC 通道，见 dsh.rs）。本机已经有 DSH 在运行（用户自己启动的、DSH 桌面版）就用它，
-// 没有才在这个会话的终端（tmux）里运行一个。一台电脑只有一个 DSH 会话，一个进程管理所有项目文件夹（在网页里添加）。
-
-/// 旧版本新建 DSH 时建的本机网页映射：`instance_page.{实例ID}`（现在不建了，见 [`drop_legacy_page`]）
-#[derive(Serialize, Deserialize)]
-struct DshPage {
-    tunnel_id: String,
-}
-
-fn page_key(id: &str) -> String {
-    format!("instance_page.{id}")
-}
-
-fn require_persistent(app: &App) -> R<()> {
-    // 直接运行模式下命令只在有人打开终端时运行，网页界面没法常驻
-    if app.instances.is_persistent() {
-        Ok(())
-    } else {
-        Err(LocalError::new("DSH_NEEDS_PERSISTENT"))
-    }
-}
-
-/// 没装 DSH 时 `dsh web` 一启动就退出，等它登录只会一直等下去：先查一下，让界面提示去安装。
-/// 已经有 DSH 在运行（例如 DSH 桌面版，PATH 里没有 dsh 命令）也算装了
-async fn require_dsh(app: &App) -> R<()> {
-    if dsh_running_somewhere().await {
-        return Ok(());
-    }
-    match tools::detect(app.instances.shell()).await.dsh {
-        Some(_) => Ok(()),
-        None => Err(LocalError::new("DSH_NOT_INSTALLED")),
-    }
-}
-
-/// 插件报上来有正在运行的 DSH
-async fn dsh_running_somewhere() -> bool {
-    tokio::task::spawn_blocking(|| !crate::agents::dsh_web_running().is_empty()).await.unwrap_or(false)
-}
-
-async fn create_dsh(app: &App, mut input: Input) -> R<crate::instances::View> {
-    require_persistent(app)?;
-    require_dsh(app).await?;
-    if app.instances.dsh()?.is_some() {
-        return Err(LocalError::new("DSH_EXISTS"));
-    }
-    // 已经有 DSH 在运行就记下它的端口（打开时用它）；没有就挑一个空闲的，留给看看自己启动时用
-    let _ = tokio::task::spawn_blocking(|| crate::agents::ensure_dsh_web_plugin(true)).await;
-    let running = tokio::task::spawn_blocking(crate::agents::dsh_web_running).await.unwrap_or_default();
-    input.web_port = Some(match running.first() {
-        Some(w) => w.port,
-        None => Instances::pick_web_port()?,
-    });
-    app.instances.create(input).await
-}
-
-#[derive(Deserialize, Default)]
-#[serde(default)]
-struct PageQ {
-    /// 桌面应用：由看看用系统浏览器打开（带着口令），不在应用窗口里打开（前端发 `?open=1`）
-    #[serde(deserialize_with = "de_flag")]
-    open: bool,
-}
-
-/// 在浏览器中打开 DSH：确保能登录上（本机已有的 DSH，或者在终端里启动一个）。
-/// - `?open=1` 且是本机桌面（桌面应用）：用系统浏览器直接打开 DSH 自己的地址（带口令，`127.0.0.1` 上不经过网关），返回 `opened`；
-/// - 其他情况返回 `url`：网关的 `/w/{id}/`（本机、局域网、远程都能打开，远程经管理台的通道），由页面在新标签里打开。
-async fn instance_page(State(app): State<App>, Extension(access): Extension<Access>, Path(id): Path<String>, Query(q): Query<PageQ>) -> R<Json<Value>> {
-    use super::dsh::{note, step};
-    require_persistent(&app)?;
-    app.instances.get(&id).await?.web_port.ok_or_else(LocalError::not_found)?;
-    super::dsh::begin(&id, "external");
-    dsh_installed(&app, &id).await?;
-    let login = super::dsh::login(&app, &id).await?;
-    let ready = login.is_some();
-    let desktop = q.open && access.is_local() && crate::util::has_desktop();
-    // 没登录上时不打开：打开了也只是 DSH 的“需要认证”页
-    let opened = match &login {
-        Some(l) if desktop => {
-            step(&id, "open", "run", None);
-            let u = with_query(&format!("http://127.0.0.1:{}/", l.port), "token", &l.token);
-            let ok = tokio::task::spawn_blocking(move || crate::util::open_url(&u)).await.unwrap_or(false);
-            step(&id, "open", if ok { "ok" } else { "fail" }, (!ok).then(|| "系统没能打开默认浏览器".to_string()));
-            ok
-        }
-        Some(_) => {
-            if q.open {
-                note(&id, &format!("不是本机桌面（local={}，desktop={}），由浏览器自己打开", access.is_local(), crate::util::has_desktop()));
-            }
-            step(&id, "open", "skip", Some("由页面在新标签里打开".into()));
-            false
-        }
-        None => false,
-    };
-    Ok(Json(json!({ "url": format!("/w/{id}/"), "ready": ready, "opened": opened })))
-}
-
-/// 检查安装这一步（查一次要起一个登录 shell）
-async fn dsh_installed(app: &App, id: &str) -> R<()> {
-    use super::dsh::step;
-    step(id, "install", "run", None);
-    if dsh_running_somewhere().await {
-        step(id, "install", "ok", Some("已有 DSH 在运行".into()));
-        return Ok(());
-    }
-    match tools::detect(app.instances.shell()).await.dsh {
-        Some(p) => {
-            step(id, "install", "ok", Some(p));
-            Ok(())
-        }
-        None => {
-            step(id, "install", "fail", Some(format!("在 {} 的 PATH 里找不到 dsh", app.instances.shell())));
-            Err(LocalError::new("DSH_NOT_INSTALLED"))
-        }
-    }
-}
-
-/// `GET /instances/{id}/dsh/progress`：DSH 最近一次启动 / 打开的步骤和日志（界面显示进度、复制诊断信息）
-async fn dsh_progress(State(app): State<App>, Path(id): Path<String>) -> R<Json<Value>> {
-    app.instances.get(&id).await?;
-    Ok(Json(super::dsh::progress_json(&app, &id).await))
 }
 
 // ---------------- macOS：文件夹访问权限 ----------------
@@ -946,196 +821,6 @@ async fn mac_privacy(Extension(access): Extension<Access>, Json(q): Json<Privacy
     Ok(Json(json!({ "opened": opened })))
 }
 
-/// 在会话标签里打开 DSH（`/w/{id}/`，见 dsh.rs）：确保它在运行、网关已经登录好。`ready` 为假时 dsh 还在启动。
-async fn instance_web(State(app): State<App>, Path(id): Path<String>) -> R<Json<Value>> {
-    require_persistent(&app)?;
-    app.instances.get(&id).await?.web_port.ok_or_else(LocalError::not_found)?;
-    // 已经登录好的不用再查（界面每 2 秒问一次，查一次要起一个登录 shell）
-    if !super::dsh::logged_in(&id) {
-        if let Err(e) = require_dsh(&app).await {
-            super::dsh::begin(&id, "tab");
-            super::dsh::step(&id, "install", "fail", Some(format!("在 {} 的 PATH 里找不到 dsh", app.instances.shell())));
-            return Err(e);
-        }
-    }
-    let ready = super::dsh::ensure(&app, &id).await?.is_some();
-    Ok(Json(json!({ "ready": ready })))
-}
-
-/// 旧版本给 DSH 建的本机网页映射现在用不着了（远程经管理台的通道打开）：在后台删掉，不耽误打开。
-/// 平台上已经没有了（用户自己删了）也算删掉；暂时连不上就等看看下次运行再删（每次运行只试一次）。
-pub(super) async fn drop_legacy_page(app: &App, id: &str) {
-    static TRIED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
-    let Ok(Some(p)) = app.store.get::<DshPage>(&page_key(id)) else { return };
-    {
-        let mut tried = TRIED.lock().unwrap_or_else(|e| e.into_inner());
-        if tried.iter().any(|t| t == id) {
-            return;
-        }
-        tried.push(id.to_string());
-    }
-    let (app, id) = (app.clone(), id.to_string());
-    tokio::spawn(async move {
-        match app.account.delete_tunnel(&p.tunnel_id).await {
-            Ok(()) | Err(crate::platform::PlatformError::Api { status: 404, .. }) => {
-                let _ = app.store.remove(&page_key(&id));
-                tracing::info!(id, "删掉了旧版本给 DSH 建的网页映射");
-            }
-            Err(e) => tracing::warn!(error = %e, "删除旧的 DSH 网页映射失败，下次再试"),
-        }
-    });
-}
-
-/// 等这个会话的终端里刚启动的 dsh 给出启动口令并登录上。口令有两个来源：看看的 DSH 插件写的地址文件
-/// （见 agents.rs），以及 dsh 打印的 `dsh web: http://127.0.0.1:P/?token=…` 这一行（插件没装上时靠它）。
-/// 用口令打开一次，DSH 就发一个 30 天的 Cookie（绑定 `127.0.0.1:P`，dsh 重启后照样有效）。
-/// 口令每次启动都换，而且 dsh 要等插件全部加载完才给出（第一次运行要初始化配置，会慢很多）。
-/// 输出里可能还留着上次运行的那一行，所以拿到口令后先向 dsh 换一次 Cookie，换到了才用；最多等 60 秒。
-pub(super) async fn dsh_login(app: &App, id: &str, port: u16) -> Option<DshLogin> {
-    use super::dsh::{fail_with_output, note, step};
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
-    let (mut process, mut listening, mut token_seen, mut last_exchange) = (false, false, None::<String>, String::new());
-    let mut shell_since: Option<tokio::time::Instant> = None;
-    let mut foreign: Option<(String, tokio::time::Instant)> = None;
-    step(id, "process", "run", None);
-    loop {
-        // dsh 退出了、终端里只剩 shell：再等也不会好，直接报错（带上它的输出）。刚启动时 shell 还没开始运行 dsh，宽限几秒
-        match app.instances.pane(id).await {
-            Some(pane) if crate::chat::is_shell(&pane.command) => {
-                let since = *shell_since.get_or_insert_with(tokio::time::Instant::now);
-                if since.elapsed() >= std::time::Duration::from_secs(5) {
-                    let what = if process { "dsh 运行后退出了" } else { "dsh 没有运行起来" };
-                    fail_with_output(app, id, if process { "listen" } else { "process" }, format!("{what}，终端前台是 {}", pane.command)).await;
-                    return None;
-                }
-            }
-            Some(pane) => {
-                shell_since = None;
-                if !process {
-                    process = true;
-                    step(id, "process", "ok", Some(format!("前台程序 {}，pid {}", pane.command, pane.pid)));
-                    step(id, "listen", "run", Some(format!("127.0.0.1:{port}")));
-                }
-            }
-            None => {
-                fail_with_output(app, id, "process", "终端会话不在了（tmux 会话已结束）".into()).await;
-                return None;
-            }
-        }
-        // 只在 dsh 跑着时才看端口：前台还是 shell 时端口能连上，说明是别的程序占着
-        if process && !listening && tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
-            // 再用 lsof 确认监听的是这个终端里的程序（查不到时不拦）；是别人的就别等口令了，下次打开时换端口重新运行
-            // （dsh 把网页服务放到脱离终端的进程里时会认错：先记下，10 秒内口令还登录不上才算是别人的）
-            if let Some(who) = super::dsh::foreign_holder(app, id, port).await {
-                note(id, &format!("127.0.0.1:{port} 是 {who} 在监听，不在这个终端的进程里"));
-                foreign = Some((who, tokio::time::Instant::now()));
-            }
-            listening = true;
-            step(id, "listen", "ok", Some(format!("127.0.0.1:{port}")));
-            step(id, "token", "run", None);
-        }
-        let token = match listening.then(|| crate::agents::dsh_web_running().into_iter().find(|w| w.port == port)).flatten() {
-            Some(w) => Some(w.token),
-            None => app.instances.full_output(id).await.as_deref().and_then(parse_dsh_token),
-        };
-        if let Some(token) = token {
-            if token_seen.as_deref() != Some(&token) {
-                step(id, "token", "ok", Some(format!("{}…（{} 位）", &token[..4], token.len())));
-                step(id, "login", "run", None);
-                token_seen = Some(token.clone());
-            }
-            match dsh_exchange(port, &token).await {
-                Ok(cookie) => {
-                    step(id, "login", "ok", None);
-                    return Some(DshLogin { port, token, cookie });
-                }
-                Err(e) if e != last_exchange => {
-                    note(id, &format!("用口令换 Cookie：{e}"));
-                    last_exchange = e;
-                }
-                Err(_) => {}
-            }
-        }
-        if let Some((who, _)) = foreign.as_ref().filter(|(_, at)| at.elapsed() >= std::time::Duration::from_secs(10)) {
-            fail_with_output(app, id, "listen", format!("127.0.0.1:{port} 被 {who} 占着，不是这个终端里的 dsh；再打开一次会换个端口重新运行")).await;
-            return None;
-        }
-        if tokio::time::Instant::now() >= deadline {
-            let at = if !process {
-                "process"
-            } else if !listening {
-                "listen"
-            } else if token_seen.is_none() {
-                "token"
-            } else {
-                "login"
-            };
-            let why = match at {
-                "listen" => format!("60 秒内 127.0.0.1:{port} 没有开始监听"),
-                "token" => "60 秒内输出里没有出现 “dsh web: …?token=” 这一行".into(),
-                "login" => format!("60 秒内没能用口令登录：{last_exchange}"),
-                _ => "60 秒内 dsh 没有运行起来".into(),
-            };
-            fail_with_output(app, id, at, why).await;
-            return None;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-    }
-}
-
-/// 用终端输出里最近的口令能不能登录上（能就说明端口上是这个终端里的 dsh）
-pub(super) async fn dsh_answers(app: &App, id: &str, port: u16) -> bool {
-    match app.instances.full_output(id).await.as_deref().and_then(parse_dsh_token) {
-        Some(token) => dsh_exchange(port, &token).await.is_ok(),
-        None => false,
-    }
-}
-
-#[derive(Clone)]
-pub(super) struct DshLogin {
-    /// DSH 网页界面监听的本机端口
-    pub port: u16,
-    pub token: String,
-    /// 换到的会话 Cookie（`名字=值`），绑定 `127.0.0.1:{port}` 这个 Host
-    pub cookie: String,
-}
-
-/// 口令换 Cookie：有效时 dsh 返回 303 和 Set-Cookie，无效 401，还没监听时连不上。失败时给出原因（记进诊断信息）
-pub(super) async fn dsh_exchange(port: u16, token: &str) -> Result<String, String> {
-    let client = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).timeout(std::time::Duration::from_secs(3)).no_proxy().build().map_err(|e| e.to_string())?;
-    let r = client.get(format!("http://127.0.0.1:{port}/?token={token}")).send().await.map_err(|e| format!("连不上：{e}"))?;
-    if r.status() != StatusCode::SEE_OTHER {
-        return Err(format!("dsh 回 {}（要的是 303）", r.status()));
-    }
-    r.headers().get_all(reqwest::header::SET_COOKIE).iter().filter_map(|v| v.to_str().ok()).find_map(cookie_pair).ok_or_else(|| "303 里没有 Set-Cookie".into())
-}
-
-/// `Set-Cookie` 里的 `名字=值`。
-fn cookie_pair(set_cookie: &str) -> Option<String> {
-    let pair = set_cookie.split(';').next()?.trim();
-    pair.split_once('=').filter(|(k, v)| !k.is_empty() && !v.is_empty()).map(|_| pair.to_string())
-}
-
-/// 输出里最后一个 `dsh web:` 行的口令。
-fn parse_dsh_token(text: &str) -> Option<String> {
-    text.lines().rev().filter(|l| l.contains("dsh web:")).find_map(|l| {
-        let t: String = l.split("token=").nth(1)?.chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_').collect();
-        (t.len() >= 16).then_some(t)
-    })
-}
-
-fn with_query(url: &str, key: &str, value: &str) -> String {
-    let (base, frag) = url.split_once('#').map_or((url, None), |(b, f)| (b, Some(f)));
-    let sep = if base.contains('?') { '&' } else { '?' };
-    let base = if base.contains('?') || base.ends_with('/') || base.matches('/').count() > 2 { base.to_string() } else { format!("{base}/") };
-    let mut out = format!("{base}{sep}{key}={value}");
-    if let Some(f) = frag {
-        out.push('#');
-        out.push_str(f);
-    }
-    out
-}
-
 async fn get_instance(State(app): State<App>, Path(id): Path<String>) -> R<impl IntoResponse> {
     Ok(Json(with_chat(&app, app.instances.get(&id).await?)))
 }
@@ -1145,17 +830,9 @@ async fn update_instance(State(app): State<App>, Path(id): Path<String>, Json(in
 }
 
 async fn delete_instance(State(app): State<App>, Path(id): Path<String>) -> R<StatusCode> {
-    let page: Option<DshPage> = app.store.get(&page_key(&id))?;
     app.instances.delete(&id).await?;
     app.chat.forget(&id);
     crate::checkpoint::forget(&app.store, &id);
-    if let Some(p) = page {
-        // 映射跟着删；平台上已经没有（用户自己删了）或暂时连不上都不影响删除终端
-        if let Err(e) = app.account.delete_tunnel(&p.tunnel_id).await {
-            tracing::warn!(error = %e, "删除 DSH 的网页映射失败");
-        }
-        let _ = app.store.remove(&page_key(&id));
-    }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1440,6 +1117,11 @@ struct FsQ {
     /// 同时列出文件（终端页的“文件”标签）；默认只列子目录（选工作目录）
     #[serde(default, deserialize_with = "de_flag")]
     files: bool,
+    /// 分页（大文件夹，§4.6）：从第几项开始、取多少项；不带 limit 时和以前一样最多 5000 项
+    #[serde(default)]
+    offset: usize,
+    #[serde(default)]
+    limit: Option<usize>,
 }
 
 /// 查询串布尔值：接受 `1/0`、`true/false`、`yes/no`、`on/off`，空值视为 false
@@ -1470,6 +1152,8 @@ struct FsList {
     path: String,
     parent: Option<String>,
     entries: Vec<FsEntry>,
+    /// 这个文件夹一共多少项（分页时 entries 只是其中一段）
+    total: usize,
     /// 请求的路径不存在时，返回的是最近的已存在上级目录
     exists: bool,
     /// 没有权限读取这个文件夹（或其上级不让进入）：`entries` 为空，界面按 `os` 给出对应的授权说明
@@ -1528,6 +1212,7 @@ fn list_dirs(q: &FsQ) -> Result<FsList, LocalError> {
     }
     let exists = dir == requested;
     let mut entries = Vec::new();
+    let mut total = 0;
     match std::fs::read_dir(&dir) {
         Ok(rd) => {
             entries = rd
@@ -1555,7 +1240,14 @@ fn list_dirs(q: &FsQ) -> Result<FsList, LocalError> {
                 .collect();
             // 文件夹在前（选工作目录时本来就只有文件夹）
             entries.sort_by_key(|e| (!e.is_dir, e.name.to_lowercase()));
-            entries.truncate(if q.files { 5000 } else { 2000 });
+            total = entries.len();
+            match q.limit.filter(|_| q.files) {
+                Some(limit) => {
+                    entries.drain(..q.offset.min(entries.len()));
+                    entries.truncate(limit.clamp(1, 5000));
+                }
+                None => entries.truncate(if q.files { 5000 } else { 2000 }),
+            }
         }
         // Linux/macOS 的 EACCES、EPERM（含 macOS 隐私保护拒绝）和 Windows 的“拒绝访问”都归到这里
         Err(e) if e.kind() == ErrorKind::PermissionDenied => denied = true,
@@ -1571,6 +1263,7 @@ fn list_dirs(q: &FsQ) -> Result<FsList, LocalError> {
         path: dir.display().to_string(),
         parent: dir.parent().map(|p| p.display().to_string()),
         entries,
+        total,
         exists,
         denied,
         os: std::env::consts::OS,
@@ -1636,6 +1329,20 @@ async fn list_checkpoints(State(app): State<App>, Path(id): Path<String>) -> R<J
 async fn checkpoint_diff(State(app): State<App>, Path((id, cp)): Path<(String, i64)>) -> R<Json<Value>> {
     let dir = checkpoint_dir(&app, &id)?;
     Ok(Json(blocking(move || crate::checkpoint::diff(&app.store, &id, &dir, cp)).await?))
+}
+
+#[derive(Deserialize)]
+struct BaseQ {
+    path: String,
+    /// `first`（默认：会话第一个检查点）/ `turn`（这一轮开始时）
+    #[serde(default)]
+    at: String,
+}
+
+/// 对比模式的基准内容：检查点 → HEAD → 空（checkpoint::base）
+async fn checkpoint_base(State(app): State<App>, Path(id): Path<String>, Query(q): Query<BaseQ>) -> R<Json<Value>> {
+    let dir = checkpoint_dir(&app, &id)?;
+    Ok(Json(blocking(move || crate::checkpoint::base(&app.store, &id, &dir, &q.path, q.at == "turn")).await?))
 }
 
 /// AI 正在干活时不恢复（先停下），免得恢复到一半又被改
@@ -1954,6 +1661,19 @@ async fn fs_preview(Query(q): Query<PathQ>) -> R<Response> {
     transfer::preview(&q.path).await
 }
 
+/// 旧版 Office 预览用的转换器（office.rs）：状态 / 开始下载 / 取文件
+async fn office_engine(State(app): State<App>) -> Json<Value> {
+    Json(crate::office::status(&app.paths.home))
+}
+
+async fn office_engine_start(State(app): State<App>) -> Json<Value> {
+    Json(crate::office::start(&app.paths.home, app.account.platform()))
+}
+
+async fn office_engine_file(State(app): State<App>, Path(file): Path<String>) -> R<Response> {
+    crate::office::file(&app.paths.home, &file).await
+}
+
 #[derive(Deserialize)]
 struct FsNameReq {
     /// mkdir：所在文件夹；rename / delete：要改的文件或文件夹
@@ -2114,13 +1834,129 @@ struct FsWriteReq {
     /// 打开时的修改时间；不带 = 覆盖
     #[serde(default)]
     if_mtime: Option<i64>,
+    /// 读到时的编码、换行、BOM（/fs/read 给的），按原样写回；不带 = UTF-8、不改换行、无 BOM（旧页面）
+    #[serde(default)]
+    encoding: Option<String>,
+    #[serde(default)]
+    eol: Option<String>,
+    #[serde(default)]
+    bom: bool,
+    /// 新建：已经有了报 FILE_EXISTS
+    #[serde(default)]
+    create: bool,
 }
 
-/// `POST /api/fs/write {path, content, if_mtime}`：保存编辑（≤ 1 MiB 的文字文件），返回新的修改时间。
+/// `POST /api/fs/write {path, content, if_mtime, encoding, eol, bom, create}`：保存编辑（≤ 4 MiB），返回新的修改时间。
 async fn fs_write(Json(req): Json<FsWriteReq>) -> R<Json<Value>> {
-    tracing::info!(path = %req.path, "管理台保存文件");
-    let mtime = blocking(move || crate::fsops::write(&req.path, &req.content, req.if_mtime)).await?;
-    Ok(Json(json!({ "mtime_ms": mtime })))
+    tracing::info!(path = %req.path, create = req.create, "管理台保存文件");
+    // 存好的字节数（按原编码存的不是 UTF-8 长度），预览拿来更新大小
+    let (mtime, size) = blocking(move || {
+        let m = crate::textfile::write(&req.path, &req.content, req.if_mtime, req.encoding.as_deref(), req.eol.as_deref(), req.bom, req.create)?;
+        Ok((m, std::fs::metadata(&req.path).map(|x| x.len()).ok()))
+    })
+    .await?;
+    Ok(Json(json!({ "mtime_ms": mtime, "size": size })))
+}
+
+#[derive(Deserialize)]
+struct FsReadQ {
+    path: String,
+    #[serde(default)]
+    offset: Option<u64>,
+    #[serde(default)]
+    line: Option<u64>,
+    #[serde(default)]
+    len: Option<u64>,
+    #[serde(default)]
+    encoding: Option<String>,
+}
+
+/// `GET /api/fs/read?path&offset|line&len&encoding`：文字文件的一段（转成 UTF-8，带原编码 / 换行 / BOM），见 textfile.rs
+async fn fs_read(Query(q): Query<FsReadQ>) -> R<Json<crate::textfile::ReadOut>> {
+    Ok(Json(blocking(move || crate::textfile::read(&q.path, q.offset, q.line, q.len, q.encoding.as_deref())).await?))
+}
+
+/// `GET /api/fs/stat?path`：在不在、大小、修改时间（查看器看文件有没有被改过）
+async fn fs_stat(Query(q): Query<PathQ>) -> R<Json<crate::textfile::Stat>> {
+    Ok(Json(blocking(move || crate::textfile::stat(&q.path)).await?))
+}
+
+#[derive(Deserialize)]
+struct FsExistsReq {
+    paths: Vec<String>,
+    /// 相对路径按这个文件夹解析（会话的工作目录）
+    #[serde(default)]
+    base: Option<String>,
+}
+
+/// `POST /api/fs/exists {paths, base}`：对话里认出来的路径哪些真的存在（最多 200 个，只回答在不在、是不是文件夹）
+async fn fs_exists(Json(req): Json<FsExistsReq>) -> R<Json<Value>> {
+    Ok(Json(json!({ "items": blocking(move || Ok(crate::textfile::exists(&req.paths, req.base.as_deref()))).await? })))
+}
+
+#[derive(Deserialize)]
+struct FsPathReq {
+    path: String,
+}
+
+/// `POST /api/fs/site {path}`：HTML 预览用的只读静态目录（fsview.rs）
+async fn fs_site_open(Json(req): Json<FsPathReq>) -> R<Json<Value>> {
+    Ok(Json(blocking(move || crate::fsview::site_open(&req.path)).await?))
+}
+
+async fn fs_site_file(Path((token, rest)): Path<(String, String)>) -> R<Response> {
+    crate::fsview::site_file(&token, &rest).await
+}
+
+#[derive(Deserialize)]
+struct ThumbQ {
+    path: String,
+    #[serde(default)]
+    size: u32,
+}
+
+/// `GET /api/fs/thumb?path&size=128|256`：图片 / 视频缩略图（JPEG），做不出来 404
+async fn fs_thumb(State(app): State<App>, Query(q): Query<ThumbQ>) -> R<Response> {
+    crate::fsview::thumb(&app.paths.home, &q.path, q.size).await
+}
+
+/// `GET /api/fs/archive?path`：压缩包里的文件
+async fn fs_archive(Query(q): Query<PathQ>) -> R<Json<Value>> {
+    Ok(Json(blocking(move || crate::fsview::archive_list(&q.path)).await?))
+}
+
+#[derive(Deserialize)]
+struct ArchiveReadQ {
+    path: String,
+    entry: String,
+}
+
+/// `GET /api/fs/archive/read?path&entry`：压缩包里的一个文件（原样字节，按扩展名给类型）
+async fn fs_archive_read(Query(q): Query<ArchiveReadQ>) -> R<Response> {
+    let (name, bytes) = blocking(move || crate::fsview::archive_read(&q.path, &q.entry)).await?;
+    let mime = transfer::media_type(&name).map(str::to_string).unwrap_or_else(|| mime_guess::from_path(&name).first_or_octet_stream().to_string());
+    Ok((
+        [
+            (axum::http::header::CONTENT_TYPE, mime),
+            (axum::http::header::X_CONTENT_TYPE_OPTIONS, "nosniff".into()),
+            (axum::http::header::CONTENT_SECURITY_POLICY, "sandbox; default-src 'none'".into()),
+            (axum::http::header::CACHE_CONTROL, "no-store".into()),
+        ],
+        bytes,
+    )
+        .into_response())
+}
+
+/// `POST /api/fs/archive/extract {path}`：解压到旁边的新文件夹，返回 `{ path }`
+async fn fs_archive_extract(Json(req): Json<FsPathReq>) -> R<Json<Value>> {
+    tracing::info!(path = %req.path, "管理台解压");
+    let path = blocking(move || crate::fsview::archive_extract(&req.path)).await?;
+    Ok(Json(json!({ "path": path })))
+}
+
+/// `GET /api/fs/head?path`：前 64 KiB 原样字节 + 猜出来的类型（十六进制查看）
+async fn fs_head(Query(q): Query<PathQ>) -> R<Response> {
+    blocking(move || crate::fsview::head(&q.path)).await
 }
 
 #[derive(Deserialize)]
@@ -2396,7 +2232,7 @@ fn normalize_projects(items: Vec<Project>) -> R<Vec<Project>> {
         if p.workdir.is_empty() || p.workdir.chars().count() > 1024 {
             return Err(LocalError::invalid("workdir", "invalid"));
         }
-        if !matches!(p.launch.as_str(), "" | "shell" | "claude" | "codex" | "opencode" | "dsh" | "agy" | "custom") {
+        if !matches!(p.launch.as_str(), "" | "shell" | "claude" | "codex" | "agy" | "custom") {
             p.launch.clear();
         }
         // 同一个文件夹只留第一条（最近用的排前面）
@@ -3692,18 +3528,8 @@ mod tests {
         assert_eq!(hidden("hidden=maybe"), None);
     }
 
-    #[test]
-    fn dsh_token_and_url() {
-        let out = "old\ndsh web: http://127.0.0.1:3080/?token=aaaaaaaaaaaaaaaaaaaa\nrestart\ndsh web: http://127.0.0.1:3080/?token=ozazZIiC1LJAIc8v7EAa-jgOFmru1Kqh_bd8KubxLQ\n[x] other\n";
-        assert_eq!(parse_dsh_token(out).as_deref(), Some("ozazZIiC1LJAIc8v7EAa-jgOFmru1Kqh_bd8KubxLQ"));
-        assert_eq!(parse_dsh_token("token=abc\n"), None);
-        assert_eq!(with_query("https://a--b.r2.example.com", "token", "T"), "https://a--b.r2.example.com/?token=T");
-        assert_eq!(with_query("https://a--b.r2.example.com/", "token", "T"), "https://a--b.r2.example.com/?token=T");
-        assert_eq!(with_query("http://127.0.0.1:41002/?x=1", "token", "T"), "http://127.0.0.1:41002/?x=1&token=T");
-    }
-
     fn q(path: &std::path::Path, hidden: bool) -> FsQ {
-        FsQ { path: path.display().to_string(), hidden, files: false }
+        FsQ { path: path.display().to_string(), hidden, files: false, offset: 0, limit: None }
     }
 
     #[test]
@@ -3935,7 +3761,7 @@ async fn pets_delete(State(app): State<App>, Path((source, id)): Path<(String, S
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// 对话页：按这个终端的启动类型（claude / codex / dsh / opencode）选宠物
+/// 对话页：按这个终端的启动类型（claude / codex）选宠物
 #[derive(Deserialize)]
 struct BondQ {
     #[serde(default)]

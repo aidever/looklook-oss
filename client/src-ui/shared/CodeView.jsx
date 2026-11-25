@@ -3,13 +3,17 @@
 // `focus`（{ from, to }，从 1 开始）：那几行标出来，打开时滚到上面三分之一处（对话里“读的那段、改的地方”）。
 // `editable`：可以改（文件预览的“编辑”），改动经 `onChange` 报给外面，⌘S / Ctrl+S 调 `onSave`；
 // `onSelect`：选中的几行（{ from, to, text }，没选中时 null），给“让 AI 改”；`atEnd`：打开时滚到最后（跟随日志）。
+// `original`：对比模式（@codemirror/merge 的单栏对比），和这份比，删掉的行显示在改过的行上面；编辑时每块旁边能“还原”；
+// `onChunks({ add, del, n })`：改了几行；`lineStart`：第一行的行号（大文件分段看时不从 1 起）；
+// `api`（ref）：{ gotoLine(n), nextChunk(), prevChunk(), insert(text), focus() } 给外面的按钮（跳到行、上一处 / 下一处改动、手机编辑工具条）。
 import { Compartment, EditorState, RangeSetBuilder, Text } from '@codemirror/state';
 import { Decoration, drawSelection, EditorView, highlightSpecialChars, keymap, lineNumbers } from '@codemirror/view';
-import { defaultKeymap, history, historyKeymap } from '@codemirror/commands';
+import { defaultKeymap, history, historyKeymap, redo, undo } from '@codemirror/commands';
 import { bracketMatching, codeFolding, foldGutter, foldKeymap, HighlightStyle, LanguageDescription, syntaxHighlighting } from '@codemirror/language';
 import { languages } from '@codemirror/language-data';
 import { highlightSelectionMatches, search, searchKeymap } from '@codemirror/search';
 import { tags as t } from '@lezer/highlight';
+import { getChunks, getOriginalDoc, goToNextChunk, goToPreviousChunk, unifiedMergeView } from '@codemirror/merge';
 import { useEffect, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
 
@@ -41,7 +45,22 @@ function focusDeco(doc, from, to) {
 /** 这个文件名对应的语法（没有就纯文字） */
 export const languageFor = (name) => LanguageDescription.matchFilename(languages, name);
 
-export default function CodeView({ text, name, wrap, focus, editable = false, onChange, onSave, onSelect, atEnd = false }) {
+/** 对比的改动数：加了几行、删了几行、几块 */
+function countChunks(state) {
+  const r = getChunks(state);
+  if (!r) return { add: 0, del: 0, n: 0 };
+  const orig = getOriginalDoc(state);
+  const lines = (doc, from, to) => (to > from ? doc.lineAt(Math.max(from, to - 1)).number - doc.lineAt(from).number + 1 : 0);
+  let add = 0;
+  let del = 0;
+  for (const c of r.chunks) {
+    add += lines(state.doc, c.fromB, Math.min(c.toB, state.doc.length));
+    del += lines(orig, c.fromA, Math.min(c.toA, orig.length));
+  }
+  return { add, del, n: r.chunks.length };
+}
+
+export default function CodeView({ text, name, wrap, focus, editable = false, onChange, onSave, onSelect, atEnd = false, original = null, onChunks, lineStart = 1, api, keepScroll }) {
   const { t: tr } = useTranslation();
   const host = useRef(null);
   const view = useRef(null);
@@ -49,13 +68,14 @@ export default function CodeView({ text, name, wrap, focus, editable = false, on
   const from = focus?.from ?? 0;
   const to = focus?.to ?? from;
   const cb = useRef({});
-  cb.current = { onChange, onSave, onSelect };
+  cb.current = { onChange, onSave, onSelect, onChunks };
   const textRef = useRef(text);
   textRef.current = text;
   // 跟随日志时新内容接在后面，不整个重建（几秒一次）
   const base = atEnd ? null : text;
   useEffect(() => {
     const text = textRef.current;
+    const diff = original == null ? null : original.replace(/\r\n?/g, '\n');
     const wrapC = new Compartment();
     const langC = new Compartment();
     parts.current = { wrapC, langC };
@@ -69,6 +89,7 @@ export default function CodeView({ text, name, wrap, focus, editable = false, on
         ...(editable ? [history(), keymap.of([...historyKeymap, { key: 'Mod-s', preventDefault: true, run: () => (cb.current.onSave?.(), true) }])] : []),
         EditorView.updateListener.of((u) => {
           if (u.docChanged) cb.current.onChange?.(u.state.doc.toString());
+          if (diff != null && (u.docChanged || u.transactions.some((tr) => tr.effects.length))) cb.current.onChunks?.(countChunks(u.state));
           if (u.selectionSet || u.docChanged) {
             const r = u.state.selection.main;
             if (r.empty) cb.current.onSelect?.(null);
@@ -78,7 +99,8 @@ export default function CodeView({ text, name, wrap, focus, editable = false, on
             }
           }
         }),
-        lineNumbers(),
+        lineNumbers(lineStart > 1 ? { formatNumber: (n) => String(n + lineStart - 1) } : {}),
+        ...(diff != null ? [unifiedMergeView({ original: diff, mergeControls: editable, gutter: true, highlightChanges: true, syntaxHighlightDeletions: true, collapseUnchanged: { margin: 3, minSize: 8 } })] : []),
         foldGutter(),
         codeFolding(),
         highlightSpecialChars(),
@@ -100,7 +122,22 @@ export default function CodeView({ text, name, wrap, focus, editable = false, on
     });
     const ed = new EditorView({ state, parent: host.current });
     view.current = ed;
-    if (atEnd) requestAnimationFrame(() => ed.dispatch({ effects: EditorView.scrollIntoView(ed.state.doc.length, { y: 'end' }) }));
+    if (diff != null) {
+      cb.current.onChunks?.(countChunks(ed.state));
+      // 打开对比时先到第一处改动
+      requestAnimationFrame(() => {
+        const first = getChunks(ed.state)?.chunks[0];
+        if (first && !from) ed.dispatch({ effects: EditorView.scrollIntoView(first.fromB, { y: 'start', yMargin: ed.scrollDOM.clientHeight / 4 }) });
+      });
+    }
+    // 外面改了文件、自动重读时停在原来的位置（keepScroll.current 是重读前的 scrollTop，用一次）
+    const keep = keepScroll?.current;
+    if (keep != null) {
+      keepScroll.current = null;
+      requestAnimationFrame(() => {
+        ed.scrollDOM.scrollTop = keep;
+      });
+    } else if (atEnd) requestAnimationFrame(() => ed.dispatch({ effects: EditorView.scrollIntoView(ed.state.doc.length, { y: 'end' }) }));
     else if (from) {
       const line = ed.state.doc.line(Math.min(from, ed.state.doc.lines));
       // 标出的几行放在上面三分之一，前面留几行看上下文
@@ -117,7 +154,37 @@ export default function CodeView({ text, name, wrap, focus, editable = false, on
       ed.destroy();
       view.current = null;
     };
-  }, [base, name, from, to, editable, atEnd]);
+  }, [base, name, from, to, editable, atEnd, original, lineStart]);
+  // 给外面按钮用的操作
+  useEffect(() => {
+    if (!api) return undefined;
+    api.current = {
+      gotoLine(n) {
+        const ed = view.current;
+        if (!ed) return;
+        const line = ed.state.doc.line(Math.max(1, Math.min(n - lineStart + 1, ed.state.doc.lines)));
+        ed.dispatch({ selection: { anchor: line.from }, effects: EditorView.scrollIntoView(line.from, { y: 'center' }) });
+        ed.focus();
+      },
+      nextChunk: () => view.current && goToNextChunk(view.current),
+      prevChunk: () => view.current && goToPreviousChunk(view.current),
+      insert(textIn, { wrap: w } = {}) {
+        const ed = view.current;
+        if (!ed || ed.state.readOnly) return;
+        const r = ed.state.selection.main;
+        // 成对的符号：有选中时包起来
+        const ins = w && !r.empty ? `${textIn}${ed.state.sliceDoc(r.from, r.to)}${w}` : textIn + (w ?? '');
+        ed.dispatch({ changes: { from: r.from, to: r.to, insert: ins }, selection: { anchor: r.from + textIn.length + (w && !r.empty ? r.to - r.from : 0) } });
+        ed.focus();
+      },
+      undo: () => view.current && (undo(view.current), view.current.focus()),
+      redo: () => view.current && (redo(view.current), view.current.focus()),
+      view: () => view.current,
+    };
+    return () => {
+      api.current = null;
+    };
+  }, [api, lineStart]);
   useEffect(() => {
     const ed = view.current;
     if (!atEnd || !ed) return;

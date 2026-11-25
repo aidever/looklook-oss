@@ -2,10 +2,8 @@
 // 不依赖 React 和浏览器，`node --test` 直接测。
 
 /** 有对话界面的启动类型（和服务端 instances.rs 的 CHAT_LAUNCHES 一致） */
-export const CHAT_LAUNCHES = ['claude', 'codex', 'dsh', 'agy'];
+export const CHAT_LAUNCHES = ['claude', 'codex', 'agy'];
 
-/** 网页版的 DSH（每台电脑一个，会话标签里显示它自己的网页）；对话模式的 DSH 和 Codex 一样走对话界面 */
-export const isDshWeb = (inst) => inst?.launch === 'dsh' && !inst?.chat_ui;
 
 /** 空的对话状态 */
 export const EMPTY = { status: null, items: [], start: 0, total: 0 };
@@ -298,8 +296,6 @@ export const CODEX_ACTIONS = { '/permissions': 'mode' };
 /** Codex 里交给看看后端做的（不是界面动作）：/logout 退出账号 */
 export const CODEX_PASS = ['/logout'];
 
-/** DSH（走 dsh web）认的：/clear、/new 开新会话，/model 是界面的模型菜单；别的斜杠命令交给 DSH 自己执行 */
-export const DSH_COMMANDS = ['/clear', '/new', '/model', '/share', '/export'];
 /** Antigravity（agy acp）：看看界面处理的命令 + agy 原生斜杠命令（菜单里还会合并 agy 报的命令和技能） */
 export const AGY_COMMANDS = [
   '/clear', '/new', '/model', '/resume', '/usage', '/context', '/status', '/mcp', '/plugins', '/agents', '/skills', '/hooks', '/permissions',
@@ -335,7 +331,6 @@ export function slashAction(text, agent) {
   if (agent !== 'agy' && AGY_ONLY.includes(cmd)) return null;
   if (agent === 'codex' && CODEX_ACTIONS[cmd]) return CODEX_ACTIONS[cmd];
   if (agent === 'codex' && CODEX_PASS.includes(cmd)) return null;
-  if (agent === 'dsh' && !DSH_COMMANDS.includes(cmd)) return null;
   if (agent === 'agy') {
     if (!AGY_COMMANDS.includes(cmd)) return null;
     if (AGY_ACTIONS[cmd]) return AGY_ACTIONS[cmd];
@@ -362,7 +357,7 @@ export function questionAnswers(questions, picked, { arrays = false } = {}) {
     const labels = [...(p.labels ?? [])];
     // otherOn === false：单选时又点了别的选项，填的字不算
     if (p.other?.trim() && p.otherOn !== false) labels.push(p.other.trim());
-    // Claude Code 要逗号连起来的一句；Codex、DSH 收数组（选项里带逗号也不会被拆开）
+    // Claude Code 要逗号连起来的一句；Codex、agy 收数组（选项里带逗号也不会被拆开）
     if (labels.length) out[q.question] = arrays ? labels : labels.join(', ');
   });
   return out;

@@ -341,7 +341,7 @@ async fn sessions(app: &App, project: Option<&str>) -> Result<Vec<Value>, String
         .instances()
         .unwrap_or_default()
         .iter()
-        .filter(|r| !core::is_hidden(&app.store, &r.id) && matches!(r.launch.as_str(), "claude" | "codex" | "dsh" | "opencode"))
+        .filter(|r| !core::is_hidden(&app.store, &r.id) && matches!(r.launch.as_str(), "claude" | "codex"))
         .filter(|r| dir.as_ref().is_none_or(|d| crate::history::same_dir(&r.workdir, d) || core::project_root(FsPath::new(&r.workdir)) == core::project_root(FsPath::new(d))))
         .map(|r| session_view(app, r, watches.contains_key(&r.id)))
         .collect())

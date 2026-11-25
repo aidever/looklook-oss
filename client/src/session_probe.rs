@@ -7,7 +7,6 @@
 //!   换对话（/clear、/resume）也会更新。多账号时每个账号有自己的配置目录，都看。
 //! - **Codex**：没有这样的文件，但它一直开着当前对话的记录文件（`rollout-…-<会话号>.jsonl`）：Linux 读 `/proc/<pid>/fd`，
 //!   macOS 用 `lsof`。记录文件几秒内还在写就是在忙。
-//! - **DSH、OpenCode**：只认出工具（图标），名字用它们设置的终端标题。
 //! - 都不是：普通终端，tmux 报的前台程序不是 shell 就是有命令在跑。
 //!
 //! 认不出对话号时调用方再按文件夹猜，只取这个进程启动之后**开始**的那段对话——不按“最近有动静”猜：
@@ -128,7 +127,7 @@ pub struct Ctx<'a> {
 /// 认出来的结果
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Found {
-    /// 工具（`claude` / `codex` / `dsh` / `opencode`，同 history.rs、会话的 launch）
+    /// 工具（`claude` / `codex` / `agy`，同 history.rs、会话的 launch）
     pub tool: &'static str,
     /// 工具进程的启动时间（Unix 秒）：按文件夹猜对话时只要这之后开始的
     pub since: u64,
@@ -170,7 +169,7 @@ pub trait Detector: Send + Sync {
 
 /// 认法的先后：先认 AI 工具；普通终端不在这里（[`probe`] 找不到时就是普通终端）
 pub fn detectors() -> Vec<Box<dyn Detector>> {
-    vec![Box::new(Claude), Box::new(Codex), Box::new(Dsh), Box::new(OpenCode), Box::new(Agy)]
+    vec![Box::new(Claude), Box::new(Codex), Box::new(Agy)]
 }
 
 /// 整台电脑上在跑的这个工具的进程数（不管是不是看看开的；Claude 桌面版自己的进程不算）。
@@ -335,19 +334,6 @@ fn open_files(_pids: &[u32]) -> Vec<PathBuf> {
     vec![]
 }
 
-// ---------------- 只认工具的 ----------------
-
-struct Dsh;
-
-impl Detector for Dsh {
-    fn tool(&self) -> &'static str {
-        "dsh"
-    }
-    fn names(&self) -> &'static [&'static str] {
-        &["dsh"]
-    }
-}
-
 struct Agy;
 
 /// transcript.jsonl 这么久之内写过就当在忙
@@ -472,17 +458,6 @@ fn agy_conv_from_cmd(cmd: &[String]) -> Option<String> {
         }
     }
     None
-}
-
-struct OpenCode;
-
-impl Detector for OpenCode {
-    fn tool(&self) -> &'static str {
-        "opencode"
-    }
-    fn names(&self) -> &'static [&'static str] {
-        &["opencode"]
-    }
 }
 
 #[cfg(test)]

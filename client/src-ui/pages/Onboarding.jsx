@@ -54,7 +54,7 @@ function useGuide() {
   const hidden = !tips.ready || tips.has(HIDE);
   const done = Object.fromEntries(STEPS.map(({ id }) => [id, tips.has(`step.${id}`)]));
   const hasProject = s.projects.length > 0;
-  const hasAi = s.items.some((i) => CHAT_LAUNCHES.includes(i.launch) || i.launch === 'opencode');
+  const hasAi = s.items.some((i) => CHAT_LAUNCHES.includes(i.launch));
   useEffect(() => {
     if (hidden) return;
     const ids = [hasProject && !done.project && 'step.project', hasAi && !done.ai && 'step.ai'].filter(Boolean);

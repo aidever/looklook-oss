@@ -1,4 +1,4 @@
-//! AI 命令行工具：检测 Codex / Claude Code / OpenCode / DSH（DeepSeek Harness）/ 飞书 CLI（lark-cli）/ Node.js 是否已安装，并生成安装命令。
+//! AI 命令行工具：检测 Codex / Claude Code / Antigravity / 飞书 CLI（lark-cli）/ Node.js 是否已安装，并生成安装命令。
 //! 安装是一个临时的后台任务（不进 tmux、不建终端）：输出留在内存里给界面看进度，客户端重启就没了；
 //! npm 源自动测速选（也可指定淘宝 npmmirror、腾讯或官方）。没有 Node.js 时先下官方 Node.js 装到看看自己的目录（不要管理员权限），
 //! Claude Code 先用官方原生安装，npm 全局目录没有写权限时装到看看的目录；`setup` 一次装好 Node.js → Claude Code → Codex。
@@ -13,14 +13,12 @@ use serde::Serialize;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 
-pub const TOOLS: &[&str] = &["codex", "claude", "opencode", "dsh", "agy", "lark-cli", "node", "npm"];
+pub const TOOLS: &[&str] = &["codex", "claude", "agy", "lark-cli", "node", "npm"];
 
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct Detected {
     pub codex: Option<String>,
     pub claude: Option<String>,
-    pub opencode: Option<String>,
-    pub dsh: Option<String>,
     /// Antigravity CLI
     pub agy: Option<String>,
     /// 飞书官方的命令行（`@larksuite/cli`）：AI 助手用它以你本人的身份读、发飞书
@@ -35,8 +33,6 @@ impl Detected {
         let slot = match name {
             "codex" => &mut self.codex,
             "claude" => &mut self.claude,
-            "opencode" => &mut self.opencode,
-            "dsh" => &mut self.dsh,
             "agy" => &mut self.agy,
             "lark-cli" => &mut self.lark,
             "node" => &mut self.node,
@@ -103,8 +99,6 @@ pub fn package(tool: &str) -> Option<&'static str> {
     match tool {
         "codex" => Some("@openai/codex"),
         "claude" => Some("@anthropic-ai/claude-code"),
-        "opencode" => Some("opencode-ai"),
-        "dsh" => Some("@deepseek-ai/dsh"),
         "lark-cli" => Some("@larksuite/cli"),
         _ => None,
     }
@@ -335,7 +329,7 @@ fn new_job(tool: &str, command: &str, steps: &[&str]) -> Result<Arc<Mutex<Job>>,
 
 /// 能装的工具（npm 包，或 Claude Code 的原生安装）
 pub fn installable(tool: &str) -> bool {
-    package(tool).is_some() || tool == "node"
+    package(tool).is_some() || tool == "node" || tool == "agy"
 }
 
 /// 开始安装（同一个工具已经在装时返回那个任务）。没有 Node.js 时先装 Node.js；源 `auto`/空 = 自动选。
@@ -347,12 +341,14 @@ pub fn start_install(shell: &str, tool: &str, mirror: &str) -> Option<Job> {
     let steps: Vec<&str> = match tool {
         "setup" => vec!["node", "claude", "codex"],
         "node" => vec![],
+        "agy" => vec![tool],
         _ => vec!["node", tool],
     };
     let shown = match tool {
         "setup" => "Node.js → Claude Code → Codex".to_string(),
         "node" => "Node.js".to_string(),
         "claude" => "claude.ai/install".to_string(),
+        "agy" => "antigravity.google/cli/install".to_string(),
         "lark-cli" => crate::lark_cli::install_command(mirror != "official").0,
         _ => install_command(tool, if mirror.is_empty() || mirror == "auto" { "npmmirror" } else { mirror }).unwrap_or_default(),
     };
@@ -379,7 +375,7 @@ async fn install_steps(job: &Mutex<Job>, shell: &str, tool: &str, mirror: &str) 
         t => vec![t],
     };
     // Claude Code 原生安装不需要 Node.js；但原生装不上还要退回 npm，所以照样先确保有 Node.js
-    let need_node = found.npm.is_none();
+    let need_node = found.npm.is_none() && tool != "agy";
     if need_node {
         set_step(job, "node", "running");
         if let Err(e) = install_node(job, mirror).await {
@@ -420,6 +416,18 @@ async fn install_one(job: &Mutex<Job>, shell: &str, tool: &str, mirror: &str) ->
     if tool == "lark-cli" {
         let (_, line) = crate::lark_cli::install_command(mirror != "official");
         return run_line(job, shell, &with_path(shell, &line).await).await.0;
+    }
+    if tool == "agy" {
+        // Antigravity 只有官方安装器（装到 ~/.local/bin/agy），不在 npm 上
+        let line = if cfg!(windows) {
+            "powershell -NoProfile -ExecutionPolicy Bypass -Command \"irm https://antigravity.google/cli/install.ps1 | iex\"".to_string()
+        } else {
+            "curl -fsSL https://antigravity.google/cli/install.sh | bash".to_string()
+        };
+        push_output(job, &format!("$ {line}\n"));
+        let ok = run_line(job, shell, &line).await.0;
+        extend_path();
+        return ok;
     }
     if tool == "claude" && claude_ai_reachable().await {
         let line = if cfg!(windows) {
@@ -686,8 +694,6 @@ mod tests {
     fn commands() {
         assert_eq!(install_command("codex", "npmmirror").unwrap(), "npm install -g @openai/codex --registry=https://registry.npmmirror.com/");
         assert!(install_command("claude", "tencent").unwrap().contains("mirrors.cloud.tencent.com"));
-        assert_eq!(install_command("opencode", "official").unwrap(), "npm install -g opencode-ai --registry=https://registry.npmjs.org/");
-        assert_eq!(install_command("dsh", "npmmirror").unwrap(), "npm install -g @deepseek-ai/dsh --registry=https://registry.npmmirror.com/");
         assert!(install_command("vim", "official").is_none());
         assert_eq!(install_command("lark-cli", "official").unwrap(), "npm install -g @larksuite/cli --registry=https://registry.npmjs.org/");
     }
@@ -723,7 +729,7 @@ mod tests {
     async fn detects_shell_builtins_path() {
         let d = detect("/bin/sh").await;
         // 测试环境不一定装了这些工具；只要求解析不出错，且找到的都是绝对路径。
-        for p in [d.codex, d.claude, d.opencode, d.dsh, d.node, d.npm].into_iter().flatten() {
+        for p in [d.codex, d.claude, d.node, d.npm].into_iter().flatten() {
             assert!(p.starts_with('/'));
         }
     }
