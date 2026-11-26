@@ -344,6 +344,9 @@ pub struct Input {
     /// Antigravity 用哪个账号（agy_profiles.rs）；不填用当前默认。只在新建时有效，只管对话模式（终端里的 agy 没法换账号目录）
     #[serde(default)]
     pub agy_profile: Option<String>,
+    /// `agy_profile` 是 `"auto"` 时按哪个模型的额度挑账号（草稿页选的模型；不填按 agy 默认的 Gemini）
+    #[serde(default)]
+    pub agy_model: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -891,7 +894,7 @@ impl Instances {
             }
         }
         let agy_profile = input.agy_profile.filter(|s| !s.is_empty());
-        if let Some(p) = &agy_profile {
+        if let Some(p) = agy_profile.as_deref().filter(|p| *p != crate::agy_profiles::AUTO) {
             if crate::agy_profiles::get(&self.store, p).is_none() {
                 return Err(LocalError::invalid("agy_profile", "not_found"));
             }
@@ -949,7 +952,10 @@ impl Instances {
             crate::codex_profiles::pin(&self.store, &row.id, codex_profile.as_deref())?;
         }
         if row.launch == "agy" && container.is_none() {
-            crate::agy_profiles::pin(&self.store, &row.id, agy_profile.as_deref())?;
+            // “自动”：现在挑一个额度够的记下，之后一直用它（不按请求轮换）
+            let picked = (agy_profile.as_deref() == Some(crate::agy_profiles::AUTO))
+                .then(|| crate::agy_profiles::resolve_auto(&self.store, &self.paths.home, input.agy_model.as_deref()));
+            crate::agy_profiles::pin(&self.store, &row.id, picked.as_deref().or(agy_profile.as_deref()))?;
         }
         if let Some(r) = input.resume {
             if !r.fork {
@@ -1473,6 +1479,10 @@ impl Instances {
             env
         } else if row.launch == "codex" {
             crate::codex_profiles::launch_env(&self.paths.home, &crate::codex_profiles::for_instance(&self.store, &row.id))
+        } else if row.launch == "agy" {
+            // 终端里的 agy 只能用本机默认账号（~/.gemini），照它的模型设置带上自动压缩点
+            let vars = crate::agy_profiles::get(&self.store, crate::agy_profiles::OFFICIAL).map(|p| p.tuning.vars()).unwrap_or_default();
+            (!vars.is_empty()).then(|| vars.into_iter().fold(crate::model::LaunchEnv::new(), |env, (k, v)| env.lit(k, v)))
         } else {
             None
         };

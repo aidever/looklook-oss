@@ -2829,6 +2829,76 @@ function AccountFail({ id, error }) {
   );
 }
 
+/** agy 这一轮额度用完了：一键换到额度够的账号接着这段对话（发 continue），或者从列表里另选；勾上以后额度用完就自动换 */
+function AgyQuotaOut({ id, out }) {
+  const { t } = useT();
+  const toast = useToast();
+  const [busy, setBusy] = useState(false);
+  const client = deviceApi(terminalDevice(id));
+  const [auto, setAuto] = useState(null);
+  useEffect(() => {
+    client
+      .get('/agy-profiles')
+      .then((d) => setAuto(!!d.auto_switch))
+      .catch(() => {});
+  }, [id]);
+  const to = out.to;
+  const go = async () => {
+    setBusy(true);
+    try {
+      await api.post(`/instances/${id}/chat/switch-profile`, { profile: to.id, continue: true });
+      toast(t('chat.limit.switched', { name: profileName(t, to, 'agy') }), 'ok');
+    } catch (e) {
+      toast(errorText(t, e), 'error');
+    } finally {
+      setBusy(false);
+    }
+  };
+  const flip = async (on) => {
+    setAuto(on);
+    try {
+      await client.put('/agy-profiles/auto-switch', { on });
+    } catch (e) {
+      setAuto(!on);
+      toast(errorText(t, e), 'error');
+    }
+  };
+  return (
+    <div className="chat-limit is-stopped" role="status">
+      <span className="chat-limit-head">
+        <TriangleAlert size={15} aria-hidden="true" />
+        {t('chat.agyq.head', { name: profileName(t, out.from, 'agy') })}
+      </span>
+      <p className="chat-note">{out.auto ? t('chat.agyq.auto_now', { name: profileName(t, to, 'agy') }) : to ? t('chat.agyq.hint', { left: Math.round(to.left) }) : t('chat.agyq.none')}</p>
+      {!out.auto && (
+        <div className="chat-acts">
+          {to && (
+            <Button onClick={go} busy={busy}>
+              {t('chat.agyq.go', { name: profileName(t, to, 'agy') })}
+            </Button>
+          )}
+          <SwitchProfile id={id} agent="agy" manage />
+        </div>
+      )}
+      {auto != null && (
+        <label className="chat-note chat-agyq-auto">
+          <input type="checkbox" checked={auto} onChange={(e) => flip(e.target.checked)} /> {t('chat.agyq.auto')}
+        </label>
+      )}
+    </div>
+  );
+}
+
+/** agy 额度用完后自动换了账号：在输入框上面说一声，换到了哪个 */
+function AgySwitched({ sw }) {
+  const { t } = useT();
+  return (
+    <p className="chat-note chat-agyq-done" role="status">
+      <UserRound size={14} aria-hidden="true" /> {t('chat.agyq.switched', { from: profileName(t, sw.from, 'agy'), to: profileName(t, sw.to, 'agy') })}
+    </p>
+  );
+}
+
 /**
  * /login、/logout：会话所在那台电脑的账号管理，不离开对话页。跟设置页的“账号”是同一套（登录、重新登录、添加、删除），
  * 上面多一行：这段对话在用哪个、换一个接着聊（Claude Code）；Codex 的 ChatGPT / API Key 登录在这里直接做（app-server 的
@@ -5568,12 +5638,11 @@ function ExtraUsage({ lim }) {
   const { t } = useT();
   const ex = lim?.extra;
   const cr = lim?.credits;
-  const resets = lim?.reset_credits;
   if (ex?.enabled && ex.limit > 0) {
     const pct = typeof ex.percent === 'number' ? ex.percent : ((ex.used ?? 0) / ex.limit) * 100;
     return <Meter label={t('chat.usage_extra')} value={pct} sub={t('chat.usage_extra_sub', { used: money(ex.used ?? 0, ex.currency), limit: money(ex.limit, ex.currency) })} />;
   }
-  if (!ex && !cr && !(resets > 0)) return null;
+  if (!ex && !cr) return null;
   return (
     <dl className="chat-kv">
       {ex && (
@@ -5588,20 +5657,147 @@ function ExtraUsage({ lim }) {
           <dd>{cr.unlimited ? t('chat.usage_credits_unlimited') : cr.has || cr.balance > 0 ? (cr.balance ?? 0).toLocaleString(undefined, { maximumFractionDigits: 2 }) : t('chat.usage_credits_none')}</dd>
         </>
       )}
-      {resets > 0 && (
-        <>
-          <dt>{t('chat.usage_reset_credits')}</dt>
-          <dd>{t('chat.usage_reset_credits_n', { n: resets })}</dd>
-        </>
-      )}
     </dl>
+  );
+}
+
+/** 重置卡（把限额立刻清零的机会）。Codex：用量里带着（app-server 给的每张卡，没给明细时只有张数）；
+ *  Claude Code：客户端在后台终端里替你敲 /limit-reset 查（按种类：Fable、全部、5 小时、每周），用也是它去用。
+ *  用之前都要确认；用完写出 CLI 的原话，再刷新用量 */
+function ResetCards({ id, agentId, lim, isOfficial, onUsed }) {
+  const { t } = useT();
+  const confirm = useConfirm();
+  const toast = useToast();
+  const [rev, setRev] = useState(0);
+  const [busy, setBusy] = useState(null);
+  const [said, setSaid] = useState(null);
+  const claude = agentId === 'claude' && isOfficial;
+  const [force, setForce] = useState(false);
+  const { data, error } = usePoll(`/instances/${id}/chat/resets${force ? '?force=1' : ''}`, { enabled: claude, deps: [rev] });
+  const use = async (card, label, lines) => {
+    const ok = await confirm({ title: t('chat.reset_use_title', { name: label }), body: (
+        <span className="chat-reset-confirm">
+          {[...(lines ?? []), t('chat.reset_use_body')].map((l, i) => (
+            <span key={i}>{l}</span>
+          ))}
+        </span>
+      ), confirm: t('chat.reset_use') });
+    if (!ok) return;
+    setBusy(card || 'any');
+    setSaid(null);
+    try {
+      const r = await api.post(`/instances/${id}/chat/resets`, { card });
+      const res = r?.result;
+      const text = r?.message || t(`chat.reset_result_${res}`, { defaultValue: t('chat.reset_result_unknown') });
+      setSaid({ ok: res === 'reset', text });
+      toast(res === 'reset' ? t('chat.reset_done') : text);
+      onUsed?.();
+      if (claude) {
+        setForce(true);
+        setRev((x) => x + 1);
+      }
+    } catch (e) {
+      setSaid({ ok: false, text: errorText(t, e) });
+    } finally {
+      setBusy(null);
+    }
+  };
+  let rows = [];
+  let note = null;
+  if (agentId === 'codex') {
+    const n = lim?.reset_credits ?? 0;
+    if (Array.isArray(lim?.reset_cards) && lim.reset_cards.length > 0) {
+      rows = lim.reset_cards.map((c) => ({
+        key: c.id,
+        card: c.id,
+        name: c.title || t('chat.reset_codex'),
+        sub: [c.description, c.expires_at ? t('chat.reset_use_by', { date: formatTime(c.expires_at) }) : null].filter(Boolean),
+        disabled: c.status === 'redeeming',
+      }));
+    } else if (n > 0) {
+      rows = [{ key: 'any', card: '', name: t('chat.reset_codex'), sub: [t('chat.usage_reset_credits_n', { n })] }];
+    }
+  } else if (claude) {
+    if (!data) {
+      if (error) return null;
+      return (
+        <p className="chat-note">
+          <LoaderCircle size={12} className="spin" /> {t('chat.reset_checking')}
+        </p>
+      );
+    }
+    const st = data.state;
+    if (st === 'unsupported' || st === 'not_installed') return null;
+    if (st === 'legacy') rows = [{ key: 'legacy', card: 'legacy', name: t('chat.reset_legacy'), sub: [t('chat.reset_legacy_sub')] }];
+    else
+      rows = (data.cards ?? []).map((c) => ({
+        key: c.kind,
+        card: c.kind,
+        name: t(`chat.reset_kind_${c.kind.replace('-', '')}`, { defaultValue: c.kind }),
+        sub: c.lines ?? [],
+      }));
+    if (st === 'logged_out') note = t('chat.reset_logged_out');
+    else if (st === 'failed') note = t('chat.reset_failed');
+    else if (rows.length === 0) note = data.message || t('chat.reset_none');
+  }
+  if (rows.length === 0 && !note && !said) return null;
+  return (
+    <div className="chat-resets">
+      <h4 className="chat-side-title">
+        {t('chat.usage_reset_credits')}
+        {claude && (
+          <button
+            type="button"
+            className="chat-more"
+            disabled={busy != null}
+            onClick={() => {
+              setForce(true);
+              setRev((x) => x + 1);
+            }}
+          >
+            {t('chat.mcp_refresh')}
+          </button>
+        )}
+      </h4>
+      {rows.length > 0 && (
+        <ul className="chat-reset-list">
+          {rows.map((r) => (
+            <li key={r.key}>
+              <div className="chat-reset-txt">
+                <b>{r.name}</b>
+                {r.sub.map((l, i) => (
+                  <small key={i}>{l}</small>
+                ))}
+              </div>
+              <Button variant="secondary" disabled={busy != null || r.disabled} onClick={() => use(r.card, r.name, r.sub)}>
+                {busy === (r.card || 'any') ? <LoaderCircle size={14} className="spin" /> : t('chat.reset_use')}
+              </Button>
+            </li>
+          ))}
+        </ul>
+      )}
+      {note && <p className="chat-note">{note}</p>}
+      {said && <p className={`chat-note${said.ok ? '' : ' chat-warn'}`}>{said.text}</p>}
+      {claude && data?.unusable?.length > 0 && (
+        <details className="chat-reset-more">
+          <summary>{t('chat.reset_unusable', { n: data.unusable.length })}</summary>
+          {data.unusable.map((u) => (
+            <p key={u.kind} className="chat-note">
+              {u.text}
+            </p>
+          ))}
+        </details>
+      )}
+      {claude && <p className="chat-note">{t('chat.reset_claude_note')}</p>}
+    </div>
   );
 }
 
 function UsageTab({ id, status, onCompact }) {
   const { t } = useT();
   const { id: agentId, name: agentName, caps } = useContext(AgentCtx);
-  const { data, error } = usePoll(`/instances/${id}/chat/usage`, { deps: [status?.context, status?.actual_model] });
+  const [usageRev, setUsageRev] = useState(0);
+  const { data, error } = usePoll(`/instances/${id}/chat/usage`, { deps: [status?.context, status?.actual_model, usageRev] });
   const [showAcct, setShowAcct] = useState(false);
   if (!data) return error ? <p className="chat-note">{errorText(t, error)}</p> : <LoaderCircle size={16} className="spin" />;
   // 和对话框的小圆环同一个算法（contextGauge）：设了自动压缩点就按压缩点算，另外写出最大上下文
@@ -5610,8 +5806,8 @@ function UsageTab({ id, status, onCompact }) {
   // 不是 Claude Code / Codex 自己报的窗口：标出是估的、按什么估的（第一轮回复后就是它报的）
   const est = win && data.window_source && data.window_source !== 'reported' ? t(`chat.usage_window_${data.window_source}`) : '';
   const cp = agentId === 'claude' ? data.compact : null;
-  // Codex：设了 model_auto_compact_token_limit（看看的模型设置或 config.toml）时写出来
-  const cxp = agentId === 'codex' && data.compact?.at ? data.compact : null;
+  // Codex：设了 model_auto_compact_token_limit（看看的模型设置或 config.toml）时写出来；agy：模型设置里设了压缩点时
+  const cxp = (agentId === 'codex' || agentId === 'agy') && data.compact?.at ? data.compact : null;
   const lim = data.limits;
   const stale = !!(data.version && data.installed && data.installed !== data.version && !versionAtLeast(data.version, String(data.installed).split('.').map((x) => parseInt(x, 10))));
   const swaps = agentId === 'codex' || agentId === 'agy' || !!caps?.sdk;
@@ -5637,8 +5833,8 @@ function UsageTab({ id, status, onCompact }) {
         {cxp && (
           <>
             <dt>{t('chat.usage_autocompact')}</dt>
-            <dd title={cxp.source ? t('chat.usage_compact_from', { file: cxp.source }) : undefined}>
-              {t(cxp.source === 'tuning' ? 'chat.usage_compact_at_env' : 'chat.usage_compact_at_file', { n: tokens(cxp.at), file: String(cxp.source ?? '').split(/[\\/]/).pop() })}
+            <dd title={cxp.source && cxp.source !== 'agy' ? t('chat.usage_compact_from', { file: cxp.source }) : undefined}>
+              {t(cxp.source === 'agy' ? 'chat.usage_compact_at_agy' : cxp.source === 'tuning' ? 'chat.usage_compact_at_env' : 'chat.usage_compact_at_file', { n: tokens(cxp.at), file: String(cxp.source ?? '').split(/[\\/]/).pop() })}
             </dd>
           </>
         )}
@@ -5711,9 +5907,15 @@ function UsageTab({ id, status, onCompact }) {
       {lim?.seven_day && <Meter label={t('chat.usage_7d')} value={lim.seven_day.used} sub={resetText(t, lim.seven_day.resets_at)} />}
       {Array.isArray(lim?.groups) &&
         lim.groups.map((grp) => (
-          <Meter key={grp.id ?? grp.name} label={grp.name} value={grp.used} sub={resetText(t, grp.resets_at)} />
+          <Meter
+            key={grp.id ?? grp.name}
+            label={grp.window ? `${grp.group} · ${t(`chat.usage_win_${grp.window}`, { defaultValue: grp.window })}` : grp.name}
+            value={grp.used}
+            sub={resetText(t, grp.resets_at)}
+          />
         ))}
       <ExtraUsage lim={lim} />
+      <ResetCards id={id} agentId={agentId} lim={lim} isOfficial={!lim?.provider} onUsed={() => setUsageRev((x) => x + 1)} />
       {lim?.reached && <p className="chat-note chat-warn">{t('chat.usage_reached')}</p>}
       {hasLimits && (
         <p className="chat-note">
@@ -7070,6 +7272,8 @@ export default function ChatView({ id, launch, workdir = null, active, touch, of
           {(status?.limit?.waiting || status?.limit?.resume_at > 0) && phase !== 'tui' && <LimitWait id={id} waiting={status.limit.waiting} resumeAt={status.limit.resume_at} guess={status.limit.guess} />}
           {status?.other && phase !== 'tui' && phase !== 'detached' && <OtherScreen id={id} onTab={onTab} />}
           {agentId === 'claude' && phase === 'idle' && !status?.limit?.waiting && !status?.limit?.resume_at && ACCOUNT_ERRORS.includes(status?.error) && <AccountFail id={id} error={status.error} />}
+          {agentId === 'agy' && phase === 'idle' && status?.agy_quota && <AgyQuotaOut id={id} out={status.agy_quota} />}
+          {agentId === 'agy' && status?.agy_switched && !status?.agy_quota && <AgySwitched sw={status.agy_switched} />}
           {agentId === 'codex' && status != null && <CodexSetup id={id} phase={phase} onTab={onTab} />}
           {phase !== 'detached' && <AgentStrip id={id} items={items} live={live} bg={bg} onOpen={openAgent} />}
           <StatusNotice status={status} online={chat.online} offline={offline} />

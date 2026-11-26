@@ -138,6 +138,8 @@ enum Entry {
     Info(String),
     Error(String),
     Turn(u64),
+    /// 手动压缩做完了
+    Compacted,
 }
 
 /// 一个会话整理出来的内容
@@ -411,6 +413,7 @@ impl AgyLog {
             Entry::Info(t) => Body::Info { text: t.clone() },
             Entry::Error(t) => Body::Error { text: t.clone() },
             Entry::Turn(ms) => Body::Turn { ms: *ms },
+            Entry::Compacted => Body::Divider { kind: "compact".into() },
         };
         Item { key: format!("g:{at}:0"), ts: ts.clone(), body }
     }
@@ -461,6 +464,11 @@ impl AgyLog {
         if let Some(ms) = ms {
             self.push(Entry::Turn(ms), None);
         }
+    }
+
+    /// 手动压缩（`/compact`）做完了：画一条“已压缩”分隔线（agy 不回放它，重新加载后就没有了）
+    pub fn compacted(&mut self) {
+        self.push(Entry::Compacted, now_iso());
     }
 
     /// 一条 `session/update`
@@ -618,7 +626,7 @@ impl AgyLog {
             Entry::Tool { raw, name, input, .. } => json!({ "name": name, "input": input, "raw": raw }),
             Entry::Result { text, error, extra, .. } => json!({ "content": text, "is_error": error, "extra": extra }),
             Entry::Plan(t) => json!({ "todos": t }),
-            Entry::Interrupt | Entry::Turn(_) => Value::Null,
+            Entry::Interrupt | Entry::Turn(_) | Entry::Compacted => Value::Null,
         })
     }
 }

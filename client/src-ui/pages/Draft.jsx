@@ -515,6 +515,8 @@ function DraftForm() {
         codex_profile: launch === 'codex' && !container && profile ? profile : undefined,
         // 只有对话模式能换 agy 账号（终端里的 agy 没有换账号目录的参数）
         agy_profile: launch === 'agy' && willChat && !container && profile ? profile : undefined,
+        // “自动”按这个模型那一组的额度挑账号
+        agy_model: launch === 'agy' && profile === 'auto' && model ? model : undefined,
         start: true,
       });
       if (r.id) {

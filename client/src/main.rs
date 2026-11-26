@@ -36,6 +36,7 @@ mod chat;
 mod checkpoint;
 pub mod agy_profiles;
 mod claude_profiles;
+mod claude_resets;
 mod codex_profiles;
 mod clock;
 mod diag;

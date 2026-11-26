@@ -343,6 +343,30 @@ pub async fn usage(State(app): State<App>, Path(id): Path<String>) -> R<Json<Val
     Ok(Json(app.chat.usage(&id).await?))
 }
 
+#[derive(Deserialize)]
+pub struct ResetsQ {
+    /// 1：不用缓存，重新查
+    #[serde(default)]
+    force: Option<u8>,
+}
+
+/// `GET /api/instances/{id}/chat/resets`：Claude Code 的重置卡（后台终端里查，可能要十几秒）
+pub async fn resets(State(app): State<App>, Path(id): Path<String>, Query(q): Query<ResetsQ>) -> R<Json<Value>> {
+    Ok(Json(app.chat.resets(&id, q.force == Some(1)).await?))
+}
+
+#[derive(Deserialize)]
+pub struct UseResetReq {
+    /// Codex：卡的 id（空 = 后端挑）；Claude Code：种类
+    #[serde(default)]
+    card: String,
+}
+
+/// `POST /api/instances/{id}/chat/resets`：用一张重置卡
+pub async fn use_reset(State(app): State<App>, Path(id): Path<String>, Json(req): Json<UseResetReq>) -> R<Json<Value>> {
+    Ok(Json(app.chat.use_reset(&id, &req.card).await?))
+}
+
 /// 对话生成的文件（Codex 生成的图片）
 pub async fn files(State(app): State<App>, Path(id): Path<String>) -> R<Json<Value>> {
     Ok(Json(app.chat.files(&id)?))

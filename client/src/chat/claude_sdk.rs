@@ -429,7 +429,7 @@ mod tests {
 }
 
 /// 随机 uuid（v4 格式），给 claude 认消息用
-fn uuid_v4() -> String {
+pub(crate) fn uuid_v4() -> String {
     let b: [u8; 16] = rand::random();
     let h = |r: std::ops::Range<usize>| b[r].iter().map(|x| format!("{x:02x}")).collect::<String>();
     format!("{}-{}-4{}-{:x}{}-{}", h(0..4), h(4..6), &h(6..8)[1..], 8 | (b[8] & 3), &h(8..10)[1..], h(10..16))

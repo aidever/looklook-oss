@@ -1516,6 +1516,7 @@ input[type="checkbox"], input[type="radio"] { width: auto; min-height: 0; paddin
 .cprof-name svg { flex: none; color: var(--muted); }
 .cprof-warn { color: var(--warn); }
 .cprof-models { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 0 12px; }
+.cprof-env { display: block; margin-top: 2px; font-size: 11px; font-weight: 400; color: var(--muted); overflow-wrap: anywhere; }
 /* 模型设置：分组小标题；列表行里设了哪些（点开改） */
 .tune-head { font-size: 13px; font-weight: 600; margin: 16px 0 8px; }
 .cprof-tuned { display: flex; align-items: center; gap: 4px; max-width: 100%; padding: 0; border: 0; background: none; text-align: left; cursor: pointer; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -2953,6 +2954,8 @@ html, body, .drawer-body, .slist-body, .files-body, .hdetail-msgs { overflow-anc
 .chat-limit .chat-acts { justify-content: flex-end; }
 .chat-limit .chat-note, .chat-limit p { margin: 0; }
 .chat-limit-auto { margin: 4px 0 0; padding: 6px 10px; border-radius: 10px; font-size: 13px; background: var(--claude-soft); color: color-mix(in srgb, var(--claude) 80%, var(--text)); font-variant-numeric: tabular-nums; }
+.chat-agyq-auto { display: flex; align-items: center; gap: 6px; cursor: pointer; }
+.chat-agyq-done { display: flex; align-items: center; gap: 6px; margin: 0 0 6px; padding: 6px 10px; border-radius: 10px; background: color-mix(in srgb, var(--ok, var(--accent)) 10%, var(--panel)); }
 
 /* 运行中插话、已并进这一轮的消息：气泡上面一行小标签，气泡带一圈虚线 */
 .chat-user[data-mid] { flex-direction: column; align-items: flex-end; gap: 4px; }
@@ -4885,3 +4888,13 @@ button.arc-row:hover { background: var(--panel-2); }
 .ep-notes ul { margin: 0; padding-left: 1.2em; }
 .ep-notes li { margin: 4px 0; }
 .ep-notes p { margin: 6px 0; }
+
+/* 重置卡（用量栏）：一张一行，说明在左、“使用”在右；手机宽度下说明换行 */
+.chat-resets { display: grid; gap: 6px; }
+.chat-reset-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 6px; }
+.chat-reset-list li { display: flex; align-items: center; gap: 10px; padding: 8px 10px; border: 1px solid var(--line); border-radius: var(--radius-sm); }
+.chat-reset-txt { flex: 1; min-width: 0; display: grid; gap: 2px; font-size: 13px; }
+.chat-reset-txt small { color: var(--muted); overflow-wrap: anywhere; }
+.chat-reset-list li > button { flex: none; }
+.chat-reset-more summary { cursor: pointer; font-size: 12px; color: var(--muted); }
+.chat-reset-confirm { display: grid; gap: 4px; }

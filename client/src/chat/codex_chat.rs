@@ -377,7 +377,7 @@ fn resets_iso(secs: Option<i64>) -> Value {
 
 /// app-server 的限额窗口 → 界面用的 `{ used, resets_at }`；按窗口长度认 5 小时 / 7 天。
 /// 另带 credits（额度用完后接着用的余额，ChatGPT 里买的：`{ has, unlimited, balance }`，`balance` 是 credits 数，不是钱）
-/// 和 `reset_credits`（能把限额立刻清零的重置机会还有几次）
+/// 和 `reset_credits`（能把限额立刻清零的重置机会还有几次）、`reset_cards`（每张的说明和期限，后端给了才有，null 时只知道张数）
 fn limits_view(r: &Value) -> Value {
     let snap = &r["rateLimits"];
     let c = &snap["credits"];
@@ -386,7 +386,17 @@ fn limits_view(r: &Value) -> Value {
         json!({ "has": has, "unlimited": c["unlimited"].as_bool().unwrap_or(false), "balance": balance })
     });
     let reset_credits = r["rateLimitResetCredits"]["availableCount"].as_i64();
-    let mut out = json!({ "five_hour": null, "seven_day": null, "plan": snap["planType"], "credits": credits, "reset_credits": reset_credits, "reached": snap["rateLimitReachedType"] });
+    let reset_cards = r["rateLimitResetCredits"]["credits"].as_array().map(|a| {
+        a.iter()
+            .filter(|c| c["status"] != "redeemed")
+            .map(|c| {
+                json!({ "id": c["id"], "title": c["title"], "description": c["description"], "status": c["status"],
+                        "granted_at": resets_iso(c["grantedAt"].as_i64()), "expires_at": resets_iso(c["expiresAt"].as_i64()) })
+            })
+            .collect::<Vec<_>>()
+    });
+    let mut out = json!({ "five_hour": null, "seven_day": null, "plan": snap["planType"], "credits": credits, "reset_credits": reset_credits,
+                          "reset_cards": reset_cards, "reached": snap["rateLimitReachedType"] });
     for w in [&snap["primary"], &snap["secondary"]] {
         if w.is_null() {
             continue;
@@ -2152,6 +2162,16 @@ impl Chat {
         Ok(v)
     }
 
+    /// 用一次重置机会（app-server 的 `account/rateLimitResetCredit/consume`，和 Codex 里 /usage 的“重置”一样）。
+    /// `credit` 为 None 时由后端挑下一张。返回 `{ result: reset|nothingToReset|noCredit|alreadyRedeemed }`
+    pub(super) async fn codex_use_reset(&self, credit: Option<&str>) -> Result<Value, LocalError> {
+        let server = self.codex_server().await?;
+        let r = server.call("account/rateLimitResetCredit/consume", json!({ "idempotencyKey": super::claude_sdk::uuid_v4(), "creditId": credit })).await;
+        // 不管成没成，限额都重新取
+        *lock(&self.codex.limits) = None;
+        Ok(json!({ "result": r?["outcome"] }))
+    }
+
     /// 账号用量（5 小时、每周的限额）和这个会话的上下文、token
     pub(super) async fn codex_usage(&self, id: &str) -> Result<Value, LocalError> {
         let cached = lock(&self.codex.limits).as_ref().filter(|(t, _)| t.elapsed() < LIMITS_TTL).map(|(_, v)| v.clone());
@@ -3256,6 +3276,14 @@ mod tests {
         let v = limits_view(&r);
         assert_eq!(v["credits"], json!({ "has": true, "unlimited": false, "balance": 125.5 }));
         assert_eq!(v["reset_credits"], 2);
+        assert!(v["reset_cards"].is_null());
+        let r = json!({ "rateLimits": {}, "rateLimitResetCredits": { "availableCount": 1, "credits": [
+            { "id": "c1", "title": "Limit reset", "description": null, "grantedAt": 1792583484, "expiresAt": 1793082793, "status": "available", "resetType": "codexRateLimits" },
+            { "id": "c0", "title": "Old", "grantedAt": 1792583484, "expiresAt": null, "status": "redeemed", "resetType": "codexRateLimits" } ] } });
+        let v = limits_view(&r);
+        assert_eq!(v["reset_cards"].as_array().unwrap().len(), 1);
+        assert_eq!(v["reset_cards"][0]["id"], "c1");
+        assert!(v["reset_cards"][0]["expires_at"].as_str().unwrap().starts_with("2026-"));
     }
 
     #[test]

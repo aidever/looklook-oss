@@ -2,7 +2,7 @@
 // 新建的会话用默认的（开始页可以另选），之后切换默认不影响已经建好的会话。两个助手共用这里的组件，`agent` 区分。
 // 官方账号的登录由 Claude Code 自己完成（后台运行 `claude auth login`，界面显示授权页地址、收授权码），看看不经手令牌。
 // 第三方接口可以从“常见服务商”里选（model_presets.rs）：地址填好了，贴上 Key 就行，模型从 models.dev 的列表里选。
-import { Check, Cpu, ExternalLink, Gauge, KeyRound, LogIn, Plus, Server, SlidersHorizontal, UserRound } from 'lucide-react';
+import { Check, Cpu, ExternalLink, Gauge, KeyRound, LogIn, Plus, Server, SlidersHorizontal, Sparkles, UserRound } from 'lucide-react';
 import { createContext, useContext, useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 
@@ -24,6 +24,8 @@ const CUSTOM = 'custom';
 // 本机的 Ollama（docs/PLAN_2026-10-27.md §4）：检测到才出现，一键填好地址和 Key，模型从已下载的里选
 const OLLAMA = 'ollama';
 const MODEL_KEYS = ['main', 'opus', 'sonnet', 'haiku'];
+// 每项对应的 Claude Code 环境变量（标签下面小字显示，名字长，单独一行可折行）
+const MODEL_ENV = { main: 'ANTHROPIC_MODEL', opus: 'ANTHROPIC_DEFAULT_OPUS_MODEL', sonnet: 'ANTHROPIC_DEFAULT_SONNET_MODEL', haiku: 'ANTHROPIC_DEFAULT_HAIKU_MODEL' };
 
 // 每个助手的接口路径和文案前缀
 const AGENTS = {
@@ -123,10 +125,13 @@ function UsageLine({ limits }) {
           {w.used >= 100 && ` (${w.resets_at ? t('cprof.usage_reset', { at: formatTime(w.resets_at) }) : t('cprof.usage_reset_unknown')})`}
         </span>
       ))}
-      {groups.map((g) => (
+      {groups.map((g, i) => (
         <span key={g.id ?? g.label} className={g.used > 85 ? 'cprof-warn' : 'muted'} title={g.resets_at ? t('cprof.usage_reset', { at: formatTime(g.resets_at) }) : undefined}>
           {dot()}
-          {`${g.label || g.id} ${Math.round(g.used)}%`}
+          {/* agy：每组（Gemini / Claude 和 GPT）各有每周、5 小时两格，组名只在第一格前写一次 */}
+          {g.window
+            ? `${groups[i - 1]?.group === g.group ? '' : `${g.group} `}${t(`cprof.usage_win_${g.window}`, { used: Math.round(g.used), defaultValue: `${g.window} ${Math.round(g.used)}%` })}`
+            : `${g.label || g.id} ${Math.round(g.used)}%`}
           {g.used >= 100 && ` (${g.resets_at ? t('cprof.usage_reset', { at: formatTime(g.resets_at) }) : t('cprof.usage_reset_unknown')})`}
         </span>
       ))}
@@ -547,7 +552,15 @@ function ApiForm({ agent, initial, accepted, onClose, onSaved }) {
               </p>
               <div className="cprof-models">
                 {MODEL_KEYS.map((k) => (
-                  <Field key={k} label={t(`cprof.model.${k}`)}>
+                  <Field
+                    key={k}
+                    label={
+                      <>
+                        {t(`cprof.model.${k}`)}
+                        <span className="cprof-env mono">{MODEL_ENV[k]}</span>
+                      </>
+                    }
+                  >
                     <input className="mono" value={models[k]} onChange={(e) => setModels({ ...models, [k]: e.target.value })} maxLength={100} spellCheck={false} autoCapitalize="none" />
                   </Field>
                 ))}
@@ -594,10 +607,79 @@ export function tokensText(n) {
   return String(n);
 }
 
+/** Antigravity 的自动压缩点 → “800K”“80%” */
+function agyCompactText(x) {
+  return x?.compact_tokens ? tokensText(x.compact_tokens) : x?.compact_pct ? `${x.compact_pct}%` : '';
+}
+
+/** “800K”“80%”→ { compact_tokens } / { compact_pct }；空的是 {}，看不懂的是 null */
+export function parseAgyCompact(v) {
+  const s = String(v ?? '').trim();
+  if (!s) return {};
+  const pm = /^(\d+(?:\.\d+)?)\s*%$/.exec(s);
+  if (pm) {
+    const p = Math.round(Number(pm[1]));
+    return p >= 20 && p <= 95 ? { compact_pct: p } : null;
+  }
+  const n = parseTokens(s);
+  return Number.isNaN(n) || n < 100_000 || n > 10_000_000 ? null : { compact_tokens: n };
+}
+
+/** Antigravity：只有自动压缩点（AGY_CLI_AUTO_COMPACT_OVERRIDE，起 agy acp 时带上） */
+function AgyTuningModal({ p, onClose, onSaved }) {
+  const api = useApi();
+  const { t } = useTranslation();
+  const [v, setV] = useState(() => agyCompactText(p.tuning));
+  const { busy, error, run } = useAction();
+  const [cur] = useLoad(() => api.get(`/agy-profiles/${p.id}/tuning/current`).catch(() => null), [p.id]);
+  const parsed = parseAgyCompact(v);
+  const save = (e) => {
+    e.preventDefault();
+    if (parsed) run(async () => onSaved(await api.put(`/agy-profiles/${p.id}/tuning`, parsed)));
+  };
+  const reset = () => run(async () => onSaved(await api.put(`/agy-profiles/${p.id}/tuning`, {})));
+  const hint = parsed?.compact_tokens ? `= ${parsed.compact_tokens.toLocaleString()} tokens · ${t('tune.agy_compact_hint')}` : t('tune.agy_compact_hint');
+  return (
+    <Modal open onClose={onClose} title={t('tune.title', { name: profileName(t, p, 'agy') })} wide>
+      <form onSubmit={save}>
+        <p className="small muted" style={{ marginTop: 0 }}>
+          {t('tune.intro_agy')}
+        </p>
+        {cur?.raw && (
+          <Note>
+            <b>{t('tune.agy_cur', { v: cur.raw })}</b>
+          </Note>
+        )}
+        <h3 className="tune-head">{t('tune.sec_context')}</h3>
+        <div className="cprof-models">
+          <Field label={t('tune.compact_limit')} hint={hint} error={parsed ? null : t('tune.agy_compact_range')}>
+            <input className="mono" value={v} onChange={(e) => setV(e.target.value)} inputMode="text" spellCheck={false} autoCapitalize="none" placeholder={cur?.raw ? t('tune.from_file', { v: cur.raw }) : t('tune.default')} maxLength={12} />
+          </Field>
+        </div>
+        <p className="small muted">{t('tune.agy_window')}</p>
+        <p className="small muted">{t('tune.agy_applies')}</p>
+        <ErrorNote error={error} />
+        <div className="modal-actions">
+          <Button variant="ghost" onClick={reset} disabled={busy}>
+            {t('tune.reset')}
+          </Button>
+          <Button variant="ghost" onClick={onClose}>
+            {t('action.cancel')}
+          </Button>
+          <Button type="submit" busy={busy} disabled={!parsed}>
+            {t('action.save')}
+          </Button>
+        </div>
+      </form>
+    </Modal>
+  );
+}
+
 /** 列表里那一行底下的摘要：设了哪些 */
 function tuningSummary(t, agent, p) {
   const x = p.tuning;
   if (!x) return [];
+  if (agent === 'agy') return x.compact_tokens || x.compact_pct ? [t('tune.sum_compact', { n: agyCompactText(x) })] : [];
   const api = p.kind === 'api';
   const out = [];
   if (x.context_window && (api || agent === 'codex')) out.push(t('tune.sum_window', { n: tokensText(x.context_window) }));
@@ -905,7 +987,7 @@ function ProfileRow({ agent, p, isDefault, busy, nonce, onDefault, onLogin, onEd
     };
   }, [autoQuery, p.id, agent]);
   const model = agent === 'codex' ? p.model : p.models?.main;
-  const tuned = agent === 'agy' ? [] : tuningSummary(t, agent, p);
+  const tuned = tuningSummary(t, agent, p);
   return (
     <li className={isDefault ? 'cprof-default' : ''}>
       <button
@@ -977,7 +1059,7 @@ function ProfileRow({ agent, p, isDefault, busy, nonce, onDefault, onLogin, onEd
               hasLogin && loggedIn && { icon: LogIn, label: t('cprof.relogin'), onClick: () => onLogin(p) },
               agent === 'agy' && !loggedIn && s && !s.error && { icon: Gauge, label: t('cprof.usage'), onClick: queryUsage },
               !isDefault && { icon: Check, label: t('cprof.make_default'), onClick: () => onDefault(p) },
-              agent !== 'agy' && { icon: SlidersHorizontal, label: t('tune.menu'), hint: t(`tune.menu_hint_${agent}`), onClick: () => onTune(p) },
+              { icon: SlidersHorizontal, label: t('tune.menu'), hint: t(`tune.menu_hint_${agent}`), onClick: () => onTune(p) },
               (p.id !== 'official' || agent === 'claude' || agent === 'agy') && { label: t(p.kind === 'api' ? 'cprof.edit' : 'cprof.rename'), onClick: () => onEdit(p) },
               !(p.id === 'official' && (only || agent === 'codex' || agent === 'agy')) && { label: t(p.id === 'official' ? 'cprof.hide_builtin' : 'action.delete'), danger: true, onClick: () => onRemove(p) },
             ]}
@@ -1100,12 +1182,29 @@ function ProfilesCard({ agent, bare }) {
             ))}
           </ul>
         )}
+        {agent === 'agy' && data && data.profiles.length > 1 && (
+          <label className="row-check small" style={{ display: 'flex', gap: 6, alignItems: 'flex-start', margin: '12px 0 0' }}>
+            <input
+              type="checkbox"
+              checked={!!data.auto_switch}
+              disabled={busy}
+              onChange={(e) =>
+                api
+                  .put(`${cfg.base}/auto-switch`, { on: e.target.checked })
+                  .then(apply)
+                  .catch((x) => toast(errorText(t, x), 'error'))
+              }
+            />
+            <span>{t('aprof.auto_switch')}</span>
+          </label>
+        )}
         <p className="muted small" style={{ margin: '12px 0 0' }}>
           {t(`${cfg.t}.note`)}
         </p>
       </Shell>
       {loggingIn && <LoginModal agent={agent} profile={loggingIn} onClose={loginClosed} />}
-      {form?.kind === 'tune' && <TuningModal agent={agent} p={form.initial} onClose={() => setForm(null)} onSaved={saved} />}
+      {form?.kind === 'tune' &&
+        (agent === 'agy' ? <AgyTuningModal p={form.initial} onClose={() => setForm(null)} onSaved={saved} /> : <TuningModal agent={agent} p={form.initial} onClose={() => setForm(null)} onSaved={saved} />)}
       {form?.kind === 'official' && <OfficialForm agent={agent} initial={form.initial} onClose={() => setForm(null)} onSaved={saved} />}
       {form?.kind === 'api' && data && <ApiForm agent={agent} initial={form.initial} accepted={Boolean(data.accepted_at)} onClose={() => setForm(null)} onSaved={saved} />}
     </div>
@@ -1151,23 +1250,26 @@ function ProfilePick({ agent, client, device, value, onChange, className = 'btn 
   const [data] = useLoad(() => client.get(cfg.base).catch(() => null), [device, agent]);
   // 换了电脑：另选的那个在新电脑上没有就回到默认
   useEffect(() => {
-    if (data && value && !data.profiles.some((p) => p.id === value)) onChange(null);
+    if (data && value && value !== 'auto' && !data.profiles.some((p) => p.id === value)) onChange(null);
   }, [data]);
   if (!data || data.profiles.length < 2) return null;
   const def = data.profiles.find((p) => p.id === data.default) ?? data.profiles[0];
+  // agy 有好几个账号时可以选“自动”：新建时挑额度最多的那个，之后一直用它
+  const auto = agent === 'agy' && value === 'auto';
   const cur = data.profiles.find((p) => p.id === value) ?? def;
   return (
     <PopMenu
       className={className}
-      icon={(p) => <KindIcon p={cur} {...p} />}
-      text={profileName(t, cur, agent)}
+      icon={auto ? Sparkles : (p) => <KindIcon p={cur} {...p} />}
+      text={auto ? t('aprof.auto_short') : profileName(t, cur, agent)}
       label={t(`${cfg.t}.pick_label`)}
       items={[
+        ...(agent === 'agy' ? [{ icon: Sparkles, label: t('aprof.auto'), hint: t('aprof.auto_hint'), checked: auto, onClick: () => onChange('auto') }] : []),
         ...data.profiles.map((p) => ({
           icon: (x) => <KindIcon p={p} {...x} />,
           label: profileName(t, p, agent),
           hint: p.id === def.id ? t('cprof.default') : p.kind === 'api' ? p.base_url : undefined,
-          checked: p.id === cur.id,
+          checked: !auto && p.id === cur.id,
           onClick: () => onChange(p.id === def.id ? null : p.id),
         })),
         'sep',

@@ -391,7 +391,7 @@ fn truthy(v: Option<String>) -> bool {
 }
 
 /// “400k”“1M”“400000”→ token 数（Claude Code 的 `/autocompact`、`CLAUDE_CODE_AUTO_COMPACT_WINDOW` 都认 k/M 后缀）
-fn token_count(s: &str) -> Option<u64> {
+pub(crate) fn token_count(s: &str) -> Option<u64> {
     let s = s.trim().to_ascii_lowercase().replace(['_', ','], "");
     let (num, mul) = match s.chars().last()? {
         'k' => (&s[..s.len() - 1], 1_000.0),

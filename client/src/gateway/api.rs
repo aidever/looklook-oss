@@ -142,6 +142,7 @@ pub fn routes(app: App) -> Router<App> {
         .route("/instances/{id}/chat/tasks", get(super::chat::tasks))
         .route("/instances/{id}/chat/models", get(super::chat::models))
         .route("/instances/{id}/chat/usage", get(super::chat::usage))
+        .route("/instances/{id}/chat/resets", get(super::chat::resets).post(super::chat::use_reset))
         .route("/instances/{id}/chat/worktrees", get(super::chat::worktrees))
         .route("/instances/{id}/chat/worktree", post(super::chat::worktree))
         .route("/instances/{id}/chat/files", get(super::chat::files))
@@ -342,9 +343,12 @@ pub fn routes(app: App) -> Router<App> {
         .route("/claude-profiles/{id}/login/code", post(claude_login_code))
         .route("/agy-profiles", get(get_agy_profiles).post(add_agy_profile))
         .route("/agy-profiles/default", put(set_default_agy_profile))
+        .route("/agy-profiles/auto-switch", put(set_agy_auto_switch))
         .route("/agy-profiles/{id}", put(update_agy_profile).delete(delete_agy_profile))
         .route("/agy-profiles/{id}/status", get(agy_profile_status))
         .route("/agy-profiles/{id}/usage", post(agy_profile_usage))
+        .route("/agy-profiles/{id}/tuning", put(set_agy_tuning))
+        .route("/agy-profiles/{id}/tuning/current", get(agy_tuning_current))
         .route("/agy-profiles/{id}/login", get(agy_login_state).post(login_agy_profile).delete(cancel_agy_login))
         .route("/agy-profiles/{id}/login/code", post(agy_login_code))
         .route("/metrics", get(metrics))
@@ -3290,11 +3294,27 @@ fn agy_profiles_view(app: &App) -> Value {
     json!({
         "default": ap::default_id(&app.store),
         "profiles": profiles,
+        // 额度用完时自动换账号接着（多账号时）
+        "auto_switch": ap::auto_switch(&app.store),
     })
 }
 
 async fn get_agy_profiles(State(app): State<App>) -> Json<Value> {
+    // 有好几个账号时顺便把过时的额度查一下：草稿页选“自动”、额度用完换账号都按查到的额度挑
+    if crate::agy_profiles::list(&app.store).len() > 1 {
+        crate::agy_profiles::refresh_all_soon(&app.store, &app.paths.home);
+    }
     Json(agy_profiles_view(&app))
+}
+
+#[derive(Deserialize)]
+struct AgyAutoSwitchReq {
+    on: bool,
+}
+
+async fn set_agy_auto_switch(State(app): State<App>, Json(req): Json<AgyAutoSwitchReq>) -> R<Json<Value>> {
+    crate::agy_profiles::set_auto_switch(&app.store, req.on)?;
+    Ok(Json(agy_profiles_view(&app)))
 }
 
 #[derive(Deserialize, Default)]
@@ -3327,15 +3347,30 @@ async fn set_default_agy_profile(State(app): State<App>, Json(req): Json<Default
 
 async fn agy_profile_status(State(app): State<App>, Path(id): Path<String>) -> R<Json<Value>> {
     crate::agy_profiles::get(&app.store, &id).ok_or_else(LocalError::not_found)?;
-    Ok(Json(crate::agy_profiles::status(&app.paths.home, app.instances.shell(), &id).await))
+    Ok(Json(crate::agy_profiles::status(&app.store, &app.paths.home, app.instances.shell(), &id).await))
 }
 
 async fn agy_profile_usage(State(app): State<App>, Path(id): Path<String>) -> R<Json<Value>> {
     crate::agy_profiles::get(&app.store, &id).ok_or_else(LocalError::not_found)?;
-    let mut u = crate::agy_profiles::usage(&app.store, &app.paths.home, &id).await;
-    let st = crate::agy_profiles::status(&app.paths.home, app.instances.shell(), &id).await;
+    let mut u = crate::agy_profiles::usage(&app.store, &app.paths.home, app.instances.shell(), &id).await;
+    let st = crate::agy_profiles::status(&app.store, &app.paths.home, app.instances.shell(), &id).await;
     u["status"] = st;
     Ok(Json(u))
+}
+
+/// 模型设置（自动压缩点，见 model_tuning.rs）；本机默认账号也能设。对话模式每轮结束时照它判断，终端里的 agy 新开时带上
+async fn set_agy_tuning(State(app): State<App>, Path(id): Path<String>, Json(req): Json<crate::model_tuning::AgyTuning>) -> R<Json<Value>> {
+    crate::agy_profiles::set_tuning(&app.store, &id, req)?;
+    Ok(Json(agy_profiles_view(&app)))
+}
+
+/// 用户自己的启动环境里设了 `AGY_CLI_AUTO_COMPACT_OVERRIDE` 没有（“模型设置”里不填时 agy 照它）
+async fn agy_tuning_current(State(app): State<App>, Path(id): Path<String>) -> R<Json<Value>> {
+    crate::agy_profiles::get(&app.store, &id).ok_or_else(LocalError::not_found)?;
+    let env = crate::chat::codex_app::user_env(app.instances.shell()).await.unwrap_or_default();
+    let raw = env.into_iter().find(|(k, _)| k == "AGY_CLI_AUTO_COMPACT_OVERRIDE").map(|(_, v)| v);
+    let t = raw.as_deref().and_then(crate::model_tuning::parse_agy_compact).unwrap_or_default();
+    Ok(Json(json!({ "raw": raw, "compact_tokens": t.compact_tokens, "compact_pct": t.compact_pct })))
 }
 
 async fn login_agy_profile(State(app): State<App>, Path(id): Path<String>) -> R<Json<crate::agy_profiles::LoginView>> {

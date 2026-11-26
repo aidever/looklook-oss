@@ -217,26 +217,44 @@ function useSideTabs(id, tab, setTab, chat, frame, enabled = true) {
 /** 带对话界面的 Claude Code 终端（docs/CLAUDE_UI.md） */
 export const hasChat = (inst) => Boolean(CHAT_LAUNCHES.includes(inst?.launch) && inst?.chat_ui);
 
+// 刷新页面时回到刚才那个标签：只记最后选的一个（本标签页的 sessionStorage），页面加载时取出来、用一次就丢
+const TAB_LAST = 'll-tab-last';
+let tabRestore = (() => {
+  try {
+    // 以前按会话永久记在 localStorage，点开很久前切过终端的对话会话会直接进终端：清掉
+    for (let i = localStorage.length - 1; i >= 0; i--) {
+      const k = localStorage.key(i);
+      if (k?.startsWith('ll-tab:')) localStorage.removeItem(k);
+    }
+  } catch {
+    /* 清不了没关系，反正不再读 */
+  }
+  try {
+    return JSON.parse(sessionStorage.getItem(TAB_LAST) ?? 'null');
+  } catch {
+    return null;
+  }
+})();
+
 /**
- * 当前标签，按终端记在浏览器里。带对话界面的终端默认打开“对话”。
+ * 当前标签。每次从会话列表点开都按默认：带对话界面的会话进“对话”，其他进“终端”；
+ * 选过的标签只在这次打开里有效，刷新页面时回到刚才那个。
  * 直接算出来、不靠 effect 改：effect 要等渲染后才改，进对话会话会先闪一帧终端。
  * 还不知道是不是对话会话（`chat` 为 undefined）、也没选过时为 null：页面按应用配色、不显示终端专用的按钮。
  */
 function useTab(id, chat) {
-  const key = `ll-tab:${id}`;
   const [stored, setStored] = useState(() => {
-    try {
-      return localStorage.getItem(key);
-    } catch {
-      return null;
-    }
+    if (tabRestore?.id !== id) return null;
+    const v = tabRestore.tab;
+    tabRestore = null;
+    return typeof v === 'string' ? v : null;
   });
   let tab = stored ?? (chat ? 'chat' : chat === false ? 'term' : null);
   if (tab === 'chat' && chat === false) tab = 'term';
   const setTab = (v) => {
     setStored(v);
     try {
-      localStorage.setItem(key, v);
+      sessionStorage.setItem(TAB_LAST, JSON.stringify({ id, tab: v }));
     } catch {
       /* 存不了就只记在这次打开里 */
     }

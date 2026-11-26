@@ -15,6 +15,10 @@
 //!   - `model_context_window`、`model_auto_compact_token_limit`、`model_reasoning_effort`、`model_reasoning_summary`、`model_verbosity`；
 //!   - 第三方接口：`model_providers.<id>.stream_idle_timeout_ms`（流式回复多久没动静算断了）。
 //!
+//! - **Antigravity（agy 1.5.17 对照）**：上下文窗口由服务器定（1M），能调的只有自动压缩点，
+//!   环境变量 `AGY_CLI_AUTO_COMPACT_OVERRIDE`（`800000`、`800K` 或 `80%`）。只有终端里的 `agy` 认（`/context` 里能看到）；
+//!   `agy acp` 不认，对话模式由看看在一轮结束、上下文到点时替用户发 `/compact`（agy_chat.rs）。
+//!
 //! 数值原样拼进启动命令，所以只收整数和固定的几个词。
 
 use serde::{Deserialize, Serialize};
@@ -208,6 +212,53 @@ impl CodexTuning {
     }
 }
 
+/// Antigravity 的模型设置：只有自动压缩点（都不填 = 照 agy 自己的默认）
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AgyTuning {
+    /// 上下文到多少 token 时自动压缩
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compact_tokens: Option<u64>,
+    /// 或者按窗口的百分之几（和 `compact_tokens` 二选一，都填时按 token）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compact_pct: Option<u64>,
+}
+
+impl AgyTuning {
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    pub fn clean(self) -> Result<Self, LocalError> {
+        // 太小 agy 会坏（12K 时终端里每轮都报 maxMessageTokens must be positive）
+        let tokens = range("compact_tokens", self.compact_tokens, 100_000, 10_000_000)?;
+        let pct = range("compact_pct", self.compact_pct, 20, 95)?;
+        Ok(AgyTuning { compact_tokens: tokens, compact_pct: if tokens.is_some() { None } else { pct } })
+    }
+
+    /// 要设的环境变量
+    pub fn vars(&self) -> Vec<(&'static str, String)> {
+        match (self.compact_tokens, self.compact_pct) {
+            (Some(n), _) => vec![("AGY_CLI_AUTO_COMPACT_OVERRIDE", n.to_string())],
+            (None, Some(p)) => vec![("AGY_CLI_AUTO_COMPACT_OVERRIDE", format!("{p}%"))],
+            _ => vec![],
+        }
+    }
+
+    /// 窗口是 `window` 时在多少 token 压缩（没设是 None）
+    pub fn compact_at(&self, window: Option<u64>) -> Option<u64> {
+        self.compact_tokens.or_else(|| Some(window? * self.compact_pct? / 100))
+    }
+}
+
+/// `AGY_CLI_AUTO_COMPACT_OVERRIDE` 的写法（`800000`、`800K`、`1M`、`80%`）→ 设置
+pub fn parse_agy_compact(v: &str) -> Option<AgyTuning> {
+    let s = v.trim().to_ascii_lowercase();
+    if let Some(p) = s.strip_suffix('%') {
+        return p.trim().parse::<f64>().ok().filter(|p| *p > 0.0 && *p < 100.0).map(|p| AgyTuning { compact_pct: Some(p.round() as u64), ..Default::default() });
+    }
+    crate::chat::models::token_count(&s).map(|n| AgyTuning { compact_tokens: Some(n), ..Default::default() })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -245,4 +296,23 @@ mod tests {
         assert!(CodexTuning { effort: Some("huge".into()), ..Default::default() }.clean().is_err());
         assert!(CodexTuning { context_window: Some(200_000), compact_limit: Some(200_000), ..Default::default() }.clean().is_err());
     }
+
+    #[test]
+    fn agy_compact() {
+        let t = AgyTuning { compact_tokens: Some(800_000), compact_pct: Some(80) }.clean().unwrap();
+        assert_eq!(t, AgyTuning { compact_tokens: Some(800_000), compact_pct: None }, "都填时按 token");
+        assert_eq!(t.vars(), [("AGY_CLI_AUTO_COMPACT_OVERRIDE", "800000".to_string())]);
+        let p = AgyTuning { compact_pct: Some(80), ..Default::default() }.clean().unwrap();
+        assert_eq!(p.vars(), [("AGY_CLI_AUTO_COMPACT_OVERRIDE", "80%".to_string())]);
+        assert_eq!(p.compact_at(Some(1_048_576)), Some(838_860));
+        assert_eq!(p.compact_at(None), None);
+        assert!(AgyTuning { compact_pct: Some(99), ..Default::default() }.clean().is_err());
+        assert!(AgyTuning { compact_tokens: Some(12_000), ..Default::default() }.clean().is_err(), "太小 agy 会坏");
+        assert!(AgyTuning::default().vars().is_empty());
+        assert_eq!(parse_agy_compact("800K"), Some(AgyTuning { compact_tokens: Some(800_000), ..Default::default() }));
+        assert_eq!(parse_agy_compact(" 80% "), Some(AgyTuning { compact_pct: Some(80), ..Default::default() }));
+        assert_eq!(parse_agy_compact("0.5M").and_then(|t| t.compact_tokens), Some(500_000));
+        assert_eq!(parse_agy_compact("lots"), None);
+    }
+
 }

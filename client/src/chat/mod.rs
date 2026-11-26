@@ -562,7 +562,7 @@ impl Chat {
             caps["plan"] = json!(false);
             caps["assistant"] = json!(true);
         }
-        json!({
+        let mut v = json!({
             "agent": inst.agent.launch(),
             "caps": caps,
             "dialog": st.dialog,
@@ -612,7 +612,11 @@ impl Chat {
                 "suggestions": p.suggestions,
                 "guard": p.guard.as_ref().map(|g| &g.hit.rule), "guard_from": p.guard.as_ref().map(GuardWait::view),
             })),
-        })
+        });
+        // agy：上一轮额度用完（换哪个账号接着）、刚自动换过账号（放在 json! 外面：宏展开有递归上限）
+        v["agy_quota"] = json!(st.agy.quota_out);
+        v["agy_switched"] = json!(st.agy.switched);
+        v
     }
 
     fn emit_status(inst: &Inst, st: &State) {
@@ -2985,6 +2989,36 @@ impl Chat {
             return Err(LocalError::new("CHAT_UNAVAILABLE"));
         }
         self.codex_worktree(id, mode, root).await
+    }
+
+    /// 重置卡。Codex：用量里已经带着（`reset_cards`），这里不用查；Claude Code（订阅账号）：在后台终端里查 `/limit-reset`，
+    /// 见 [`crate::claude_resets::status`]。别的（第三方接口、agy）`{ state: "unsupported" }`
+    pub async fn resets(&self, id: &str, force: bool) -> Result<Value, LocalError> {
+        self.require(id)?;
+        if self.is_agy(id) || self.is_codex(id) {
+            return Ok(json!({ "state": "unsupported" }));
+        }
+        let profile = crate::claude_profiles::for_instance(&self.store, id);
+        if profile.kind != crate::claude_profiles::Kind::Official {
+            return Ok(json!({ "state": "unsupported" }));
+        }
+        Ok(crate::claude_resets::status(self.instances.shell(), &self.paths.home, &profile, force).await)
+    }
+
+    /// 用一张重置卡：Codex 时 `card` 是卡的 id（空则由后端挑），Claude Code 时是种类（`fable`/`full`/`5-hour`/`weekly`/`legacy`）
+    pub async fn use_reset(&self, id: &str, card: &str) -> Result<Value, LocalError> {
+        self.require(id)?;
+        if self.is_codex(id) {
+            return self.codex_use_reset(Some(card).filter(|c| !c.is_empty())).await;
+        }
+        if self.is_agy(id) {
+            return Err(LocalError::invalid("agent", "unsupported"));
+        }
+        let profile = crate::claude_profiles::for_instance(&self.store, id);
+        if profile.kind != crate::claude_profiles::Kind::Official {
+            return Err(LocalError::invalid("profile", "unsupported"));
+        }
+        Ok(crate::claude_resets::use_card(self.instances.shell(), &self.paths.home, &profile, card).await)
     }
 
     pub async fn usage(&self, id: &str) -> Result<Value, LocalError> {

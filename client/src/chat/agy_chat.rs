@@ -43,6 +43,9 @@ pub struct Hub {
     stale: std::sync::atomic::AtomicBool,
     /// 最近一次看到的 configOptions（草稿页选模型用）
     last_config: Mutex<Value>,
+    /// 还没对上终端的会话发来的上下文用量：`session/new` 一返回 agy 就报 `{used, size}`，
+    /// 这时会话还没记到 `sessions` 里，先放这里，[`Chat::agy_finish_attach`] 时补上
+    early_usage: Mutex<HashMap<String, (Option<u64>, Option<u64>)>>,
 }
 
 /// agy 这边每个终端多记的状态
@@ -61,6 +64,13 @@ pub struct AgySt {
     pub window: Option<u64>,
     /// 这一轮开始的时间
     turn_at: Option<Instant>,
+    /// 这一轮是手动压缩（`/compact`）
+    compacting: bool,
+    /// 上一轮因为账号额度用完失败了：界面上提示换哪个账号接着（换了、或再发一轮就清掉）
+    pub quota_out: Option<Value>,
+    /// 额度用完时自动换过账号：换到了哪个（界面上提示一下），什么时候换的（短时间内不再自动换，免得几个账号来回换）
+    pub switched: Option<Value>,
+    switched_at: Option<Instant>,
     /// 防止同一个终端并发 attach / load
     attach_lock: Arc<tokio::sync::Mutex<()>>,
 }
@@ -408,7 +418,12 @@ impl Chat {
     /// 完成会话绑定后的公共收尾：设置版本、configOptions、模式，新建会话恢复记住的模型和思考强度
     async fn agy_finish_attach(&self, conn: &AcpConn, inst: &Arc<Inst>, session: &str, gen: u64, r: &Value, is_new: bool) {
         lock(&self.agy.sessions).insert(session.to_string(), inst.id.clone());
+        let early = lock(&self.agy.early_usage).remove(session);
         agy_log::shared(session).lock().unwrap_or_else(|e| e.into_inner()).loaded = true;
+        // 套餐只有这里报（本地文件里没有）：记到账号上，账号页和用量面板显示
+        if let Some(tier) = r["_meta"]["antigravity"]["tier"]["name"].as_str() {
+            crate::agy_profiles::remember_plan(&self.store, &self.agy_profile(&inst.id).id, tier);
+        }
         let conn_ver = lock(&conn.version).clone();
         let config_opt = r.get("configOptions").filter(|c| c.is_array()).cloned();
         if let Some(ref c) = config_opt {
@@ -422,6 +437,10 @@ impl Chat {
             }
             if let Some(c) = config_opt {
                 Self::agy_config(&mut st, c);
+            }
+            if let Some((used, size)) = early {
+                st.agy.window = size.or(st.agy.window);
+                st.context = used.or(st.context);
             }
             if st.phase == Phase::Detached {
                 Self::set_phase(inst, &mut st, Phase::Idle, None);
@@ -618,8 +637,17 @@ impl Chat {
     }
 
     fn agy_update(&self, session: &str, u: &Value) {
-        let Some(inst) = self.agy_inst_of(session) else { return };
         let kind = u["sessionUpdate"].as_str().unwrap_or("");
+        let Some(inst) = self.agy_inst_of(session) else {
+            if kind == "usage_update" && agy_log::valid_session(session) {
+                let mut early = lock(&self.agy.early_usage);
+                if early.len() > 64 {
+                    early.clear();
+                }
+                early.insert(session.to_string(), (u["used"].as_u64(), u["size"].as_u64()));
+            }
+            return;
+        };
         let log = agy_log::shared(session);
         lock(&log).update(u);
         let mut st = lock(&inst.st);
@@ -798,7 +826,13 @@ impl Chat {
         {
             let mut st = lock(&inst.st);
             st.error = None;
+            st.agy.quota_out = None;
+            // 自动换账号后发的那句 continue 之外，用户再发一轮就不用再提示“已换账号”了
+            if text != "continue" {
+                st.agy.switched = None;
+            }
             st.agy.turn_at = Some(Instant::now());
+            st.agy.compacting = text.trim() == "/compact";
             inst.prompts.send_modify(|n| *n += 1);
             Self::set_phase(&inst, &mut st, Phase::Running, None);
         }
@@ -816,7 +850,10 @@ impl Chat {
             return;
         }
         let log = agy_log::shared(session);
-        let next = {
+        // 模型设置里的自动压缩点：agy acp 不认 AGY_CLI_AUTO_COMPACT_OVERRIDE（1.5.17 实测只有终端里的 agy 认），由看看到点替用户发 /compact
+        let tuning = self.agy_profile(&inst.id).tuning;
+        let mut quota_hit = false;
+        let (next, compact_now) = {
             let mut st = lock(&inst.st);
             let ms = st.agy.turn_at.take().map(|t| t.elapsed().as_millis() as u64);
             match &r {
@@ -832,24 +869,47 @@ impl Chat {
                         st.end_hint = Some(super::board::Outcome::Interrupted);
                     }
                     lock(&log).turn_end(stop, None, ms);
+                    // 手动压缩做完：agy 不再报压缩后的上下文（下一轮才报），先当不知道，别还显示压缩前的
+                    if st.agy.compacting && stop == Some("end_turn") {
+                        lock(&log).compacted();
+                        st.context = None;
+                    }
                 }
                 Err(e) => {
                     let why = e.params.get("detail").and_then(Value::as_str).map(String::from).unwrap_or_else(|| e.code.to_string());
                     st.error = Some(why.chars().take(500).collect());
                     lock(&log).turn_end(None, Some(&why), ms);
+                    quota_hit = crate::agy_profiles::quota_error(&why);
                 }
             }
+            let was_compact = std::mem::take(&mut st.agy.compacting);
             Self::drop_pending(&mut st);
             st.last_reply = lock(&log).last_reply();
             let cancelled = matches!(&r, Ok(v) if v["stopReason"].as_str() == Some("cancelled"));
+            let ok = conn.alive() && !cancelled && r.is_ok();
+            // 到了压缩点：先压缩，排着的等压缩完再发
+            let compact_now = ok && !was_compact && tuning.compact_at(st.agy.window).zip(st.context).is_some_and(|(at, used)| used >= at);
             // 进程没了或被停止：排着的留着（可在界面上取回或编辑），正常完成才接着发下一条
-            let next = if conn.alive() && !cancelled && !st.agy.queued.is_empty() { Some(st.agy.queued.remove(0)) } else { None };
-            if next.is_none() {
+            let next = if !compact_now && conn.alive() && !cancelled && !st.agy.queued.is_empty() { Some(st.agy.queued.remove(0)) } else { None };
+            if next.is_none() && !compact_now {
                 Self::set_phase(inst, &mut st, Phase::Idle, None);
             }
             Self::emit_status(inst, &st);
-            next
+            (next, compact_now)
         };
+        if quota_hit {
+            self.agy_quota_out(inst);
+            return;
+        }
+        if compact_now {
+            tracing::info!(id = %inst.id, "agy 上下文到了模型设置里的压缩点，自动压缩");
+            if let Err(e) = self.agy_start_turn(conn.clone(), inst.clone(), "/compact".into(), vec![]) {
+                let mut st = lock(&inst.st);
+                st.error = Some(e.code.to_string());
+                Self::set_phase(inst, &mut st, Phase::Idle, None);
+            }
+            return;
+        }
         if let Some((text, images)) = next {
             self.checkpoint_turn(&inst.id, &text, false).await;
             if let Err(e) = self.agy_start_turn(conn.clone(), inst.clone(), text, images) {
@@ -858,6 +918,51 @@ impl Chat {
                 Self::set_phase(inst, &mut st, Phase::Idle, None);
             }
         }
+    }
+
+    /// 这一轮因为账号额度用完失败：挑一个额度够的账号（同一组模型、两个窗口都 ≥10%，剩得最多的）提示“换到它接着”；
+    /// 开了自动换账号就直接换过去发 continue（同一段对话，见 agy_switch_profile）。10 分钟内自动换过就不再自动换，只提示
+    fn agy_quota_out(&self, inst: &Arc<Inst>) {
+        use crate::agy_profiles as ap;
+        let from = self.agy_profile(&inst.id);
+        // 用完的这个也重新查一下（用量面板上看得到），别的账号过时了也查
+        ap::refresh_all_soon(&self.store, &self.paths.home);
+        let gemini = ap::gemini_model(lock(&inst.st).model.as_deref());
+        let to = ap::best(&self.store, &self.paths.home, gemini, Some(&from.id)).and_then(|(id, left)| ap::get(&self.store, &id).map(|p| (p, left)));
+        let auto = {
+            let mut st = lock(&inst.st);
+            let recent = st.agy.switched_at.is_some_and(|t| t.elapsed() < Duration::from_secs(600));
+            let auto = to.is_some() && ap::auto_switch(&self.store) && !recent && self.instances.container(&inst.id).is_none();
+            st.agy.quota_out = Some(json!({
+                "from": { "id": from.id, "name": from.name },
+                "to": to.as_ref().map(|(p, left)| json!({ "id": p.id, "name": p.name, "email": p.email, "left": left })),
+                "auto": auto,
+            }));
+            if auto {
+                st.agy.switched_at = Some(Instant::now());
+            }
+            Self::emit_status(inst, &st);
+            auto
+        };
+        let (Some((to, _)), true) = (to, auto) else { return };
+        let Some(me) = self.me.upgrade() else { return };
+        let inst = inst.clone();
+        tracing::info!(id = %inst.id, from = %from.id, to = %to.id, "agy 账号额度用完，自动换账号接着");
+        tokio::spawn(async move {
+            match me.agy_switch_profile(&inst.id, &to.id, true).await {
+                Ok(()) => {
+                    let mut st = lock(&inst.st);
+                    st.agy.switched = Some(json!({ "from": { "id": from.id, "name": from.name }, "to": { "id": to.id, "name": to.name, "email": to.email } }));
+                    Self::emit_status(&inst, &st);
+                }
+                Err(e) => {
+                    tracing::warn!(error = ?e, "agy 自动换账号没成");
+                    let mut st = lock(&inst.st);
+                    st.error = Some(e.code.to_string());
+                    Self::emit_status(&inst, &st);
+                }
+            }
+        });
     }
 
     /// 新建会话时带的第一句话、要接着的以前的对话（agy 的对话号就是 ACP 的会话号）
@@ -954,6 +1059,8 @@ impl Chat {
             Self::drop_pending(&mut st);
             st.agy.generation = 0;
             st.error = None;
+            st.agy.quota_out = None;
+            st.agy.switched = None;
             if matches!(st.phase, Phase::Running | Phase::Approval) {
                 Self::set_phase(&inst, &mut st, Phase::Idle, None);
             }
@@ -1046,12 +1153,22 @@ impl Chat {
         let st = lock(&inst.st);
         let u = st.agy.usage;
         let totals = json!({ "input": u.input + u.cache_write, "cache_read": u.cache_read, "output": u.output });
+        // 额度：这个会话用的账号上次查到的（`agy -p /usage`），过时了后台再查
+        let profile = self.agy_profile(id);
+        crate::agy_profiles::refresh_quota_soon(&self.paths.home, &profile.id);
+        let limits = crate::agy_profiles::cached_quota(&profile.id);
+        let email = profile.email.clone().or_else(|| crate::agy_profiles::local_email(&self.paths.home, &profile.id));
+        let account = json!({ "id": profile.id, "name": profile.name, "email": email, "plan": profile.plan });
+        // 自动压缩点：模型设置里设了才知道（没设是 agy 自己的默认，它不报）
+        let compact = profile.tuning.compact_at(st.agy.window).map(|at| json!({ "enabled": true, "at": at, "source": "agy" }));
         json!({
             "model": st.model,
             "context": st.context,
             "window": st.agy.window,
+            "compact": compact,
             "totals": totals,
-            "limits": null,
+            "limits": limits,
+            "account": account,
             "version": st.version,
             "installed": crate::agent_update::installed_version("agy"),
         })
