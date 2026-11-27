@@ -116,7 +116,10 @@
     "cert_read": "读取不到证书文件，请检查本机路径与权限",
     "key_read": "读取不到私钥文件，请检查本机路径与权限",
     "cert_invalid": "不是有效的 PEM 证书或私钥，或两者不匹配",
-    "cert_expired": "这张证书已经过期"
+    "cert_expired": "这张证书已经过期",
+    "port_busy": "这个端口已被其他程序占用，请换一个",
+    "port_denied": "没有权限监听这个端口（例如 1024 以下的特权端口）",
+    "port_unavailable": "这个端口当前无法监听"
   },
   "DEVICE_TIMEOUT": "这台电脑没有及时响应，正在重试",
   "CLIENT_UNREACHABLE": "连不上这台电脑上的看看，它可能已经退出",
@@ -174,7 +177,8 @@
     "public_v4": "公网 IPv4",
     "public_v6": "公网 IPv6",
     "custom_urls": "穿透与加速地址",
-    "tls_cert": "自定义 HTTPS 证书"
+    "tls_cert": "自定义 HTTPS 证书",
+    "listen_port": "监听端口"
   },
   "reason": {
     "MEMBERSHIP_EXPIRED": "会员已到期",

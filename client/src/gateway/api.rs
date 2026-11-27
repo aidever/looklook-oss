@@ -2637,6 +2637,8 @@ fn connection_view(app: &App, peer: Option<Peer>) -> Value {
     let net = crate::rtc::net::NetConfig::load(&app.store);
     json!({
         "port": app.ui_addr.port(),
+        "custom_port": crate::listen::custom_port(&app.store),
+        "listen_override": crate::listen::is_explicit(),
         "allow_lan": acc.allow_lan,
         "lan_ips": crate::gateway::access::own_lan_ips().into_iter().map(|ip| ip.to_string()).collect::<Vec<_>>(),
         "public_direct": dir.enabled,
@@ -2664,6 +2666,10 @@ async fn get_connection(State(app): State<App>, peer: Option<Extension<Peer>>) -
     Ok(Json(connection_view(&app, peer.map(|p| p.0))))
 }
 
+fn deser_opt_opt_i64<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Option<i64>>, D::Error> {
+    Option::<i64>::deserialize(d).map(Some)
+}
+
 #[derive(Deserialize, Default)]
 #[serde(default)]
 struct ConnectionReq {
@@ -2672,9 +2678,27 @@ struct ConnectionReq {
     custom_urls: Option<Vec<String>>,
     tls_cert_path: Option<String>,
     tls_key_path: Option<String>,
+    /// 自定义监听端口：`null` 或 `0` 恢复自动分配，`1..=65535` 固定端口（重启客户端后生效）
+    #[serde(default, deserialize_with = "deser_opt_opt_i64")]
+    custom_port: Option<Option<i64>>,
 }
 
 async fn put_connection(State(app): State<App>, peer: Option<Extension<Peer>>, Json(req): Json<ConnectionReq>) -> R<Json<Value>> {
+    if let Some(cp) = req.custom_port {
+        match cp {
+            None | Some(0) => {
+                crate::listen::set_custom_port(&app.store, None)?;
+            }
+            Some(n) if (1..=65535).contains(&n) => {
+                let p = n as u16;
+                if p != app.ui_addr.port() {
+                    crate::listen::check_available(p).await.map_err(|rule| LocalError::invalid("listen_port", rule))?;
+                }
+                crate::listen::set_custom_port(&app.store, Some(p))?;
+            }
+            Some(_) => return Err(LocalError::invalid("listen_port", "port")),
+        }
+    }
     if let Some(allow_lan) = req.allow_lan {
         let mut c = app.access();
         if c.allow_lan != allow_lan {
@@ -3596,8 +3620,7 @@ async fn update_seen(State(app): State<App>) -> R<Json<Value>> {
 }
 
 /// 重启客户端（命令行 `looklook restart`）。
-async fn restart(State(app): State<App>, Extension(access): Extension<Access>) -> R<Json<Value>> {
-    require_local(&access)?;
+async fn restart(State(app): State<App>) -> R<Json<Value>> {
     app.updater.restart()?;
     Ok(Json(json!({ "pid": std::process::id() })))
 }

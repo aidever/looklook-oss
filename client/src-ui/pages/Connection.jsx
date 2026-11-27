@@ -97,6 +97,113 @@ function WindowsFirewall({ exe }) {
   );
 }
 
+function ListenPort({ data, save, busy, error, clearError, reload }) {
+  const { t } = useTranslation();
+  const toast = useToast();
+  const saved = data.custom_port ? String(data.custom_port) : '';
+  const [val, setVal] = useState(saved);
+  const [restarting, setRestarting] = useState(false);
+
+  useEffect(() => {
+    setVal(data.custom_port ? String(data.custom_port) : '');
+  }, [data.custom_port]);
+
+  const trimmed = val.trim();
+  const parsed = trimmed === '' ? null : /^\d+$/.test(trimmed) ? Number(trimmed) : NaN;
+  const badPort = trimmed !== '' && (!Number.isInteger(parsed) || parsed < 1 || parsed > 65535);
+  const changed = trimmed !== saved;
+  const pendingPort = !data.listen_override && data.custom_port && data.custom_port !== data.port ? data.custom_port : null;
+
+  const modeLabel = data.listen_override
+    ? t('conn_cfg.port_mode_override')
+    : data.custom_port
+      ? t('conn_cfg.port_mode_custom')
+      : t('conn_cfg.port_mode_auto');
+
+  const submit = async (e) => {
+    e.preventDefault();
+    if (badPort || data.listen_override) return;
+    await save({ custom_port: parsed });
+  };
+
+  const doRestart = async () => {
+    if (restarting) return;
+    setRestarting(true);
+    try {
+      await api.post('/restart', {});
+      toast(t('conn_cfg.port_restarting'));
+      const nextPort = pendingPort;
+      if (nextPort && window.location.port === String(data.port)) {
+        const host = window.location.hostname.includes(':') ? `[${window.location.hostname}]` : window.location.hostname;
+        const target = `${window.location.protocol}//${host}:${nextPort}${window.location.pathname}${window.location.search}${window.location.hash}`;
+        setTimeout(() => {
+          window.location.href = target;
+        }, 2000);
+      } else {
+        setTimeout(() => {
+          reload();
+          setRestarting(false);
+        }, 3000);
+      }
+    } catch (err) {
+      setRestarting(false);
+      toast(errorText(t, err));
+    }
+  };
+
+  return (
+    <form className="field" onSubmit={submit}>
+      <b>{t('conn_cfg.port_title')}</b>
+      <span className="field-hint">{t('conn_cfg.port_hint', { port: data.port, mode: modeLabel })}</span>
+      <div className="row">
+        <input
+          value={val}
+          onChange={(e) => {
+            setVal(e.target.value);
+            if (error) clearError();
+          }}
+          className="mono"
+          style={{ maxWidth: 160 }}
+          inputMode="numeric"
+          autoComplete="off"
+          spellCheck={false}
+          disabled={data.listen_override || restarting}
+          placeholder={t('conn_cfg.port_ph', { port: data.port })}
+          aria-label={t('conn_cfg.port_title')}
+          aria-invalid={badPort || error ? 'true' : undefined}
+        />
+        <Button type="submit" busy={busy} disabled={data.listen_override || restarting || !changed || badPort}>
+          {t('action.save')}
+        </Button>
+        {data.custom_port && !data.listen_override && (
+          <Button
+            variant="ghost"
+            busy={busy}
+            disabled={restarting}
+            onClick={() => {
+              if (error) clearError();
+              save({ custom_port: null });
+            }}
+          >
+            {t('conn_cfg.port_auto')}
+          </Button>
+        )}
+      </div>
+      {badPort && <span className="field-error">{t('error:rule.port')}</span>}
+      {!badPort && error && <span className="field-error">{t(`error:rule.${error.params?.rule}`, { defaultValue: errorText(t, error) })}</span>}
+      {data.listen_override && <span className="field-hint">{t('conn_cfg.port_override_hint')}</span>}
+      {pendingPort && (
+        <Note kind="info">
+          {t('conn_cfg.port_pending', { next: pendingPort, cur: data.port })}{' '}
+          <button type="button" className="btn btn-plain" style={{ minHeight: 28, padding: '0 4px' }} disabled={restarting} onClick={doRestart}>
+            {restarting ? t('conn_cfg.port_restarting') : t('conn_cfg.port_restart')}
+          </button>
+        </Note>
+      )}
+    </form>
+  );
+}
+
 function CustomUrls({ urls, save, busy, error, clearError }) {
   const { t } = useTranslation();
   const [val, setVal] = useState('');
@@ -628,6 +735,7 @@ export default function ConnectionCards() {
   const pubEndpoints = (data.endpoints ?? []).filter((e) => e.kind !== 'lan' && e.kind !== 'tunnel');
   const urlError = connAct.error?.params?.field === 'custom_urls' ? connAct.error : null;
   const certError = connAct.error?.params?.field === 'tls_cert' ? connAct.error : null;
+  const portError = connAct.error?.params?.field === 'listen_port' ? connAct.error : null;
   const listError = accessAct.error?.params?.field === 'allowed_ips' ? accessAct.error : null;
   const clashIp = st.ip || net.resolved_v4 || (!isName(net.public_v4 || '') && net.public_v4) || null;
 
@@ -710,6 +818,18 @@ export default function ConnectionCards() {
             </div>
           )}
 
+          <ListenPort
+            data={data}
+            save={saveConn}
+            busy={connAct.busy}
+            error={portError}
+            clearError={() => connAct.setError(null)}
+            reload={() => {
+              load();
+              reload();
+            }}
+          />
+
           <CustomUrls
             urls={data.custom_urls ?? []}
             save={saveConn}
@@ -729,7 +849,7 @@ export default function ConnectionCards() {
             />
             <NetAdvanced net={net} clashIp={clashIp} onSaved={onSavedNet} />
           </More>
-          <ErrorNote error={urlError || certError ? null : connAct.error} />
+          <ErrorNote error={urlError || certError || portError ? null : connAct.error} />
         </Card>
       </div>
 

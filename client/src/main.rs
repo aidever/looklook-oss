@@ -279,6 +279,8 @@ enum AccessCmd {
     Allow { ip: String },
     /// 从白名单移除 / Remove from the whitelist
     Remove { ip: String },
+    /// 自定义监听端口（重启后生效）：如 8080，或 auto 恢复自动 / Custom listening port (takes effect after restart): e.g. 8080, or `auto`
+    Port { value: String },
 }
 
 /// 改了只对新建的连接生效。客户端没在运行时直接改本机设置，下次启动生效。
@@ -1046,6 +1048,36 @@ fn qr_text(url: &str) -> Option<String> {
 
 /// `looklook access`：查看或修改访问控制，然后打印当前状态。
 async fn cli_access(home: &Option<PathBuf>, listen: SocketAddr, action: Option<AccessCmd>) -> Result<()> {
+    if let Some(AccessCmd::Port { value }) = action {
+        let port: Option<u16> = if value.eq_ignore_ascii_case("auto") || value == "0" {
+            None
+        } else {
+            let p: u16 = value.parse().ok().filter(|n| *n > 0).context("端口必须是 1–65535 之间的数字，或 auto / Port must be 1–65535, or `auto`")?;
+            Some(p)
+        };
+        let body = json!({ "custom_port": port });
+        match call(home, listen, "PUT", "/api/connection", Some(body)).await {
+            Ok(v) => {
+                let cur = v["port"].as_u64().unwrap_or(0);
+                match port {
+                    Some(p) if p as u64 == cur => println!("监听端口已固定为 {p} / Listening port fixed to {p}"),
+                    Some(p) => println!("已设置监听端口为 {p}（当前仍运行在 {cur}），运行 looklook restart 生效 / Listening port set to {p} (currently {cur}); run `looklook restart` to apply"),
+                    None => println!("已恢复自动分配端口（当前运行在 {cur}），重启后生效 / Listening port reset to automatic (currently {cur}); takes effect on next restart"),
+                }
+                return Ok(());
+            }
+            Err(e) if e.chain().any(|c| c.is::<reqwest::Error>()) => {
+                let store = Store::open(&Paths::discover(home.clone())?.db())?;
+                listen::set_custom_port(&store, port)?;
+                match port {
+                    Some(p) => println!("已设置监听端口为 {p}，下次启动生效 / Listening port set to {p}; takes effect on next start"),
+                    None => println!("已恢复自动分配端口，下次启动生效 / Listening port reset to automatic; takes effect on next start"),
+                }
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        }
+    }
     let body = match action {
         None => None,
         Some(AccessCmd::Lan { state, .. }) => Some(json!({ "allow_lan": matches!(state, OnOff::On) })),
@@ -1054,6 +1086,7 @@ async fn cli_access(home: &Option<PathBuf>, listen: SocketAddr, action: Option<A
         Some(AccessCmd::Code { action: CodeAction::New }) => Some(json!({ "new_code": true })),
         Some(AccessCmd::Allow { ip }) => Some(json!({ "add_ip": ip })),
         Some(AccessCmd::Remove { ip }) => Some(json!({ "remove_ip": ip })),
+        Some(AccessCmd::Port { .. }) => unreachable!(),
     };
     let v = match body {
         Some(b) => call(home, listen, "PUT", "/api/access", Some(b)).await?,
@@ -1402,6 +1435,10 @@ fn cli_error(code: &str, params: &Value) -> String {
             Some("ip_too_many") => "白名单最多 32 项 / The whitelist holds at most 32 entries".into(),
             Some("rtc_ports") => "端口范围要在 1025–65535 之间，起始不大于结束 / The range must be within 1025–65535, begin ≤ end".into(),
             Some("rtc_ports_span") => "端口范围至少 8 个端口 / The range needs at least 8 ports".into(),
+            Some("port") => "端口必须在 1–65535 之间 / Port must be between 1 and 65535".into(),
+            Some("port_busy") => "这个端口已被其他程序占用，请换一个 / This port is already in use; pick another".into(),
+            Some("port_denied") => "没有权限监听这个端口（例如 1024 以下的特权端口）/ No permission to bind this port (e.g. privileged port below 1024)".into(),
+            Some("port_unavailable") => "这个端口当前无法监听 / This port is unavailable".into(),
             Some("ipv4") => "不是 IPv4 地址 / Not an IPv4 address".into(),
             Some("ipv6") => "不是 IPv6 地址 / Not an IPv6 address".into(),
             Some("host_unusable") => "这个地址连不到（回环、链路本地、组播等）/ This address can't be reached (loopback, link-local, multicast…)".into(),

@@ -8,6 +8,7 @@
 //! `127.0.0.1:端口`，有人应答就当作被占用。
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
@@ -19,8 +20,44 @@ pub const DEFAULT_PORT: u16 = 1234;
 pub const DEFAULT: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), DEFAULT_PORT);
 const STEP: u16 = 10;
 const MAX_TRIES: usize = 200;
-/// 数据库 kv 键：上次用上的管理台端口
+/// 数据库 kv 键：上次用上的管理台端口（自动模式记忆）
 const KEY: &str = "console_port";
+/// 数据库 kv 键：用户自定义的管理台监听端口（空/不存在表示自动分配）
+const CUSTOM_KEY: &str = "custom_port";
+
+/// 本次启动是否通过 `--listen` / `LOOKLOOK_LISTEN` 显式指定了监听地址。
+static EXPLICIT_LISTEN: AtomicBool = AtomicBool::new(false);
+
+pub fn is_explicit() -> bool {
+    EXPLICIT_LISTEN.load(Ordering::Relaxed)
+}
+
+/// 读取用户设置的自定义监听端口；`None` 表示自动分配。
+pub fn custom_port(store: &Store) -> Option<u16> {
+    store.get::<u16>(CUSTOM_KEY).ok().flatten().filter(|p| *p > 0)
+}
+
+/// 保存或清除用户自定义的监听端口（重启客户端后生效）。
+pub fn set_custom_port(store: &Store, port: Option<u16>) -> Result<()> {
+    match port.filter(|p| *p > 0) {
+        Some(p) => store.set(CUSTOM_KEY, &p),
+        None => store.remove(CUSTOM_KEY),
+    }
+}
+
+/// 检查目标端口当前是否可以绑定（供设置界面保存前预检）。
+pub async fn check_available(port: u16) -> std::result::Result<(), &'static str> {
+    let addr = SocketAddr::new(DEFAULT.ip(), port);
+    match try_bind(addr).await {
+        Ok(l) => {
+            drop(l);
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => Err("port_busy"),
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => Err("port_denied"),
+        Err(_) => Err("port_unavailable"),
+    }
+}
 
 /// 依次尝试的端口：从 `start` 开始每次 +10，不超过 65535。
 fn candidates(start: u16) -> impl Iterator<Item = u16> {
@@ -42,8 +79,10 @@ async fn try_bind(addr: SocketAddr) -> std::io::Result<TcpListener> {
     TcpListener::bind(addr).await
 }
 
-/// 选端口并开始监听。`explicit` 为用户指定的地址；否则按记住的端口（没有则 1234）开始找，用上后记下来。
+/// 选端口并开始监听。优先级：`--listen`/`LOOKLOOK_LISTEN` > 设置里的自定义端口 > 自动分配（按记住的端口或 1234 起步）。
+/// 自定义端口不可用时打警告并回退到自动分配，避免桌面端启动失败无法进入界面修改。
 pub async fn bind(explicit: Option<SocketAddr>, store: &Store) -> Result<TcpListener> {
+    EXPLICIT_LISTEN.store(explicit.is_some(), Ordering::Relaxed);
     if let Some(addr) = explicit {
         return match try_bind(addr).await {
             Ok(l) => Ok(l),
@@ -52,6 +91,16 @@ pub async fn bind(explicit: Option<SocketAddr>, store: &Store) -> Result<TcpList
             }
             Err(e) => Err(e).with_context(|| format!("无法监听 {addr}")),
         };
+    }
+    if let Some(port) = custom_port(store) {
+        let addr = SocketAddr::new(DEFAULT.ip(), port);
+        match try_bind(addr).await {
+            Ok(l) => return Ok(l),
+            Err(e) if matches!(e.kind(), std::io::ErrorKind::AddrInUse | std::io::ErrorKind::PermissionDenied) => {
+                tracing::warn!(port, error = %e, "自定义监听端口不可用，临时回退到自动分配端口");
+            }
+            Err(e) => return Err(e).with_context(|| format!("无法监听 {addr}")),
+        }
     }
     let remembered = store.get::<u16>(KEY).ok().flatten().filter(|p| *p > 0);
     let start = remembered.unwrap_or(DEFAULT_PORT);
@@ -120,5 +169,34 @@ mod tests {
         let addr = SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), busy.local_addr().unwrap().port());
         assert!(bind(Some(addr), &store).await.is_err());
         assert_eq!(store.get::<u16>(KEY).unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn custom_port_is_bound_and_falls_back_when_busy() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("db.sqlite")).unwrap();
+        // 找一个空闲端口作为自定义端口
+        let probe = std::net::TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0)).unwrap();
+        let wanted = probe.local_addr().unwrap().port();
+        drop(probe);
+
+        set_custom_port(&store, Some(wanted)).unwrap();
+        assert_eq!(custom_port(&store), Some(wanted));
+        assert!(check_available(wanted).await.is_ok());
+
+        let l = bind(None, &store).await.unwrap();
+        assert_eq!(l.local_addr().unwrap().port(), wanted);
+        assert!(!is_explicit());
+
+        // 占用该端口时，check_available 返回 port_busy，bind 会回退到自动分配而不是直接报错
+        assert_eq!(check_available(wanted).await, Err("port_busy"));
+        let fallback = bind(None, &store).await.unwrap();
+        assert_ne!(fallback.local_addr().unwrap().port(), wanted);
+        drop(fallback);
+        drop(l);
+
+        // 清除自定义端口后恢复自动模式
+        set_custom_port(&store, None).unwrap();
+        assert_eq!(custom_port(&store), None);
     }
 }

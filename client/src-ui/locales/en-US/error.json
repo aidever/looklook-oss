@@ -116,7 +116,10 @@
     "cert_read": "could not read the certificate file; check the local path and permissions",
     "key_read": "could not read the private key file; check the local path and permissions",
     "cert_invalid": "is not a valid PEM certificate / private key pair",
-    "cert_expired": "has already expired"
+    "cert_expired": "has already expired",
+    "port_busy": "is already in use by another program; pick another",
+    "port_denied": "requires elevated privileges to bind (e.g. ports below 1024)",
+    "port_unavailable": "cannot be bound right now"
   },
   "DEVICE_TIMEOUT": "This computer didn't answer in time; retrying",
   "CLIENT_UNREACHABLE": "Can't reach Looklook on this computer; it may have quit",
@@ -174,7 +177,8 @@
     "public_v4": "Public IPv4",
     "public_v6": "Public IPv6",
     "custom_urls": "Tunnel & direct addresses",
-    "tls_cert": "Custom HTTPS certificate"
+    "tls_cert": "Custom HTTPS certificate",
+    "listen_port": "Listening port"
   },
   "reason": {
     "MEMBERSHIP_EXPIRED": "membership expired",
