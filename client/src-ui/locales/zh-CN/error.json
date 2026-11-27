@@ -109,7 +109,14 @@
     "rtc_ports": "端口要在 1025–65535 之间，起始不大于结束",
     "rtc_ports_span": "至少要 8 个端口",
     "ipv4": "不是 IPv4 地址或域名",
-    "ipv6": "不是 IPv6 地址或域名"
+    "ipv6": "不是 IPv6 地址或域名",
+    "url_format": "格式不正确，例如 https://code.example.com 或 home.example.com:1234",
+    "url_too_many": "最多添加 16 条地址",
+    "cert_pair": "证书文件和私钥文件需要同时填写",
+    "cert_read": "读取不到证书文件，请检查本机路径与权限",
+    "key_read": "读取不到私钥文件，请检查本机路径与权限",
+    "cert_invalid": "不是有效的 PEM 证书或私钥，或两者不匹配",
+    "cert_expired": "这张证书已经过期"
   },
   "DEVICE_TIMEOUT": "这台电脑没有及时响应，正在重试",
   "CLIENT_UNREACHABLE": "连不上这台电脑上的看看，它可能已经退出",
@@ -165,7 +172,9 @@
     "resume": "要接着的对话",
     "rtc_ports": "传输端口范围",
     "public_v4": "公网 IPv4",
-    "public_v6": "公网 IPv6"
+    "public_v6": "公网 IPv6",
+    "custom_urls": "穿透与加速地址",
+    "tls_cert": "自定义 HTTPS 证书"
   },
   "reason": {
     "MEMBERSHIP_EXPIRED": "会员已到期",
@@ -339,9 +348,8 @@
   "PLUGIN_FAILED": "插件操作没成功：{{detail}}",
   "CLAUDE_CLI_TIMEOUT": "Claude Code 命令太久没有完成",
   "AGENT_EXISTS": "已经有同名的子代理了",
-  "MEMORY_TOO_LONG": "一条最多 600 字，只留以后用得上的，不相干的分成几条",
-  "MEMORY_TITLE_LONG": "标题最多 80 字",
-  "MEMORY_EMPTY": "标题和内容都要填",
+  "MEMORY_TOO_LONG": "一页最多 8,000 字，太长就分成几页",
+  "MEMORY_EMPTY": "名字和内容都要填",
   "MEMORY_SECRET": "看起来像密钥、令牌或密码，记忆里不存这些",
   "MEMORY_UNDO_LATER": "这条之后又改过，先撤销后面那次",
   "MEMORY_UNDONE": "已经撤销过了",
@@ -373,5 +381,9 @@
   "ENCODING_UNMAPPABLE": "“{{char}}” 没法用 {{encoding}} 编码保存",
   "SITE_EXPIRED": "预览已过期，请重新打开",
   "ARCHIVE_BAD": "压缩包损坏或者读不出来",
-  "ARCHIVE_UNSUPPORTED": "不支持这种压缩包"
+  "ARCHIVE_UNSUPPORTED": "不支持这种压缩包",
+  "MEMORY_EXISTS": "已经有同名的一页了",
+  "MEMORY_STALE": "这页刚被改过，刷新看看再改",
+  "MEMORY_BAD_NAME": "名字不能带 / \\ 这类符号",
+  "MEMORY_FULL": "记忆已经有 150 页了，先删掉些不用的"
 }

@@ -40,9 +40,9 @@ const TITLE_WAIT: Duration = Duration::from_secs(60);
 /// 起来后这么快就退出的算“起不来”（没登录、参数不认、程序坏了），界面上显示原因，不自动重起
 const QUICK_EXIT: Duration = Duration::from_secs(15);
 /// 额度用完后等重置自动继续：到了重置时间再多等这么久才发 continue（重置时间是整点，留点余量）
-const LIMIT_SLACK_MS: i64 = 60_000;
+pub(super) const LIMIT_SLACK_MS: i64 = 60_000;
 /// 不知道什么时候重置（第三方接口多半不给）：过这么久试一次，还没重置会再失败，下次多等一些（10、20、40 分钟，之后每小时）
-const LIMIT_RETRY_MS: [i64; 4] = [10 * 60_000, 20 * 60_000, 40 * 60_000, 60 * 60_000];
+pub(super) const LIMIT_RETRY_MS: [i64; 4] = [10 * 60_000, 20 * 60_000, 40 * 60_000, 60 * 60_000];
 /// 等重置时隔这么久看一次用量：没到点但额度已经回来了（比如等着 5 小时窗口，周额度提前刷新了；官方提前重置）就提前继续
 const LIMIT_POLL_MS: i64 = 10 * 60_000;
 
@@ -1603,7 +1603,7 @@ fn is_expired_text(s: &str) -> bool {
 /// 报错原文里写的重置时间（Unix 秒），过去的不算：
 /// `Claude AI usage limit reached|1730000000`、`您的限额将在 2025-08-23 21:40:58 重置`、`resets at 2025-08-23T13:40:58Z`。
 /// 不带时区的：中文的按北京时间（国内服务商），别的按 UTC
-fn reset_in_text(s: &str, now: i64) -> Option<i64> {
+pub(super) fn reset_in_text(s: &str, now: i64) -> Option<i64> {
     if let Some(t) = s.split('|').nth(1).and_then(|x| x.trim().get(..10)).and_then(|x| x.parse::<i64>().ok()).filter(|&t| t > now) {
         return Some(t);
     }

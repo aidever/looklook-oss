@@ -37,6 +37,24 @@ export function LaunchIcon({ launch, size = 16, className = '', mono = false }) 
   return <Icon className={className} size={size} aria-hidden="true" />;
 }
 
+/** Gemini 主题的四角星（蓝→紫→粉渐变，每个实例独立渐变 id，避免被隐藏时串掉）。 */
+export function GeminiSparkle({ size = 16, className = '' }) {
+  const uid = useId().replace(/[^a-zA-Z0-9_-]/g, '');
+  const gradId = `ll-gemini-grad-${uid}`;
+  return (
+    <svg className={`brand-icon gemini-sparkle ${className}`} width={size} height={size} viewBox="0 0 24 24" aria-hidden="true">
+      <defs>
+        <linearGradient id={gradId} x1="2" y1="2" x2="22" y2="22" gradientUnits="userSpaceOnUse">
+          <stop offset="0%" stopColor="#4285F4" />
+          <stop offset="52%" stopColor="#9B72CB" />
+          <stop offset="100%" stopColor="#D96570" />
+        </linearGradient>
+      </defs>
+      <path d="M12 1.5C12.55 7.45 16.55 11.45 22.5 12C16.55 12.55 12.55 16.55 12 22.5C11.45 16.55 7.45 12.55 1.5 12C7.45 11.45 11.45 7.45 12 1.5Z" fill={`url(#${gradId})`} />
+    </svg>
+  );
+}
+
 /**
  * 会话的图标：在跑的工具的图标；AI 工具在终端里跑（不是对话界面）时右下角加一个终端小角标，
  * 免得终端里的 Codex 和对话界面的 Codex 看起来一样。悬停说明是哪一种。

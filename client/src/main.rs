@@ -57,6 +57,7 @@ mod metrics;
 mod model;
 mod model_presets;
 mod model_tuning;
+mod model_test;
 mod notify;
 mod office;
 mod fsview;

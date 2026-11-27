@@ -16,7 +16,7 @@ pub const THEMES: &[&str] = &["tangerine", "lagoon", "sunset", "mint", "agent", 
 const DEFAULT_THEME: &str = "tangerine";
 /// 在电脑之间同步的设置项（docs/SETTINGS_SYNC.md §4.1）：值只以同步记录为准（settings_sync.rs），
 /// `kv.settings` 里也留一份，只是给降级到旧版本时读。其余字段和这台电脑的路径、环境有关，不同步。
-pub const SYNCED: &[&str] = &["theme", "font", "font_size", "default_full_access", "attach_days", "idle_stop_days"];
+pub const SYNCED: &[&str] = &["theme", "font", "font_size", "default_full_access", "attach_days", "idle_stop_days", "claude_link_guard"];
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
@@ -57,6 +57,10 @@ pub struct Settings {
     /// 社区实测 `sdk-*` 入口的 5 小时额度扣得更快（anthropics/claude-code#97074），官方没有表态，所以让用户自己选。见 docs/CLAUDE_SDK.md「入口名」
     #[serde(default)]
     pub claude_entrypoint: bool,
+    /// Claude 相关域名链接风控拦截（默认开启）：命中 claude.ai / claude.com / anthropic.com 等域名时
+    /// 以红色警告 UI 展示，复制链接提示勿发飞书等会预读网址的应用，本机打开需二次确认。
+    /// 没有字段级的 serde 默认：缺这个字段时取 `Settings::default()` 的 true。
+    pub claude_link_guard: bool,
 }
 
 impl Default for Settings {
@@ -77,6 +81,7 @@ impl Default for Settings {
             termd_rev: TERMD_REV,
             native_terminal: String::new(),
             claude_entrypoint: false,
+            claude_link_guard: true,
         }
     }
 }
@@ -311,6 +316,9 @@ mod tests {
         assert!(!off.migrated().termd);
         let missing: Settings = serde_json::from_str(r#"{}"#).unwrap();
         assert!(missing.termd);
+        assert!(missing.claude_link_guard);
+        let guard_off: Settings = serde_json::from_str(r#"{"claude_link_guard":false}"#).unwrap();
+        assert!(!guard_off.claude_link_guard);
         let light: Settings = serde_json::from_str(r#"{"theme":"light"}"#).unwrap();
         assert_eq!(light.migrated().theme, "light", "自己选的浅色不动");
         // 之后又自己选回 agent / dark / lagoon 并保存：保留

@@ -105,131 +105,6 @@ export function usePop() {
   return { open, setOpen, ref };
 }
 
-// 连这台电脑“只直连”：不用中转，本地端口第一个包就发往那台电脑，开着 Clash/mihomo TUN 时按那台电脑 IP 写的代理规则
-// 才生效（平时第一个包是发往中转的 STUN，端口被定成直连）；连不上自动改按平常连。
-// 网页记在浏览器里（启动页 __llrtc.directOnly），本机 App 记在本机（PUT /api/rtc/direct-only）；按电脑分开记。
-let directOnlyList = null;
-async function directOnlyGet(device) {
-  if (rtcMode) {
-    const r = window.top.__llrtc;
-    return typeof r?.directOnly === 'function' ? Boolean(r.directOnly(device)) : null;
-  }
-  directOnlyList ??= (await localApi.get('/rtc/direct-only'))?.items ?? [];
-  return directOnlyList.includes(device);
-}
-
-function DirectOnlyRow({ device, fellBack, kind }) {
-  const { t } = useTranslation();
-  const [on, setOn] = useState(null);
-  const [busy, setBusy] = useState(false);
-  useEffect(() => {
-    let alive = true;
-    directOnlyGet(device)
-      .then((v) => alive && setOn(v))
-      .catch(() => {});
-    return () => {
-      alive = false;
-    };
-  }, [device]);
-  if (on == null) return null;
-  const toggle = async (e) => {
-    const v = e.target.checked;
-    setBusy(true);
-    try {
-      // 网页：只重连这台电脑（不重载整页，不影响其他电脑）；本机 App：断开到这台电脑的连接，下个请求按新设置连
-      if (rtcMode) {
-        window.top.__llrtc.setDirectOnly(device, v);
-        setOn(v);
-        setTimeout(() => load(), 1500);
-      } else {
-        directOnlyList = (await localApi.put('/rtc/direct-only', { device, on: v }))?.items ?? null;
-        setOn(v);
-        load();
-      }
-    } finally {
-      setBusy(false);
-    }
-  };
-  return (
-    <>
-      <dt>{t('path.direct_only')}</dt>
-      <dd>
-        <label style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-          <input type="checkbox" checked={on} disabled={busy} onChange={toggle} />
-          {t('path.direct_only_label')}
-        </label>
-        {on && fellBack && (
-          <span className="small" style={{ display: 'block', color: 'var(--warn)' }}>
-            {t(kind === 'p2p' || kind === 'lan' ? 'path.direct_only_fell_back_p2p' : 'path.direct_only_fell_back')}
-          </span>
-        )}
-        <span className="muted small" style={{ display: 'block' }}>
-          {t('path.direct_only_hint')}
-        </span>
-      </dd>
-    </>
-  );
-}
-
-// 填了公网地址后在输入框下面小字问一句要不要“只直连”（不弹窗、能关掉，关掉后不再问）。
-// 正经由 WebRTC 连着这台电脑（网页远程，或本机 App 连其他电脑）就能直接开；在它本机上改的，只说去哪里开。
-const NUDGE_KEY = 'looklook.direct-only-nudge-off';
-export function DirectOnlyNudge({ device }) {
-  const { t } = useTranslation();
-  const all = usePaths();
-  const connected = Boolean(device && all[device]);
-  const [on, setOn] = useState(null);
-  const [off, setOff] = useState(() => {
-    try {
-      return localStorage.getItem(NUDGE_KEY) === '1';
-    } catch {
-      return false;
-    }
-  });
-  useEffect(() => {
-    if (!connected) return undefined;
-    let alive = true;
-    directOnlyGet(device)
-      .then((v) => alive && setOn(v))
-      .catch(() => {});
-    return () => {
-      alive = false;
-    };
-  }, [device, connected]);
-  if (off || on) return null;
-  const dismiss = () => {
-    try {
-      localStorage.setItem(NUDGE_KEY, '1');
-    } catch {}
-    setOff(true);
-  };
-  const enable = async () => {
-    if (rtcMode) window.top.__llrtc.setDirectOnly(device, true);
-    else {
-      directOnlyList = (await localApi.put('/rtc/direct-only', { device, on: true }))?.items ?? null;
-      setOn(true);
-      load();
-    }
-  };
-  return (
-    <span className="field-hint" style={{ display: 'block' }}>
-      {connected && on === false ? (
-        <>
-          {t('path.direct_only_nudge')}{' '}
-          <button type="button" className="link-button" onClick={enable}>
-            {t('path.direct_only_enable')}
-          </button>
-        </>
-      ) : (
-        t('path.direct_only_nudge_elsewhere')
-      )}{' '}
-      <button type="button" className="link-button muted" onClick={dismiss} aria-label={t('path.direct_only_nudge_off')} title={t('path.direct_only_nudge_off')}>
-        ×
-      </button>
-    </span>
-  );
-}
-
 // 走中转时，按那台电脑自己测的网络类型（docs/08 的 reach）说一句为什么没直连；其余档位不说
 const RELAY_REACH = new Set(['relay_only', 'wrong_addr', 'partial', 'proxy']);
 
@@ -254,8 +129,7 @@ function ReconnectButton({ device, isRelay }) {
   );
 }
 
-/** 连接的详情（放在 `dl.kv` 里）：延迟、丢包率、连接方式（带一句说明）、两端地址。`ms` 不给时用路径自己的往返时间。
- * `device`：给了就加“只直连”开关与单设备重连按钮。 */
+/** 连接的详情（放在 `dl.kv` 里）：延迟、丢包率、连接方式（带一句说明）、两端地址。`ms` 不给时用路径自己的往返时间。 */
 export function PathRows({ p, ms = p?.rtt_ms ?? null, device = null }) {
   const { t } = useTranslation();
   return (
@@ -291,8 +165,6 @@ export function PathRows({ p, ms = p?.rtt_ms ?? null, device = null }) {
           </dd>
         </>
       )}
-      {/* “只直连”是 WebRTC 的选项：走公网 HTTPS 直连时不用 */}
-      {device && p?.kind !== 'https' && <DirectOnlyRow device={device} fellBack={Boolean(p?.direct_fallback)} kind={p?.kind} />}
     </>
   );
 }

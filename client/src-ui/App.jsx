@@ -71,21 +71,19 @@ export function webUrl(status, path) {
   return `${(status?.account?.server ?? '').replace(/\/$/, '')}${path}`;
 }
 
-/** 安全提醒：有公网 IP 的机器不要把管理台端口开放到公网。允许了其他设备却没开访问码时换成红色并说明。
- *  设置页（full）显示全文；登录页、首页只在真有风险（放开了其他设备、又没开访问码）时折叠成一行出现——
- *  安全的状态（只有这台电脑能打开）不用黄色警告去打扰人。 */
+/** 安全提醒：白名单允许了外部地址却没开访问码时提醒开启访问码；局域网直连默认免输访问码不打扰首页。 */
 export function SafetyNote({ full = false }) {
   const { t } = useTranslation();
   const { status } = useStatus();
   const c = status?.console;
   if (!c) return null;
   const open = c.allow_lan || c.allowed_ips > 0;
-  const risky = open && !c.code_enabled;
-  const state = risky ? 'open_no_code' : open ? 'open' : 'local_only';
+  const risky = c.allowed_ips > 0 && !c.code_enabled;
+  const state = risky ? 'open_no_code' : open ? (c.code_enabled ? 'open' : 'lan_no_code') : 'local_only';
   if (!full) {
     if (!risky) return null;
     return (
-      <FoldNote kind={risky ? 'error' : 'warn'} summary={`${t('safety.title')} · ${t(`safety.short.${state}`)}`}>
+      <FoldNote kind="warn" summary={`${t('safety.title')} · ${t(`safety.short.${state}`)}`}>
         <p>{t(`safety.${state}`)}</p>
         <p>{t('safety.body', { port: c.port })}</p>
       </FoldNote>
@@ -94,10 +92,9 @@ export function SafetyNote({ full = false }) {
   // 只有这台电脑能打开：没什么要提醒的
   if (!open) return null;
   return (
-    <Note kind={risky ? 'error' : 'warn'}>
+    <Note kind={risky ? 'warn' : 'info'}>
       <b>{t('safety.title')}</b>
-      <span style={{ display: 'block' }}>{t('safety.body', { port: c.port })}</span>
-      <span style={{ display: 'block', marginTop: 4 }}>{t(risky ? 'safety.open_no_code' : open ? 'safety.open' : 'safety.local_only')}</span>
+      <span style={{ display: 'block' }}>{t(`safety.${state}`)}</span>
     </Note>
   );
 }
@@ -428,7 +425,7 @@ function NavRail({ path, onPane }) {
   const asst = useAssistantSummary();
   return (
     <nav className="rail" aria-label={t('nav.main')}>
-      <Link to="/assistant" className="rail-brand" aria-label={t('asst.title')} title={t('asst.title')}>
+      <Link to="/" className="rail-brand" aria-label={t('brand')} title={t('brand')}>
         <BrandMark size={30} />
       </Link>
       {/* 助理：比会话高一级，一个入口说话，它自己派活（docs/ASSISTANT.md） */}
@@ -542,7 +539,7 @@ function PaneNav({ path }) {
   return (
     <div className="spane-nav">
       <div className="spane-top">
-        <Link to="/assistant" className="spane-brand" aria-label={t('asst.title')} title={t('asst.title')}>
+        <Link to="/" className="spane-brand" aria-label={t('brand')} title={t('brand')}>
           <BrandMark size={26} />
           <span>{t('brand')}</span>
         </Link>
@@ -682,29 +679,23 @@ function MobileTabs({ path }) {
 }
 
 /**
- * 打开看看时停在首页：助理开着就进助理（它比会话高一级，是首页）；没开助理时，电脑上有最近打开过、还在的会话就回到它
+ * 打开看看时停在首页，不自动跳去助理（助理入口在会话栏最上面和手机底栏）。电脑上有最近打开过、还在的会话就回到它
  * （会话为主 P2），手机上就是会话列表。只在刚打开时做一次；之后点“新会话”来到首页照常是草稿。
  */
-// 整个页面生命周期只做一次：手机上进终端页（/t/）会卸掉 ConsoleLayout，返回时重新挂载，不能再当成“刚打开”又跳去助理
+// 整个页面生命周期只做一次：手机上进终端页（/t/）会卸掉 ConsoleLayout，返回时重新挂载，不能再当成“刚打开”
 let resumed = false;
 function useResumeLast(path) {
   const sessions = useSessions();
   const ui = useSessionUi();
-  const asst = useAssistantSummary();
-  const { navigate } = useRouter();
   const first = useRef(path);
   useEffect(() => {
-    if (resumed || sessions.loading || !asst.loaded) return;
+    if (resumed || sessions.loading) return;
     resumed = true;
     if (first.current !== '/' || path !== '/' || window.location.search) return;
-    if (asst.enabled) {
-      navigate('/assistant', { replace: true });
-      return;
-    }
     if (!opensInPage()) return;
     const last = sessions.recent.find((id) => sessions.byId(id));
     if (last) ui.openSession(last);
-  }, [sessions.loading, asst.loaded, path]);
+  }, [sessions.loading, path]);
 }
 
 function ConsoleLayout({ path, stale, children }) {
@@ -783,7 +774,7 @@ function ConsoleLayout({ path, stale, children }) {
       </div>
       {/* 手机上的顶栏；电脑上这些都在图标栏里 */}
       <header className="topbar topbar-console">
-        <Link to="/assistant" className="brand">
+        <Link to="/" className="brand">
           <BrandMark />
           <span className="brand-text">{t('brand')}</span>
         </Link>

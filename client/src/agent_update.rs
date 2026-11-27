@@ -211,13 +211,7 @@ pub async fn installed(shell: &str) -> BTreeMap<&'static str, Option<Installed>>
     if d.agy.is_none() {
         d.agy = crate::agents::agy_fallback();
     }
-    let mut out = BTreeMap::new();
-    for tool in AGENTS {
-        let path = match tool {
-            "claude" => d.claude.clone(),
-            "codex" => d.codex.clone(),
-            _ => d.agy.clone(),
-        };
+    let probe = |tool: &'static str, path: Option<String>| async move {
         let found = match path {
             Some(p) => {
                 let mut i = locate(tool, Path::new(&p));
@@ -228,9 +222,10 @@ pub async fn installed(shell: &str) -> BTreeMap<&'static str, Option<Installed>>
             }
             None => None,
         };
-        out.insert(tool, found);
-    }
-    out
+        (tool, found)
+    };
+    let (c, x, a) = tokio::join!(probe("claude", d.claude), probe("codex", d.codex), probe("agy", d.agy));
+    BTreeMap::from([c, x, a])
 }
 
 /// 更新用的命令：`(界面上显示的, 交给 shell 跑的)`；这种装法不能由看看更新时 None

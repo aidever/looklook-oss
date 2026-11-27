@@ -29,7 +29,12 @@ const QUEUE_LIMIT: usize = 20;
 /// 缓存的 configOptions 存在数据库的键（草稿页用）
 const LAST_CONFIG_KEY: &str = "agy.last_config";
 /// 思考强度通用档位（模型选项里没带时兜底）
-pub(super) const EFFORTS: &[&str] = &["low", "medium", "high"];
+pub(crate) const EFFORTS: &[&str] = &["low", "medium", "high"];
+
+/// 存“额度重置后自动继续” `{ at, guess }` 的键（at：Unix 毫秒）
+pub(super) fn limit_key(id: &str) -> String {
+    format!("agy.limit_resume.{id}")
+}
 
 #[derive(Default)]
 pub struct Hub {
@@ -71,6 +76,14 @@ pub struct AgySt {
     /// 额度用完时自动换过账号：换到了哪个（界面上提示一下），什么时候换的（短时间内不再自动换，免得几个账号来回换）
     pub switched: Option<Value>,
     switched_at: Option<Instant>,
+    /// 额度用完、在等重置后自动发 continue：到这个时间（Unix 毫秒）发（[`Chat::agy_limit_tick`]）。存在数据库里，客户端重启后接着等
+    pub limit_resume: Option<i64>,
+    /// 等到的时间是猜的：报错和额度里都没说什么时候重置
+    pub limit_guess: bool,
+    /// 猜着等了几次还是用完（每次多等一会儿）；好好做完一轮清零
+    limit_tries: u8,
+    /// 到点了、正在发 continue
+    limit_firing: bool,
     /// 防止同一个终端并发 attach / load
     attach_lock: Arc<tokio::sync::Mutex<()>>,
 }
@@ -403,11 +416,8 @@ impl Chat {
         if has_binding {
             let (me, id, inst) = (self.clone(), id.to_string(), inst.clone());
             tokio::spawn(async move {
-                match me.agy_attach(&id).await {
-                    Ok(_) => {
-                        let _ = inst.tx.send(super::Event::Reset);
-                    }
-                    Err(e) => Self::agy_attach_failed(&inst, &e),
+                if let Err(e) = me.agy_attach(&id).await {
+                    Self::agy_attach_failed(&inst, &e);
                 }
             });
         } else if let Err(e) = self.agy_attach(id).await {
@@ -448,6 +458,7 @@ impl Chat {
             st.error = None;
             Self::emit_status(inst, &st);
         }
+        let _ = inst.tx.send(super::Event::Reset);
         // 权限模式：看看记着的（客户端重启后接着用）；没记过时“全部权限”打开的终端用全部权限
         let mode = self.store.get::<String>(&mode_key(&inst.id)).ok().flatten().or_else(|| self.instances.opts(&inst.id).full_access.then(|| "bypassPermissions".to_string()));
         if let Some(m) = mode {
@@ -520,6 +531,7 @@ impl Chat {
                 // 先对上终端再加载：重放的 `session/update` 才记得进来
                 lock(&self.agy.sessions).insert(s.clone(), id.to_string());
                 agy_log::shared(&s).lock().unwrap_or_else(|e| e.into_inner()).clear();
+                Self::emit_status(&inst, &lock(&inst.st));
                 match conn.call("session/load", json!({ "sessionId": s, "cwd": row.workdir, "mcpServers": [] })).await {
                     Ok(r) => Some(r),
                     Err(e) => {
@@ -564,6 +576,10 @@ impl Chat {
             let old = st.binding.as_ref().map(|b| b.session_id.clone()).filter(|s| s != session);
             if st.binding.as_ref() != Some(&b) {
                 let _ = self.store.set(&super::binding_key(&inst.id), &b);
+                // 换了一段对话：上一段在等额度重置自动继续的不等了（下面 st.agy 整个换新，数据库里记着的也删掉）
+                if st.agy.limit_resume.is_some() {
+                    let _ = self.store.remove(&limit_key(&inst.id));
+                }
                 st.binding = Some(b);
                 let queued = std::mem::take(&mut st.agy.queued);
                 let attach_lock = st.agy.attach_lock.clone();
@@ -614,6 +630,9 @@ impl Chat {
                 Incoming::Permission { id, params } => {
                     let (me, conn) = (self.clone(), conn.clone());
                     tokio::spawn(async move { me.agy_permission(&conn, id, params).await });
+                }
+                Incoming::Mark(done) => {
+                    let _ = done.send(());
                 }
                 Incoming::Closed => break,
             }
@@ -792,6 +811,12 @@ impl Chat {
                     self.agy_finish_attach(&conn, &inst, &sid, gen, &r, true).await;
                 }
             }
+            {
+                // 换了一段对话：上一段的额度用完提示、等着自动继续的都不算了
+                let mut st = lock(&inst.st);
+                st.agy.quota_out = None;
+                self.agy_limit_set(&inst, &mut st, None);
+            }
             let _ = inst.tx.send(super::Event::Reset);
             return Ok(json!({ "delivered": true }));
         }
@@ -827,6 +852,8 @@ impl Chat {
             let mut st = lock(&inst.st);
             st.error = None;
             st.agy.quota_out = None;
+            // 在等额度重置自动继续：发了这一轮就不用等了（又用完的话这一轮结束时重新等）
+            self.agy_limit_set(&inst, &mut st, None);
             // 自动换账号后发的那句 continue 之外，用户再发一轮就不用再提示“已换账号”了
             if text != "continue" {
                 st.agy.switched = None;
@@ -849,10 +876,13 @@ impl Chat {
         if Self::agy_session(inst).as_deref() != Some(session) {
             return;
         }
+        // 这一轮最后几段回复（额度用完的 ⚠ 那句就在这里）先记进来再收尾
+        conn.settled().await;
         let log = agy_log::shared(session);
         // 模型设置里的自动压缩点：agy acp 不认 AGY_CLI_AUTO_COMPACT_OVERRIDE（1.5.17 实测只有终端里的 agy 认），由看看到点替用户发 /compact
         let tuning = self.agy_profile(&inst.id).tuning;
-        let mut quota_hit = false;
+        // 这一轮因为账号额度用完停了：报错原文（里面多半写着多久后重置）
+        let mut quota: Option<String> = None;
         let (next, compact_now) = {
             let mut st = lock(&inst.st);
             let ms = st.agy.turn_at.take().map(|t| t.elapsed().as_millis() as u64);
@@ -867,6 +897,9 @@ impl Chat {
                     let stop = v["stopReason"].as_str();
                     if stop == Some("cancelled") {
                         st.end_hint = Some(super::board::Outcome::Interrupted);
+                    } else {
+                        // agy 把额度用完当成最后一段回复（`⚠ Individual quota reached… Resets in 58m39s.`）发来，这一轮照常结束
+                        quota = lock(&log).turn_tail_text().and_then(crate::agy_profiles::quota_reply).map(String::from);
                     }
                     lock(&log).turn_end(stop, None, ms);
                     // 手动压缩做完：agy 不再报压缩后的上下文（下一轮才报），先当不知道，别还显示压缩前的
@@ -879,26 +912,31 @@ impl Chat {
                     let why = e.params.get("detail").and_then(Value::as_str).map(String::from).unwrap_or_else(|| e.code.to_string());
                     st.error = Some(why.chars().take(500).collect());
                     lock(&log).turn_end(None, Some(&why), ms);
-                    quota_hit = crate::agy_profiles::quota_error(&why);
+                    if crate::agy_profiles::quota_error(&why) {
+                        quota = Some(why);
+                    }
                 }
             }
             let was_compact = std::mem::take(&mut st.agy.compacting);
             Self::drop_pending(&mut st);
             st.last_reply = lock(&log).last_reply();
             let cancelled = matches!(&r, Ok(v) if v["stopReason"].as_str() == Some("cancelled"));
-            let ok = conn.alive() && !cancelled && r.is_ok();
+            let ok = conn.alive() && !cancelled && r.is_ok() && quota.is_none();
+            if ok {
+                st.agy.limit_tries = 0;
+            }
             // 到了压缩点：先压缩，排着的等压缩完再发
             let compact_now = ok && !was_compact && tuning.compact_at(st.agy.window).zip(st.context).is_some_and(|(at, used)| used >= at);
-            // 进程没了或被停止：排着的留着（可在界面上取回或编辑），正常完成才接着发下一条
-            let next = if !compact_now && conn.alive() && !cancelled && !st.agy.queued.is_empty() { Some(st.agy.queued.remove(0)) } else { None };
+            // 进程没了、被停止、额度用完：排着的留着（可在界面上取回或编辑；额度用完的等接着的那一轮做完再发），正常完成才接着发下一条
+            let next = if ok && !compact_now && !st.agy.queued.is_empty() { Some(st.agy.queued.remove(0)) } else { None };
             if next.is_none() && !compact_now {
                 Self::set_phase(inst, &mut st, Phase::Idle, None);
             }
             Self::emit_status(inst, &st);
             (next, compact_now)
         };
-        if quota_hit {
-            self.agy_quota_out(inst);
+        if let Some(why) = quota {
+            self.agy_quota_out(inst, &why);
             return;
         }
         if compact_now {
@@ -920,15 +958,19 @@ impl Chat {
         }
     }
 
-    /// 这一轮因为账号额度用完失败：挑一个额度够的账号（同一组模型、两个窗口都 ≥10%，剩得最多的）提示“换到它接着”；
-    /// 开了自动换账号就直接换过去发 continue（同一段对话，见 agy_switch_profile）。10 分钟内自动换过就不再自动换，只提示
-    fn agy_quota_out(&self, inst: &Arc<Inst>) {
+    /// 这一轮因为账号额度用完停了（`why`：报错原文）：挑一个额度够的账号（同一组模型、两个窗口都 ≥10%，剩得最多的）提示“换到它接着”；
+    /// 开了自动换账号就直接换过去发 continue（同一段对话，见 agy_switch_profile）。10 分钟内自动换过就不再自动换，只提示。
+    /// 不自动换时等这个账号的额度重置后自动发 continue（跟 Claude Code 的一样，到点由 [`Chat::agy_limit_tick`] 发）
+    fn agy_quota_out(&self, inst: &Arc<Inst>, why: &str) {
         use crate::agy_profiles as ap;
         let from = self.agy_profile(&inst.id);
         // 用完的这个也重新查一下（用量面板上看得到），别的账号过时了也查
         ap::refresh_all_soon(&self.store, &self.paths.home);
         let gemini = ap::gemini_model(lock(&inst.st).model.as_deref());
         let to = ap::best(&self.store, &self.paths.home, gemini, Some(&from.id)).and_then(|(id, left)| ap::get(&self.store, &id).map(|p| (p, left)));
+        // 报错里写的什么时候重置（Unix 毫秒）：agy 的 `Resets in 58m39s` 是服务端算好的，没写再去查额度
+        let now = crate::util::system_ms();
+        let reset = ap::reset_after_secs(why).map(|s| now + s as i64 * 1000).or_else(|| super::claude_chat::reset_in_text(why, now / 1000).map(|t| t * 1000));
         let auto = {
             let mut st = lock(&inst.st);
             let recent = st.agy.switched_at.is_some_and(|t| t.elapsed() < Duration::from_secs(600));
@@ -940,10 +982,17 @@ impl Chat {
             }));
             if auto {
                 st.agy.switched_at = Some(Instant::now());
+            } else if reset.is_some() {
+                self.agy_limit_arm(inst, &mut st, reset, now);
             }
             Self::emit_status(inst, &st);
             auto
         };
+        if !auto && reset.is_none() {
+            if let Some(me) = self.me.upgrade() {
+                tokio::spawn(me.agy_limit_wait(inst.clone(), from.id.clone(), gemini));
+            }
+        }
         let (Some((to, _)), true) = (to, auto) else { return };
         let Some(me) = self.me.upgrade() else { return };
         let inst = inst.clone();
@@ -963,6 +1012,105 @@ impl Chat {
                 }
             }
         });
+    }
+
+    /// 额度用完、报错里没说什么时候重置：现问一次这个账号的额度（`agy -p /usage`，不花额度），等用完的那组重置；问不到就猜
+    async fn agy_limit_wait(self: Arc<Self>, inst: Arc<Inst>, profile: String, gemini: bool) {
+        let buckets = crate::agy_profiles::quota_now(&self.paths.home, &profile).await;
+        let now = crate::util::system_ms();
+        let reset = buckets.as_deref().and_then(|b| crate::agy_profiles::reset_of(b, gemini)).filter(|&t| t > now);
+        let mut st = lock(&inst.st);
+        // 问额度的这会儿已经有人接手了（发了消息、换了账号、开了新对话），或者已经在等了
+        if !matches!(st.phase, Phase::Idle | Phase::Detached) || st.agy.quota_out.is_none() || st.agy.limit_resume.is_some() {
+            return;
+        }
+        self.agy_limit_arm(&inst, &mut st, reset, now);
+    }
+
+    /// 记下等到什么时候自动继续：知道什么时候重置（`reset`，Unix 毫秒）就到点再多等一会儿，不知道就猜（10、20、40 分钟，之后每小时）。
+    /// 接连用完（到点继续了还是用完）时至少等猜的那么久：说的重置时间不准时，别隔一分钟就发一次 continue
+    fn agy_limit_arm(&self, inst: &Inst, st: &mut super::State, reset: Option<i64>, now: i64) {
+        use super::claude_chat::{LIMIT_RETRY_MS, LIMIT_SLACK_MS};
+        let n = st.agy.limit_tries as usize;
+        st.agy.limit_tries = st.agy.limit_tries.saturating_add(1);
+        let guess = LIMIT_RETRY_MS[n.min(LIMIT_RETRY_MS.len() - 1)];
+        let at = match reset {
+            Some(t) if n == 0 => t.max(now) + LIMIT_SLACK_MS,
+            Some(t) => (t.max(now) + LIMIT_SLACK_MS).max(now + guess),
+            None => now + guess,
+        };
+        st.agy.limit_guess = reset.is_none();
+        tracing::info!(id = %inst.id, at, guess = reset.is_none(), "agy 额度用完了，等重置后自动继续");
+        self.agy_limit_set(inst, st, Some(at));
+    }
+
+    /// 记下（存进数据库，客户端重启后接着等）或取消“额度重置后自动继续”
+    fn agy_limit_set(&self, inst: &Inst, st: &mut super::State, at: Option<i64>) {
+        if st.agy.limit_resume == at {
+            return;
+        }
+        st.agy.limit_resume = at;
+        if at.is_none() {
+            st.agy.limit_guess = false;
+        }
+        let key = limit_key(&inst.id);
+        let _ = match at {
+            Some(t) => self.store.set(&key, &json!({ "at": t, "guess": st.agy.limit_guess })),
+            None => self.store.remove(&key),
+        };
+        Self::emit_status(inst, st);
+    }
+
+    /// 后台每隔几秒看一次（[`Chat::background`]）：在等额度重置的到点了就发 continue。
+    /// `agy acp` 没起着、会话还没加载也没关系，发消息时会接上
+    pub(super) fn agy_limit_tick(&self, inst: &Arc<Inst>) {
+        let mut st = lock(&inst.st);
+        let Some(at) = st.agy.limit_resume else { return };
+        if st.agy.limit_firing || crate::util::system_ms() < at {
+            return;
+        }
+        // 已经有人接着了（发了消息）
+        if !matches!(st.phase, Phase::Idle | Phase::Detached) {
+            self.agy_limit_set(inst, &mut st, None);
+            return;
+        }
+        let Some(me) = self.me.upgrade() else { return };
+        st.agy.limit_firing = true;
+        drop(st);
+        let inst = inst.clone();
+        tokio::spawn(async move {
+            tracing::info!(id = %inst.id, "agy 额度应该重置了，自动继续");
+            let r = me.agy_input(&inst.id, "continue", &[]).await;
+            let mut st = lock(&inst.st);
+            st.agy.limit_firing = false;
+            if let Err(e) = r {
+                tracing::warn!(id = %inst.id, code = %e.code, "agy 额度重置后没能自动继续");
+                st.error = Some(e.code.to_string());
+            }
+            // 发出去了（发的时候已经不等了）或者没发成：都不再等。又用完了的话这一轮结束时会重新等
+            if st.agy.limit_resume == Some(at) {
+                me.agy_limit_set(&inst, &mut st, None);
+            }
+            Self::emit_status(&inst, &st);
+        });
+    }
+
+    /// 客户端启动时：重启前在等额度重置的会话接着等（卡片上没有可换的账号：额度要重新查，换账号在卡片的“管理”里）
+    pub(super) fn agy_limit_restore(&self) {
+        for r in self.store.instances().unwrap_or_default() {
+            let key = limit_key(&r.id);
+            let Ok(Some(v)) = self.store.get::<Value>(&key) else { continue };
+            let Some(at) = v["at"].as_i64().filter(|_| self.instances.agy_acp_mode(&r)) else {
+                let _ = self.store.remove(&key);
+                continue;
+            };
+            let from = self.agy_profile(&r.id);
+            let inst = self.inst(&r.id);
+            let mut st = lock(&inst.st);
+            st.agy.limit_resume = Some(at);
+            st.agy.limit_guess = v["guess"].as_bool().unwrap_or(false);
+            st.agy.quota_out.get_or_insert_with(|| json!({ "from": { "id": from.id, "name": from.name }, "to": null, "auto": false }));
+        }
     }
 
     /// 新建会话时带的第一句话、要接着的以前的对话（agy 的对话号就是 ACP 的会话号）
@@ -985,8 +1133,22 @@ impl Chat {
         }
     }
 
-    /// 停止：取消这一轮（agy 那边结束后 `session/prompt` 返回 `cancelled`），排着的消息留着供取回
+    /// 界面上的停止：在等额度重置自动继续时是“不自动继续”，否则停下这一轮
     pub(super) async fn agy_interrupt(&self, id: &str) -> Result<(), LocalError> {
+        let inst = self.inst(id);
+        {
+            let mut st = lock(&inst.st);
+            if st.agy.limit_resume.is_some() && !matches!(st.phase, Phase::Running | Phase::Approval) {
+                self.agy_limit_set(&inst, &mut st, None);
+                return Ok(());
+            }
+        }
+        self.agy_cancel_turn(id).await
+    }
+
+    /// 停下这一轮（agy 那边结束后 `session/prompt` 返回 `cancelled`），排着的消息留着供取回。
+    /// 在等额度重置自动继续的不动（会话停掉、强制重启、客户端退出后照样到点继续）
+    pub(super) async fn agy_cancel_turn(&self, id: &str) -> Result<(), LocalError> {
         let inst = self.inst(id);
         let session = {
             let mut st = lock(&inst.st);
@@ -1017,7 +1179,7 @@ impl Chat {
 
     /// 强制重启：标记 stale，重新加载当前会话
     pub(super) async fn agy_restart(&self, id: &str) -> Result<(), LocalError> {
-        let _ = self.agy_interrupt(id).await;
+        let _ = self.agy_cancel_turn(id).await;
         self.agy.stale.store(true, Ordering::SeqCst);
         let inst = self.inst(id);
         {
@@ -1042,7 +1204,7 @@ impl Chat {
         if self.instances.container(id).is_some() {
             return Err(LocalError::new("CHAT_UNAVAILABLE"));
         }
-        let _ = self.agy_interrupt(id).await;
+        let _ = self.agy_cancel_turn(id).await;
         let old = self.agy_live(id).await;
         crate::agy_profiles::pin(&self.store, id, Some(profile))?;
         let inst = self.inst(id);
@@ -1061,6 +1223,9 @@ impl Chat {
             st.error = None;
             st.agy.quota_out = None;
             st.agy.switched = None;
+            // 换了账号就不用等原来那个的额度重置了
+            st.agy.limit_tries = 0;
+            self.agy_limit_set(&inst, &mut st, None);
             if matches!(st.phase, Phase::Running | Phase::Approval) {
                 Self::set_phase(&inst, &mut st, Phase::Idle, None);
             }
@@ -1549,5 +1714,201 @@ mod tests {
         assert_eq!((agent, profile.as_str()), ("agy", crate::agy_profiles::OFFICIAL));
         let mem = super::super::model_memory::get(&store, agent, &profile, &base).unwrap();
         assert_eq!((mem.model.as_deref(), mem.effort.as_deref()), (Some("claude-opus-5-5"), Some("high")));
+    }
+
+    /// 假的 `agy acp`：第一轮停一秒后回 agy 1.5.18 额度用完的那句（当成回复、这一轮照常结束），之后每轮回 Done.；收到的请求记在旁边的 requests
+    #[cfg(unix)]
+    const FAKE_AGY: &str = r#"#!/bin/sh
+dir=$(dirname "$0")
+sid=0a9e1c0d-0000-4000-8000-000000000001
+n=0
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> "$dir/requests"
+  id=$(printf '%s' "$line" | sed -n 's/^{"jsonrpc":"2.0","id":\([0-9]*\),"method":"\([^"]*\)".*/\1/p')
+  m=$(printf '%s' "$line" | sed -n 's/^{"jsonrpc":"2.0","id":\([0-9]*\),"method":"\([^"]*\)".*/\2/p')
+  [ -n "$id" ] || continue
+  case "$m" in
+  initialize) printf '%s\n' '{"jsonrpc":"2.0","id":'"$id"',"result":{"protocolVersion":1,"agentInfo":{"name":"agy","version":"9.9.9"}}}' ;;
+  session/new) printf '%s\n' '{"jsonrpc":"2.0","id":'"$id"',"result":{"sessionId":"'"$sid"'"}}' ;;
+  session/prompt)
+    n=$((n + 1))
+    if [ "$n" = 1 ]; then
+      sleep 1
+      text='\n⚠ Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 58m39s.\n'
+    else
+      text='Done.'
+    fi
+    printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"'"$sid"'","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"'"$text"'"}}}}'
+    printf '%s\n' '{"jsonrpc":"2.0","id":'"$id"',"result":{"stopReason":"end_turn","usage":{"inputTokens":1,"outputTokens":1}}}' ;;
+  *) printf '%s\n' '{"jsonrpc":"2.0","id":'"$id"',"result":{}}' ;;
+  esac
+done
+"#;
+
+    /// agy 额度用完（不是报错，是这一轮最后一段回复）：排着的留着，按说的重置时间等，记进数据库；到点发 continue，做完再发排着的
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn quota_reply_waits_then_continues() {
+        use crate::instances::Instances;
+        use crate::paths::Paths;
+        use crate::store::Store;
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let fake_dir = tempfile::tempdir().unwrap();
+        let fake = fake_dir.path().join("agy");
+        std::fs::write(&fake, FAKE_AGY).unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let paths = Paths::discover(Some(home.path().to_path_buf())).unwrap();
+        let store = Arc::new(Store::memory().unwrap());
+        let instances = Instances::new(store.clone(), paths.clone());
+        let input = crate::instances::Input { name: Some("agy-q".into()), workdir: Some(work.path().display().to_string()), launch: Some("agy".into()), ..Default::default() };
+        let id = instances.create(input).await.unwrap().row.id;
+        let chat = Chat::new(store.clone(), paths.clone(), instances.clone());
+        // 这个会话的账号用假的 agy acp
+        let (tx, rx) = mpsc::unbounded_channel();
+        let conn = AcpConn::start(&fake, None, &[], &[], fake_dir.path(), tx).await.unwrap();
+        let gen = chat.agy.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        chat.agy.conns.lock().await.insert(chat.agy_profile(&id).id, (conn.clone(), gen));
+        tokio::spawn(chat.clone().agy_events(conn.clone(), rx, gen));
+        let prompts = || {
+            let text = std::fs::read_to_string(fake_dir.path().join("requests")).unwrap_or_default();
+            text.lines().filter_map(|l| serde_json::from_str::<Value>(l).ok()).filter(|v| v["method"] == "session/prompt").map(|v| v["params"]["prompt"][0]["text"].as_str().unwrap_or("").to_string()).collect::<Vec<_>>()
+        };
+        let status = |chat: &Arc<Chat>| {
+            let inst = chat.inst(&id);
+            let st = lock(&inst.st);
+            Chat::status_of(&inst, &st)
+        };
+
+        chat.input(&id, "fix the bug", &[]).await.unwrap();
+        let r = chat.input(&id, "then add tests", &[]).await.unwrap();
+        assert_eq!(r["queued"], true, "第一轮还在跑：排着");
+        let before = crate::util::system_ms();
+        let mut s = status(&chat);
+        for _ in 0..100 {
+            if s["phase"] == "idle" && !s["limit"].is_null() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            s = status(&chat);
+        }
+        let after = crate::util::system_ms();
+        assert_eq!(s["phase"], "idle", "{s}");
+        let at = s["limit"]["resume_at"].as_i64().unwrap_or_else(|| panic!("额度用完后应该在等重置：{s}"));
+        let wait_ms = (58 * 60 + 39) * 1000 + super::super::claude_chat::LIMIT_SLACK_MS;
+        assert!(at >= before - 2000 + wait_ms && at <= after + wait_ms, "按报错里说的 58m39s 再多等一分钟：{at} vs {before}..{after}");
+        assert_eq!(s["limit"]["guess"], false);
+        assert_eq!(s["agy_quota"]["from"]["id"], chat.agy_profile(&id).id, "{s}");
+        assert_eq!(s["later"], json!([{ "text": "then add tests", "images": 0 }]), "额度用完时排着的不发");
+        assert_eq!(prompts(), ["fix the bug"]);
+        assert_eq!(store.get::<Value>(&limit_key(&id)).unwrap(), Some(json!({ "at": at, "guess": false })), "记进数据库，重启后接着等");
+        assert_eq!(chat.brief(&id).unwrap()["board"], "working", "会话列表上算在干活（等着自动继续）");
+        assert_eq!(chat.brief(&id).unwrap()["limit"]["resume_at"], at);
+
+        // 没到点：不发
+        chat.agy_limit_tick(&chat.inst(&id));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(prompts().len(), 1);
+        // 到点：发 continue，做完接着发排着的
+        lock(&chat.inst(&id).st).agy.limit_resume = Some(crate::util::system_ms() - 1);
+        chat.agy_limit_tick(&chat.inst(&id));
+        for _ in 0..100 {
+            s = status(&chat);
+            if prompts().len() == 3 && s["phase"] == "idle" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(prompts(), ["fix the bug", "continue", "then add tests"], "{s}");
+        assert!(s["limit"].is_null() && s["agy_quota"].is_null() && s["later"] == json!([]), "{s}");
+        assert_eq!(store.get::<Value>(&limit_key(&id)).unwrap(), None);
+        assert_eq!(lock(&chat.inst(&id).st).agy.limit_tries, 0, "好好做完一轮清零");
+        conn.kill();
+    }
+
+    /// 报错里没说什么时候重置：看账号的额度，再不知道就猜（接连用完每次多等一些）；停止 = 不自动继续；客户端重启后接着等
+    #[tokio::test(flavor = "multi_thread")]
+    async fn quota_wait_without_reset_time() {
+        use super::super::claude_chat::{LIMIT_RETRY_MS, LIMIT_SLACK_MS};
+        use crate::instances::Instances;
+        use crate::paths::Paths;
+        use crate::store::Store;
+        let home = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let paths = Paths::discover(Some(home.path().to_path_buf())).unwrap();
+        let store = Arc::new(Store::memory().unwrap());
+        let instances = Instances::new(store.clone(), paths.clone());
+        let input = crate::instances::Input { name: Some("agy-w".into()), workdir: Some(work.path().display().to_string()), launch: Some("agy".into()), ..Default::default() };
+        let id = instances.create(input).await.unwrap().row.id;
+        let chat = Chat::new(store.clone(), paths.clone(), instances.clone());
+        let inst = chat.inst(&id);
+        let out = |st: &mut super::super::State| {
+            st.phase = Phase::Idle;
+            st.agy.quota_out = Some(json!({ "from": { "id": "p" }, "to": null, "auto": false }));
+        };
+        // 额度里 Gemini 的 5 小时窗口用完了：等它重置
+        let reset = crate::util::system_ms() + 2 * 3600 * 1000;
+        let iso = time::OffsetDateTime::from_unix_timestamp(reset / 1000).unwrap().format(&time::format_description::well_known::Rfc3339).unwrap();
+        crate::agy_profiles::quota_put_for_test("limit-wait-a", vec![json!({ "group": "Gemini", "window": "5h", "remaining": 0.0, "resets_at": iso }), json!({ "group": "Gemini", "window": "weekly", "remaining": 50.0, "resets_at": "2099-01-01T00:00:00Z" })]);
+        out(&mut lock(&inst.st));
+        chat.clone().agy_limit_wait(inst.clone(), "limit-wait-a".into(), true).await;
+        assert_eq!(lock(&inst.st).agy.limit_resume, Some(reset / 1000 * 1000 + LIMIT_SLACK_MS));
+        assert!(!lock(&inst.st).agy.limit_guess);
+        // 停止 = 不自动继续
+        chat.agy_interrupt(&id).await.unwrap();
+        assert_eq!(lock(&inst.st).agy.limit_resume, None);
+        assert_eq!(store.get::<Value>(&limit_key(&id)).unwrap(), None);
+
+        // 额度也查不到：猜 10 分钟；接连用完时就算说了很快重置也至少等下一档
+        lock(&inst.st).agy.limit_tries = 0;
+        let now = crate::util::system_ms();
+        chat.clone().agy_limit_wait(inst.clone(), "limit-wait-none".into(), true).await;
+        let (at, guess) = {
+            let st = lock(&inst.st);
+            (st.agy.limit_resume.unwrap(), st.agy.limit_guess)
+        };
+        assert!(guess && at >= now + LIMIT_RETRY_MS[0] && at <= crate::util::system_ms() + LIMIT_RETRY_MS[0], "{at} vs {now}");
+        {
+            let mut st = lock(&inst.st);
+            chat.agy_limit_set(&inst, &mut st, None);
+            let now = crate::util::system_ms();
+            chat.agy_limit_arm(&inst, &mut st, Some(now + 5_000), now);
+            assert_eq!(st.agy.limit_resume, Some(now + LIMIT_RETRY_MS[1]), "接连第二次用完");
+            assert!(!st.agy.limit_guess);
+        }
+        // 已经有人接手了（发了消息、开了新对话）：查完额度不再等
+        chat.agy_limit_set(&inst, &mut lock(&inst.st), None);
+        lock(&inst.st).agy.quota_out = None;
+        chat.clone().agy_limit_wait(inst.clone(), "limit-wait-a".into(), true).await;
+        assert_eq!(lock(&inst.st).agy.limit_resume, None);
+
+        // 客户端重启：数据库里记着的接着等，卡片上显示用完的是哪个账号（会话用 termd：哪台机器上都算持久终端、对话模式）
+        let opts = |o: crate::instances::Opts| store.set(&format!("instance_opts.{id}"), &o).unwrap();
+        opts(crate::instances::Opts { termd: true, ..instances.opts(&id) });
+        assert!(instances.agy_acp_mode(&store.instance(&id).unwrap().unwrap()));
+        let at = crate::util::system_ms() + 600_000;
+        store.set(&limit_key(&id), &json!({ "at": at, "guess": true })).unwrap();
+        let chat2 = Chat::new(store.clone(), paths.clone(), instances.clone());
+        chat2.agy_limit_restore();
+        {
+            let inst2 = chat2.inst(&id);
+            let st = lock(&inst2.st);
+            assert_eq!((st.agy.limit_resume, st.agy.limit_guess), (Some(at), true));
+            assert_eq!(st.agy.quota_out.as_ref().unwrap()["from"]["id"], chat2.agy_profile(&id).id);
+            let s = Chat::status_of(&inst2, &st);
+            assert_eq!(s["limit"]["resume_at"], at);
+            assert_eq!(s["limit"]["guess"], true);
+        }
+        // 删掉会话：记着的也删
+        chat2.forget(&id);
+        assert_eq!(store.get::<Value>(&limit_key(&id)).unwrap(), None);
+        // 改成终端里的 agy 了（不是对话模式）：不接着等，记着的删掉
+        opts(crate::instances::Opts { chat_ui: false, ..instances.opts(&id) });
+        store.set(&limit_key(&id), &json!({ "at": at, "guess": true })).unwrap();
+        let chat3 = Chat::new(store.clone(), paths.clone(), instances.clone());
+        chat3.agy_limit_restore();
+        assert_eq!(lock(&chat3.inst(&id).st).agy.limit_resume, None);
+        assert_eq!(store.get::<Value>(&limit_key(&id)).unwrap(), None);
     }
 }

@@ -16,6 +16,25 @@ test('events merge into the tail and update the last item', () => {
   assert.equal(s.status.phase, 'running');
 });
 
+test('loading flag stays true across status updates until snapshot or detached', () => {
+  let s = applyEvent(EMPTY, 'snapshot', { status: { phase: 'idle', loading: true }, start: 0, total: 0, items: [] });
+  assert.equal(s.status.loading, true);
+  // 单独的 status 事件先到了（reset 触发的新快照还没回来）：保持 loading，不闪空页
+  s = applyEvent(s, 'status', { phase: 'idle', loading: false, model: 'gemini' });
+  assert.equal(s.status.loading, true);
+  assert.equal(s.status.model, 'gemini');
+  // 掉线/加载失败（detached）：立刻清掉 loading 显示错误
+  const detached = applyEvent(s, 'status', { phase: 'detached', loading: false, reason: 'agy_unavailable' });
+  assert.equal(detached.status.loading, false);
+  // 真正的新快照回来（哪怕真的是 0 条）：按快照清掉 loading
+  const emptySnap = applyEvent(s, 'snapshot', { status: { phase: 'idle', loading: false }, start: 0, total: 0, items: [] });
+  assert.equal(emptySnap.status.loading, false);
+  // 已有条目时 status 正常覆盖
+  const withItems = applyEvent(s, 'items', { start: 0, items: [{ key: 'g:0:0' }] });
+  const afterStatus = applyEvent(withItems, 'status', { phase: 'idle', loading: false });
+  assert.equal(afterStatus.status.loading, false);
+});
+
 test('tool results pair with tool uses', () => {
   const items = [
     { k: 'assistant', blocks: [{ t: 'tool_use', id: 't1', name: 'Bash', input: { command: 'ls' } }] },
@@ -309,10 +328,11 @@ test('quotes and attachments round-trip through the message text', async () => {
 });
 
 test('助理记忆的工具单独一行，不进工具组，也不收进处理过程', () => {
-  const tu = (id, name) => ({ t: 'tool_use', id, name, input: {} });
+  const tu = (id, name, input = {}) => ({ t: 'tool_use', id, name, input });
+  const M = 'mcp__looklook_assistant__memory';
   const items = [
     { k: 'user', key: 'u1', text: '以后汇报别超过三句' },
-    { k: 'assistant', key: 'a1', blocks: [tu('t1', 'Read'), tu('t2', 'mcp__looklook_assistant__memory_save'), tu('t3', 'Bash'), { t: 'text', text: '记住了' }] },
+    { k: 'assistant', key: 'a1', blocks: [tu('t1', 'Read'), tu('t2', M, { command: 'str_replace', path: '/memories/you/说话.md' }), tu('t3', 'Bash'), { t: 'text', text: '记住了' }] },
     { k: 'turn', key: 'e1' },
   ];
   const rows = chatRows(items, new Set());
@@ -325,6 +345,9 @@ test('助理记忆的工具单独一行，不进工具组，也不收进处理�
   // 只有记忆、没有别的处理过程：不画空的处理过程
   const only = chatRows([{ k: 'user', key: 'u', text: 'x' }, { k: 'assistant', key: 'a', blocks: [tu('m', 'mcp__looklook_assistant__memory_forget'), { t: 'text', text: '好' }] }], new Set());
   assert.ok(!workParts(only, false).some((p) => p.k === 'work'));
+  // 只是看记忆：普通工具
+  const look = chatRows([{ k: 'assistant', key: 'a', blocks: [tu('v', M, { command: 'view', path: '/memories' })] }], new Set());
+  assert.deepEqual(look.map((r) => r.k), ['tool']);
 });
 
 test('contextGauge: 设了自动压缩点按压缩点算，否则按窗口', () => {

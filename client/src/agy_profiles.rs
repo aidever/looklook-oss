@@ -966,6 +966,102 @@ pub fn quota_error(why: &str) -> bool {
         || l.split(|c: char| !c.is_ascii_alphanumeric()).any(|w| w == "429")
 }
 
+/// agy 的额度用完多半不是报错：`session/prompt` 照常返回，报错当成这一轮最后一段回复发来（1.5.18 实测：
+/// `⚠ Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 58m39s.`）。
+/// `text` 是这一轮最后一段回复：最后一行是 `⚠` 开头、Google 接口额度用完的说法时，返回 `⚠` 后面的那句。
+/// 模型自己写的回复里提到 quota（比如正在改额度相关的代码）不算：要是单独一行、`⚠` 开头、而且就是这一轮的结尾
+pub fn quota_reply(text: &str) -> Option<&str> {
+    let line = text.trim_end().rsplit('\n').next()?.trim();
+    let tail = line.strip_prefix('⚠')?.trim_start_matches('\u{fe0f}').trim();
+    let l = tail.to_ascii_lowercase();
+    let google = l.contains("quota reached")
+        || l.contains("quota exceeded")
+        || l.contains("resource_exhausted")
+        || l.contains("resource exhausted")
+        || l.contains("exhausted your capacity")
+        || (l.contains("quota") && l.contains("resets in"));
+    (google && quota_error(tail)).then_some(tail)
+}
+
+/// 报错里说的多久后重置（秒）：`Resets in 58m39s`、`Resets in 154h46m27s`（Go 的时长写法；也认 `1h 2m`、`2 hours 5 minutes`）。
+/// 没写、写得认不出、或者超过一个月（不像是真的）时 None
+pub fn reset_after_secs(text: &str) -> Option<u64> {
+    let l = text.to_ascii_lowercase();
+    let at = l.find("resets in").map(|i| i + "resets in".len()).or_else(|| l.find("reset in").map(|i| i + "reset in".len()))?;
+    let s = l[at..].trim_start();
+    let b = s.as_bytes();
+    let skip_spaces = |mut i: usize| {
+        while b.get(i) == Some(&b' ') {
+            i += 1;
+        }
+        i
+    };
+    let (mut i, mut total) = (0, 0f64);
+    while b.get(i).is_some_and(u8::is_ascii_digit) {
+        let st = i;
+        while b.get(i).is_some_and(|c| c.is_ascii_digit() || *c == b'.') {
+            i += 1;
+        }
+        let n: f64 = s[st..i].trim_end_matches('.').parse().ok()?;
+        i = skip_spaces(i);
+        let w = i;
+        while b.get(i).is_some_and(u8::is_ascii_alphabetic) {
+            i += 1;
+        }
+        total += n * match &s[w..i] {
+            "ms" | "msec" | "millisecond" | "milliseconds" => 0.001,
+            "s" | "sec" | "secs" | "second" | "seconds" => 1.0,
+            "m" | "min" | "mins" | "minute" | "minutes" => 60.0,
+            "h" | "hr" | "hrs" | "hour" | "hours" => 3_600.0,
+            "d" | "day" | "days" => 86_400.0,
+            _ => return None,
+        };
+        i = skip_spaces(i);
+    }
+    (total > 0.0 && total <= 31.0 * 86_400.0).then(|| total.ceil() as u64)
+}
+
+/// 用完的那组额度什么时候重置（Unix 毫秒）：这一组里用完了的窗口（每周 / 5 小时）里最晚的那个，都回来了才能接着用
+pub(crate) fn reset_of(buckets: &[Value], gemini: bool) -> Option<i64> {
+    buckets
+        .iter()
+        .filter(|b| b["group"].as_str().is_some_and(|g| g.to_ascii_lowercase().contains("gemini") == gemini))
+        .filter(|b| b["remaining"].as_f64().is_some_and(|r| r < 1.0))
+        .filter_map(|b| b["resets_at"].as_str())
+        .filter_map(|t| time::OffsetDateTime::parse(t, &time::format_description::well_known::Rfc3339).ok())
+        .map(|t| (t.unix_timestamp_nanos() / 1_000_000) as i64)
+        .max()
+}
+
+/// 现问一次这个账号的额度（`agy -p /usage`，几秒，不花额度）：各格；没查到时 None。
+/// 正在别处查着（额度用完时刚叫过 [`refresh_all_soon`]）：等那次查完用它的结果，不再起一个
+pub async fn quota_now(home: &Path, id: &str) -> Option<Vec<Value>> {
+    // 测试里不起 agy：用 quota_put_for_test 放的
+    let since = if cfg!(test) { 0 } else { crate::util::system_ms() };
+    let fresh = || {
+        let g = QUOTA.lock().unwrap_or_else(|e| e.into_inner());
+        g.as_ref()?.get(id).filter(|(at, _)| *at >= since).map(|(_, b)| b.clone())
+    };
+    if cfg!(test) {
+        return fresh();
+    }
+    let shell = crate::shells::login_shell();
+    let deadline = tokio::time::Instant::now() + QUOTA_TIMEOUT + Duration::from_secs(5);
+    loop {
+        match refresh_quota(home, &shell, id).await {
+            Some(QuotaFetch::Ok(b)) => return Some(b),
+            Some(_) => return None,
+            None if tokio::time::Instant::now() >= deadline => return None,
+            None => {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                if let Some(b) = fresh() {
+                    return Some(b);
+                }
+            }
+        }
+    }
+}
+
 /// 测试用：直接放一份额度
 #[cfg(test)]
 pub(crate) fn quota_put_for_test(id: &str, buckets: Vec<Value>) {
@@ -1387,6 +1483,52 @@ mod tests {
         assert!(quota_error("Internal error: RESOURCE_EXHAUSTED: You have exhausted your capacity"));
         assert!(quota_error("googleapi: Error 429: Too Many Requests"));
         assert!(!quota_error("rate limited, retry later") && !quota_error("port 4290 refused") && !quota_error("session not found"));
+    }
+
+    /// agy 1.5.18 额度用完是这一轮的最后一段回复（不是报错）；模型自己说到 quota 的不算
+    #[test]
+    fn quota_in_reply() {
+        let real = "Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 58m39s.";
+        assert_eq!(quota_reply(&format!("\n⚠ {real}\n")), Some(real));
+        assert_eq!(quota_reply(&format!("I'll look at the tests first.\n\n⚠️ {real}")), Some(real), "接在回复后面、带 VS16 的 ⚠️");
+        assert_eq!(quota_reply("⚠ RESOURCE_EXHAUSTED: You have exhausted your capacity on this model."), Some("RESOURCE_EXHAUSTED: You have exhausted your capacity on this model."));
+        assert_eq!(quota_reply(&format!("⚠ {real}\nBut here is the rest of the answer.")), None, "不在最后");
+        assert_eq!(quota_reply(real), None, "不是 ⚠ 开头");
+        assert_eq!(quota_reply("Done. The quota check now resets the counter.\n⚠ Remember to run the migrations."), None);
+        assert_eq!(quota_reply("⚠ The quota module is untested"), None, "提到 quota 但不是额度用完");
+        assert_eq!(quota_reply(""), None);
+    }
+
+    #[test]
+    fn reset_after() {
+        assert_eq!(reset_after_secs("Individual quota reached. Resets in 58m39s."), Some(58 * 60 + 39));
+        assert_eq!(reset_after_secs("Resets in 154h46m27s."), Some(154 * 3600 + 46 * 60 + 27));
+        assert_eq!(reset_after_secs("resets in 1h 2m"), Some(3720));
+        assert_eq!(reset_after_secs("Quota will reset in 2 hours 5 minutes"), Some(2 * 3600 + 5 * 60));
+        assert_eq!(reset_after_secs("Resets in 2d3h"), Some(2 * 86_400 + 3 * 3600));
+        assert_eq!(reset_after_secs("Resets in 1.5s"), Some(2));
+        assert_eq!(reset_after_secs("Resets in 500ms"), Some(1));
+        assert_eq!(reset_after_secs("Resets in 0s"), None);
+        assert_eq!(reset_after_secs("Resets in 40d"), None, "超过一个月不像真的");
+        assert_eq!(reset_after_secs("Resets in a while"), None);
+        assert_eq!(reset_after_secs("Resets in 5 fortnights"), None);
+        assert_eq!(reset_after_secs("Individual quota reached."), None);
+    }
+
+    #[test]
+    fn reset_of_exhausted_group() {
+        let b = |g: &str, w: &str, r: f64, t: &str| json!({ "group": g, "window": w, "remaining": r, "resets_at": t });
+        let ms = |t: &str| (time::OffsetDateTime::parse(t, &time::format_description::well_known::Rfc3339).unwrap().unix_timestamp_nanos() / 1_000_000) as i64;
+        let buckets = vec![
+            b("Gemini", "weekly", 42.2, "2026-12-01T07:10:37Z"),
+            b("Gemini", "5h", 0.0, "2026-11-26T05:55:03Z"),
+            b("Claude and GPT", "5h", 0.0, "2026-11-26T09:00:00Z"),
+            b("Claude and GPT", "weekly", 0.4, "2026-11-30T00:00:00Z"),
+        ];
+        assert_eq!(reset_of(&buckets, true), Some(ms("2026-11-26T05:55:03Z")), "只看用完的窗口");
+        assert_eq!(reset_of(&buckets, false), Some(ms("2026-11-30T00:00:00Z")), "两个窗口都用完：等最晚的");
+        assert_eq!(reset_of(&buckets[..1], true), None, "没有用完的");
+        assert_eq!(reset_of(&[json!({ "group": "Gemini", "remaining": 0.0 })], true), None, "没写什么时候重置");
     }
 
     #[test]

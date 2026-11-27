@@ -13,6 +13,7 @@ import { errorText } from '../shared/i18n.js';
 import { isTouch } from '../shared/KeyBar.jsx';
 import { Link, useRouter } from '../shared/router.jsx';
 import Select from '../shared/Select.jsx';
+import { effortsFor } from '../shared/chat.js';
 import { AGENTS, baseName, sessionLaunch, sessionTitle, useSessions } from '../shared/sessions.jsx';
 import { formatTime, relativeTime } from '../shared/time.js';
 import { Button, CopyButton, Empty, Note, Skeleton, Switch, useToast } from '../shared/ui.jsx';
@@ -910,6 +911,15 @@ function EngineDefaults({ engine, cur, onChange }) {
     // 存的模型不在现在的列表里（换了服务商、列表没拉到）：照样显示，能换掉
     ...(cur.model && !known.some((o) => o.value === cur.model) ? [[cur.model, cur.model]] : []),
   ];
+  // 强度按选的模型（没选：工具的默认模型）能用的列；存的那个不在列表里也照样显示，能换掉
+  const effortModel = known.find((o) => o.value === cur.model) ?? (models ?? []).find((o) => o.value === 'default') ?? null;
+  const effortList = effortsFor(engine, effortModel);
+  const effortLabel = (x) => t(`chat.effort_${x}`, { defaultValue: x });
+  const effortOpts = [
+    ['', t('asst.defaults_effort_none'), { hint: t('asst.defaults_effort_none_hint') }],
+    ...effortList.map((x) => [x, effortLabel(x)]),
+    ...(cur.effort && !effortList.includes(cur.effort) ? [[cur.effort, effortLabel(cur.effort)]] : []),
+  ];
   return (
     <div className="asst-defaults">
       <div className="asst-defaults-name">
@@ -960,6 +970,22 @@ function EngineDefaults({ engine, cur, onChange }) {
           aria-label={`${name} ${t('asst.defaults_model')}`}
         />
       </div>
+      {effortList.length > 0 || cur.effort ? (
+        <div className="asst-switch">
+          <span>{t('asst.defaults_effort')}</span>
+          <Select
+            className="asst-pick"
+            value={cur.effort ?? ''}
+            disabled={busy || models == null}
+            options={effortOpts}
+            onChange={(e) => {
+              const v = e.target.value;
+              if (v !== (cur.effort ?? '')) put('effort', v, v ? effortLabel(v) : t('asst.defaults_effort_none'));
+            }}
+            aria-label={`${name} ${t('asst.defaults_effort')}`}
+          />
+        </div>
+      ) : null}
     </div>
   );
 }

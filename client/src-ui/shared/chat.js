@@ -18,8 +18,11 @@ export function applyEvent(state, type, data) {
   switch (type) {
     case 'snapshot':
       return { status: data.status ?? null, items: data.items ?? [], start: data.start ?? 0, total: data.total ?? 0 };
-    case 'status':
-      return { ...state, status: data };
+    case 'status': {
+      // 正在加载历史且还没收到条目时，不要让单独的 status 事件先清掉 loading，等 reset 触发的新快照把状态和条目一起换掉
+      const keepLoading = state.status?.loading && !data?.loading && data?.phase !== 'detached' && !state.items.length;
+      return { ...state, status: keepLoading ? { ...data, loading: true } : data };
+    }
     case 'items': {
       const items = state.items.slice();
       (data.items ?? []).forEach((item, i) => {
@@ -395,8 +398,14 @@ const NO_GROUP = new Set(['TodoWrite', 'AskUserQuestion', 'ExitPlanMode', 'Image
 /** 改文件的工具：组的标题上合计增删行数 */
 export const EDIT_TOOLS = new Set(['Edit', 'MultiEdit', 'Write', 'NotebookEdit']);
 
-/** 助理记、忘记忆的工具（两种引擎都翻成这个名字）：不进工具组、不收进处理过程，画成一行“记住了：…” */
-export const MEMORY_TOOL = /^mcp__looklook_assistant__memory_(save|forget)$/;
+/**
+ * 助理写记忆（两种引擎都翻成这个名字）：不进工具组、不收进处理过程，画成一行“记住了：…”。
+ * `memory` 工具的 view 只是看，照普通工具算；`memory_save` / `memory_forget` 是旧版的（以前的对话里还有）
+ */
+export function isMemoryWrite(b) {
+  if (/^mcp__looklook_assistant__memory_(save|forget)$/.test(b.name)) return true;
+  return b.name === 'mcp__looklook_assistant__memory' && b.input?.command !== 'view';
+}
 
 /** 工具的类别（合并用）；不合并的返回 null */
 export function toolClass(name) {
@@ -428,7 +437,7 @@ export function chatRows(items, used = toolUseIds(items)) {
       if (b.t === 'tool_use') {
         // 参数被截断的：记下所在的条目，卡片上可以按它取完整参数
         if (b.truncated && !b.item) b.item = item.key;
-        if (MEMORY_TOOL.test(b.name)) {
+        if (isMemoryWrite(b)) {
           flush();
           rows.push({ k: 'memory', key, block: b });
           return;

@@ -245,7 +245,13 @@ fn in_net(ip: IpAddr, net: IpAddr, len: u8) -> bool {
 }
 
 /// 请求头 Host 是否可以接受（见模块说明）。`name` 已去掉端口和方括号。
+#[cfg(test)]
 pub fn host_allowed(name: &str, open_host: Option<&OpenHost>) -> bool {
+    host_allowed_with_custom(name, open_host, &[])
+}
+
+/// 请求头 Host 校验（额外允许用户在“穿透与加速地址”里配置的域名）。
+pub fn host_allowed_with_custom(name: &str, open_host: Option<&OpenHost>, custom_hosts: &[String]) -> bool {
     let n = name.trim_end_matches('.').to_ascii_lowercase();
     if n.is_empty() {
         return false;
@@ -254,6 +260,9 @@ pub fn host_allowed(name: &str, open_host: Option<&OpenHost>) -> bool {
         return true;
     }
     if open_host.is_some_and(|h| h.matches(&n)) {
+        return true;
+    }
+    if custom_hosts.iter().any(|h| h.eq_ignore_ascii_case(&n)) {
         return true;
     }
     // 局域网名字：这些不能在公网注册，攻击者没法把它们解析到你的机器上。

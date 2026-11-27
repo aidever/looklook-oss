@@ -200,3 +200,13 @@ pub fn local_at(ms: i64) -> (i32, u32, u32, u32, u32, u32) {
     let t = from_ms(ms + offset);
     (t.year(), t.month() as u32, t.day() as u32, t.hour() as u32, t.minute() as u32, t.second() as u32)
 }
+
+/// 本机时区里某天零点的 Unix 毫秒（时区偏移按现在算，同 [`local_at`]）
+pub fn local_ms(y: i32, mo: u32, d: u32) -> Option<i64> {
+    let (ny, nmo, nd, h, mi, s) = local_now();
+    let now = system_ms();
+    let local_now = time::Date::from_calendar_date(ny, time::Month::try_from(nmo as u8).ok()?, nd as u8).ok()?.with_hms(h as u8, mi as u8, s as u8).ok()?.assume_utc().unix_timestamp() * 1000;
+    let offset = ((local_now - now) as f64 / 60_000.0).round() as i64 * 60_000;
+    let day = time::Date::from_calendar_date(y, time::Month::try_from(mo as u8).ok()?, d as u8).ok()?.midnight().assume_utc().unix_timestamp() * 1000;
+    Some(day - offset)
+}

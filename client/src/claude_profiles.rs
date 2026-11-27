@@ -11,7 +11,7 @@
 //!   另外的账号在 `<数据目录>/claude-accounts/<ID>/`：设置、CLAUDE.md、技能、插件、对话记录等用软链接共用默认目录的
 //!   （见 [`SHARED`]），只有登录状态和 `.claude.json` 是各自的。
 //! - **第三方接口**：用户自己的 Key，`ANTHROPIC_BASE_URL` + `ANTHROPIC_AUTH_TOKEN`（见 model.rs），
-//!   可选指定模型（`ANTHROPIC_MODEL`、`ANTHROPIC_DEFAULT_{OPUS,SONNET,HAIKU}_MODEL`）。只支持官方格式的接口，不做格式转换。
+//!   可选指定模型（`ANTHROPIC_MODEL`、`ANTHROPIC_DEFAULT_{FABLE,OPUS,SONNET,HAIKU}_MODEL`）。只支持官方格式的接口，不做格式转换。
 //!   要求 `x-api-key` 头的接口（Anthropic Console 的 API Key、部分服务商）改用 `ANTHROPIC_API_KEY`（[`Auth::ApiKey`]）。
 //!   Key 只写在本机文件 `<数据目录>/model/claude-<ID>.key`，启动命令让 shell 自己读。
 
@@ -67,16 +67,29 @@ pub struct Models {
     pub sonnet: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub haiku: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fable: Option<String>,
 }
 
 impl Models {
-    fn vars(&self) -> [(&'static str, &Option<String>); 4] {
-        [("ANTHROPIC_MODEL", &self.main), ("ANTHROPIC_DEFAULT_OPUS_MODEL", &self.opus), ("ANTHROPIC_DEFAULT_SONNET_MODEL", &self.sonnet), ("ANTHROPIC_DEFAULT_HAIKU_MODEL", &self.haiku)]
+    fn vars(&self) -> [(&'static str, &Option<String>); 5] {
+        [
+            ("ANTHROPIC_MODEL", &self.main),
+            ("ANTHROPIC_DEFAULT_FABLE_MODEL", &self.fable),
+            ("ANTHROPIC_DEFAULT_OPUS_MODEL", &self.opus),
+            ("ANTHROPIC_DEFAULT_SONNET_MODEL", &self.sonnet),
+            ("ANTHROPIC_DEFAULT_HAIKU_MODEL", &self.haiku),
+        ]
+    }
+
+    /// 档位（测试、界面用）：`main` 和四个别名，各自指定的模型
+    pub fn slots(&self) -> [(&'static str, Option<&str>); 5] {
+        [("main", self.main.as_deref()), ("fable", self.fable.as_deref()), ("opus", self.opus.as_deref()), ("sonnet", self.sonnet.as_deref()), ("haiku", self.haiku.as_deref())]
     }
 
     fn clean(self) -> Result<Self, LocalError> {
         let f = |v: Option<String>| crate::model::clean_model(v.as_deref()).map_err(|_| LocalError::invalid("models", "invalid"));
-        Ok(Models { main: f(self.main)?, opus: f(self.opus)?, sonnet: f(self.sonnet)?, haiku: f(self.haiku)? })
+        Ok(Models { main: f(self.main)?, opus: f(self.opus)?, sonnet: f(self.sonnet)?, haiku: f(self.haiku)?, fable: f(self.fable)? })
     }
 }
 
@@ -447,19 +460,62 @@ pub fn launch_env(home: &Path, p: &Profile) -> Option<LaunchEnv> {
                 return None;
             }
             let key = key_path(home, &p.id);
-            let mut env = match p.auth {
+            let env = match p.auth {
                 Auth::Bearer => crate::model::claude_api_env(url, key),
                 Auth::ApiKey => crate::model::claude_api_key_env(url, key),
             };
-            for (k, v) in p.models.vars() {
-                if let Some(v) = v {
-                    env = env.lit(k, v.clone());
-                }
-            }
-            env
+            with_models(env, &p.models)
         }
     };
     Some(p.tuning.env(env, p.kind == Kind::Api))
+}
+
+fn with_models(mut env: LaunchEnv, m: &Models) -> LaunchEnv {
+    for (k, v) in m.vars() {
+        if let Some(v) = v {
+            env = env.lit(k, v.clone());
+        }
+    }
+    env
+}
+
+/// 测试第三方接口（还没保存的也行）用的环境：Key 直接给值（不经文件），其余和 [`launch_env`] 一样
+pub fn test_env(p: &Profile, key: &str) -> Option<LaunchEnv> {
+    let url = p.base_url.as_deref().filter(|u| crate::model::check_base_url(u).is_ok())?;
+    let (set, clear) = match p.auth {
+        Auth::Bearer => ("ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"),
+        Auth::ApiKey => ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"),
+    };
+    let env = LaunchEnv::new().lit("ANTHROPIC_BASE_URL", url).lit(set, key).unset(clear);
+    Some(p.tuning.env(with_models(env, &p.models), true))
+}
+
+/// 测试用的配置：已保存的（`id`）改上表单里填的，没保存的按表单新建一个（不存）；返回配置和 Key（没填用保存的）。
+/// `base_url` 由调用方确定（平台推荐的、快速配置的已经换成地址）
+pub fn draft(store: &Store, home: &Path, id: Option<&str>, input: Input) -> Result<(Profile, String), LocalError> {
+    let mut p = match id {
+        Some(id) => get(store, id).filter(|p| p.kind == Kind::Api).ok_or_else(LocalError::not_found)?,
+        None => Profile { kind: Kind::Api, ..builtin() },
+    };
+    if let Some(url) = input.base_url.as_deref() {
+        let url = url.trim().trim_end_matches('/').to_string();
+        crate::model::check_base_url(&url)?;
+        p.base_url = Some(url);
+    }
+    if let Some(m) = input.models {
+        p.models = m.clean()?;
+    }
+    if let Some(a) = input.auth {
+        p.auth = a;
+    }
+    let key = match input.api_key.as_deref().map(str::trim).filter(|k| !k.is_empty()) {
+        Some(k) => k.to_string(),
+        None => id.and_then(|id| std::fs::read_to_string(key_path(home, id)).ok()).map(|k| k.trim().to_string()).filter(|k| !k.is_empty()).ok_or_else(|| LocalError::new("MODEL_KEY_REQUIRED"))?,
+    };
+    if p.base_url.is_none() {
+        return Err(LocalError::invalid("base_url", "required"));
+    }
+    Ok((p, key))
 }
 
 /// 决定“连哪个服务商、用哪个模型”的环境变量。CC Switch 这类工具把服务商写进用户 `settings.json` 的 `env`，
@@ -470,6 +526,7 @@ const PROVIDER_KEYS: &[&str] = &[
     "ANTHROPIC_AUTH_TOKEN",
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_MODEL",
+    "ANTHROPIC_DEFAULT_FABLE_MODEL",
     "ANTHROPIC_DEFAULT_OPUS_MODEL",
     "ANTHROPIC_DEFAULT_SONNET_MODEL",
     "ANTHROPIC_DEFAULT_HAIKU_MODEL",
@@ -1203,6 +1260,17 @@ mod tests {
         let cmd = launch_env(&dir, &p).unwrap().wrap("claude", crate::shells::Family::Posix);
         assert!(cmd.contains(" ANTHROPIC_API_KEY=\"$(cat ") && cmd.contains(" ANTHROPIC_AUTH_TOKEN= "), "{cmd}");
         assert_eq!(get(&store, &p.id).unwrap().auth, Auth::ApiKey);
+        // Fable 也能指定
+        let p = update(&store, &dir, &p.id, Input { models: Some(Models { fable: Some("glm-5".into()), ..Default::default() }), ..Default::default() }).unwrap();
+        let cmd = launch_env(&dir, &p).unwrap().wrap("claude", crate::shells::Family::Posix);
+        assert!(cmd.contains(" ANTHROPIC_DEFAULT_FABLE_MODEL='glm-5' "), "{cmd}");
+        // 测试用的环境：Key 直接给值，没保存的表单也行
+        let (d, key) = draft(&store, &dir, None, Input { base_url: Some("https://t.example.com/".into()), models: Some(Models { opus: Some("o-1".into()), ..Default::default() }), api_key: Some("sk-t".into()), ..Default::default() }).unwrap();
+        assert_eq!((d.base_url.as_deref(), key.as_str()), (Some("https://t.example.com"), "sk-t"));
+        let env: std::collections::HashMap<_, _> = test_env(&d, &key).unwrap().resolved().into_iter().collect();
+        assert_eq!((env["ANTHROPIC_AUTH_TOKEN"].as_str(), env["ANTHROPIC_DEFAULT_OPUS_MODEL"].as_str()), ("sk-t", "o-1"));
+        let (_, key) = draft(&store, &dir, Some(&p.id), Input::default()).unwrap();
+        assert_eq!(key, "sk-1", "没填 Key 用保存的");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

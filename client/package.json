@@ -9,7 +9,7 @@
     "build": "vite build",
     "build:wasm": "bash scripts/build-term-web.sh",
     "check:locales": "node scripts/check-locales.mjs",
-    "test": "node --test src-term/zstd.test.mjs src-term/dom/dom.test.mjs src-ui/shared/xfer.test.mjs src-ui/shared/chat.test.mjs src-ui/shared/inputHistory.test.mjs src-ui/shared/chatCopy.test.mjs src-ui/shared/chatShare.test.mjs src-ui/shared/office.test.mjs src-ui/shared/selectAt.test.mjs src-ui/shared/mermaidView.test.mjs src-ui/shared/pet/brain.test.mjs src-ui/shared/pet/events.test.mjs src-ui/shared/project.test.mjs src-ui/files/pathLinks.test.mjs"
+    "test": "node --test src-term/zstd.test.mjs src-term/dom/dom.test.mjs src-ui/shared/xfer.test.mjs src-ui/shared/chat.test.mjs src-ui/shared/inputHistory.test.mjs src-ui/shared/chatCopy.test.mjs src-ui/shared/chatShare.test.mjs src-ui/shared/office.test.mjs src-ui/shared/selectAt.test.mjs src-ui/shared/mermaidView.test.mjs src-ui/shared/pet/brain.test.mjs src-ui/shared/pet/events.test.mjs src-ui/shared/project.test.mjs src-ui/shared/claudeDomains.test.mjs src-ui/files/pathLinks.test.mjs"
   },
   "dependencies": {
     "@aiden0z/pptx-renderer": "1.4.0",

@@ -16,11 +16,11 @@
 //! 测试用的环境变量：`LOOKLOOK_ACME_DIRECTORY`、`LOOKLOOK_ACME_ROOT`（额外信任的根证书 PEM，Pebble 用）、
 //! `LOOKLOOK_ACME_PROFILE`（空字符串表示不指定）、`LOOKLOOK_ACME_HTTP_PORT`、`LOOKLOOK_ACME_TLS_PORT`。
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::Duration;
 
 use axum::http::{self, header, HeaderMap, HeaderValue, StatusCode};
@@ -31,13 +31,13 @@ use instant_acme::{
     Account, AccountCredentials, AuthorizationStatus, BodyWrapper, BytesResponse, CertificateIdentifier, ChallengeType, Identifier, NewAccount, NewOrder,
     OrderStatus, RetryPolicy,
 };
-use looklook_protocol::direct::{self as proto, CheckRequest, DirectInfo};
+use looklook_protocol::direct::{self as proto, CheckRequest, DirectEndpoint, DirectInfo, EndpointKind};
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
 use serde::{Deserialize, Serialize};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use tokio::sync::Notify;
 
 use crate::gateway::access::AccessConfig;
@@ -46,11 +46,14 @@ use crate::store::Store;
 const KEY_CONFIG: &str = "direct";
 const KEY_ACCOUNT: &str = "acme_account";
 const KEY_CERT: &str = "direct_tls";
+const KEY_SELF_CERT: &str = "direct_self_tls";
 const KEY_SECRET: &str = "direct_secret";
 
 pub const COOKIE: &str = "ll_direct";
 /// 公网访问码至少这么多个字符（默认生成的访问码是 12 个）。
 pub const MIN_PUBLIC_CODE: usize = 12;
+/// 最多配置多少条穿透 / DDNS / 端口映射地址。
+pub const MAX_CUSTOM_URLS: usize = 16;
 /// Let's Encrypt 订户协议（第一次打开时在界面上显示）。
 pub const TOS_URL: &str = "https://letsencrypt.org/repository/";
 
@@ -58,7 +61,7 @@ const LE_PRODUCTION: &str = "https://acme-v02.api.letsencrypt.org/directory";
 const DEFAULT_PROFILE: &str = "shortlived";
 /// 失败后的重试间隔：1、5、30 分钟，之后每 2 小时。
 const BACKOFF: [u64; 4] = [60, 300, 1800, 7200];
-/// 没有公网 IP、等 DDNS 解析、平时检查 IP 有没有变的间隔。
+/// 没有公网 IP、等 DDNS 解析、平时检查 IP 或自定义证书文件有没有变的间隔。
 const POLL: Duration = Duration::from_secs(60);
 /// ARI 隔这么久重新问一次（Let's Encrypt 出事故要提前续期时会改窗口）。
 const ARI_EVERY: i64 = 6 * 3600;
@@ -68,6 +71,9 @@ const GLOBAL_WINDOW_MS: i64 = 3600 * 1000;
 /// 最近的公网登录记多少条（只在内存里，界面显示）。
 const MAX_LOGINS: usize = 20;
 const CODE_COOKIE_MAX_AGE: i64 = 30 * 86400;
+/// 同一张 `mux` 票据允许在多候选并发竞速窗口内握手几次。
+const MUX_JTI_RACE_MS: i64 = 15_000;
+const MUX_JTI_MAX_USES: u8 = 8;
 
 type HmacSha256 = Hmac<Sha256>;
 type Pending = Arc<Mutex<HashMap<String, String>>>;
@@ -75,8 +81,17 @@ type Pending = Arc<Mutex<HashMap<String, String>>>;
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct DirectConfig {
-    /// 开启“公网 HTTPS 直连”（默认关闭）
+    /// 开启“公网直连（IPv6 / IPv4）”（默认关闭）
     pub enabled: bool,
+    /// 用户添加的内网穿透 / 反向代理 / DDNS / 端口映射地址
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub custom_urls: Vec<String>,
+    /// 高级选项：自定义 TLS 证书链 PEM 路径
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub tls_cert_path: String,
+    /// 高级选项：自定义 TLS 私钥 PEM 路径
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub tls_key_path: String,
 }
 
 impl DirectConfig {
@@ -85,10 +100,10 @@ impl DirectConfig {
     }
 }
 
-/// 存在本机的证书。
+/// 存在本机的 ACME 证书（兼容旧版 `Ipv4Addr` JSON 字符串与新版 `IpAddr`）。
 #[derive(Clone, Serialize, Deserialize)]
 struct Stored {
-    ip: Ipv4Addr,
+    ip: IpAddr,
     /// 证书链（PEM）
     chain: String,
     /// 私钥（PKCS#8 PEM）
@@ -105,6 +120,30 @@ struct Stored {
     method: String,
 }
 
+/// 本机持久自签 TLS 证书（无公网受信任证书时兜底，供桌面端与手机端通过 `ctl hello` 签名绑定安全直连）。
+#[derive(Clone, Serialize, Deserialize)]
+struct SelfStored {
+    chain: String,
+    key: String,
+    not_after: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum CertSan {
+    Dns(String),
+    Ip(IpAddr),
+}
+
+#[derive(Clone, Default)]
+struct ActiveTls {
+    /// 是否为浏览器受信任的证书（ACME 或用户提供的有效 PEM）
+    web_tls: bool,
+    not_after: i64,
+    /// 叶子证书 DER 的 SHA-256 小写 hex（64 位）
+    sha256_hex: String,
+    sans: Vec<CertSan>,
+}
+
 #[derive(Serialize, Deserialize)]
 struct StoredAccount {
     directory: String,
@@ -114,10 +153,10 @@ struct StoredAccount {
 /// 界面显示的状态。
 #[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
 pub struct Status {
-    /// `off` 没开、`no_ip` 没有公网 IPv4、`working` 正在申请、`ok` 可以用、`failed` 申请失败（还没有可用的证书）
+    /// `off` 没开、`no_ip` 没有公网地址、`working` 正在申请证书、`ok` 有浏览器受信任证书、`failed` 仅桌面端/手机端自签直连可用（浏览器回退 P2P）
     pub phase: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub ip: Option<Ipv4Addr>,
+    pub ip: Option<IpAddr>,
     /// 直连地址 `https://IP:端口`（有可用证书时）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
@@ -125,11 +164,10 @@ pub struct Status {
     pub not_after: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub renew_at: Option<i64>,
-    /// `http01`、`tls_alpn01`、`forward`
+    /// `http01`、`tls_alpn01`、`forward`、`custom`
     #[serde(skip_serializing_if = "Option::is_none")]
     pub method: Option<String>,
-    /// 最近一次失败的原因：`no_privilege`（Linux 普通用户绑不了 80 / 443）、`port_busy`（80、443 都被占用且没有转发）、
-    /// `unreachable`（外面连不到 80 / 443）、`rate_limited`、`acme`（Let's Encrypt 拒绝，见 `detail`）、`network`、`expired`
+    /// 最近一次失败的原因
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -147,7 +185,7 @@ pub struct Status {
 pub struct Login {
     pub ip: IpAddr,
     pub at: i64,
-    /// `code`（访问码）或 `grant`（平台票据）
+    /// `code`（访问码）或 `grant`（平台票据）或 `site`（复用直连）
     pub via: &'static str,
 }
 
@@ -159,11 +197,21 @@ struct Global {
     locked_until: i64,
 }
 
+#[derive(Clone, Copy)]
+struct JtiUse {
+    first_ms: i64,
+    uses: u8,
+    exp_ms: i64,
+}
+
 pub struct Direct {
     store: Arc<Store>,
     /// 管理台端口（直连地址用它）
     port: u16,
+    self_cert: Arc<CertifiedKey>,
+    self_sha256: String,
     cert: RwLock<Option<Arc<CertifiedKey>>>,
+    tls_meta: RwLock<ActiveTls>,
     status: Mutex<Status>,
     /// 当前待验证的 http-01 token → key authorization（管理台端口和临时监听的 80 端口共用）
     pending: Pending,
@@ -171,14 +219,35 @@ pub struct Direct {
     secret: RwLock<[u8; 32]>,
     logins: Mutex<VecDeque<Login>>,
     global: Mutex<Global>,
-    /// 用过的票据 jti → 过期时间（毫秒）
-    jtis: Mutex<HashMap<String, i64>>,
+    /// 用过的票据 jti → 使用记录
+    jtis: Mutex<HashMap<String, JtiUse>>,
 }
 
-/// 心跳里带的直连地址（[`Direct::advertise`] 更新）。
+static GLOBAL_DIRECT: RwLock<Option<Weak<Direct>>> = RwLock::new(None);
+/// 心跳里带的直连地址兜底缓存。
 static ADVERTISED: RwLock<Option<DirectInfo>> = RwLock::new(None);
 
+pub fn local_port() -> Option<u16> {
+    let weak = GLOBAL_DIRECT.read().unwrap_or_else(|e| e.into_inner()).clone()?;
+    weak.upgrade().map(|d| d.port).filter(|p| *p > 0)
+}
+
+pub fn advertised_endpoints() -> Vec<DirectEndpoint> {
+    let Some(weak) = GLOBAL_DIRECT.read().unwrap_or_else(|e| e.into_inner()).clone() else { return Vec::new() };
+    let Some(d) = weak.upgrade() else { return Vec::new() };
+    let access = AccessConfig::load(&d.store);
+    d.endpoints(&access)
+}
+
 pub fn advertised() -> Option<DirectInfo> {
+    if let Some(weak) = GLOBAL_DIRECT.read().unwrap_or_else(|e| e.into_inner()).clone() {
+        if let Some(d) = weak.upgrade() {
+            let access = AccessConfig::load(&d.store);
+            if let Some(info) = d.direct_info(&access) {
+                return Some(info);
+            }
+        }
+    }
     ADVERTISED.read().unwrap_or_else(|e| e.into_inner()).clone().filter(|d| d.until > now_s())
 }
 
@@ -192,6 +261,232 @@ fn now_ms() -> i64 {
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// 解析并规范化一条用户填写的穿透 / 反代 / DDNS / 端口映射地址。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedCustomUrl {
+    /// 规范化后的展示/存储格式
+    pub canonical: String,
+    /// Host 主机名（小写，IPv6 不带方括号）
+    pub host: String,
+    /// 对应的 `https://` 源（若用户显式填了 `http://` 则为 `None`）
+    pub https_origin: Option<String>,
+    pub kind: EndpointKind,
+    pub explicit_https: bool,
+    pub explicit_http: bool,
+}
+
+const KNOWN_HTTPS_TUNNEL_SUFFIXES: &[&str] = &[
+    ".trycloudflare.com",
+    ".cfargotunnel.com",
+    ".ts.net",
+    ".ngrok-free.app",
+    ".ngrok.app",
+    ".ngrok.io",
+];
+
+pub fn parse_custom_url(raw: &str, default_port: u16) -> Result<ParsedCustomUrl, &'static str> {
+    let s = raw.trim();
+    if s.is_empty() || s.len() > 240 {
+        return Err("url_format");
+    }
+    let (explicit_https, explicit_http, rest) = if let Some(r) = s.strip_prefix("https://").or_else(|| s.strip_prefix("HTTPS://")) {
+        (true, false, r)
+    } else if let Some(r) = s.strip_prefix("http://").or_else(|| s.strip_prefix("HTTP://")) {
+        (false, true, r)
+    } else if s.contains("://") {
+        return Err("url_format");
+    } else {
+        (false, false, s)
+    };
+    let rest = rest.strip_suffix('/').unwrap_or(rest);
+    if rest.is_empty() || rest.bytes().any(|b| matches!(b, b'/' | b'?' | b'#' | b'@' | b'\\') || b <= b' ' || b >= 0x7f) {
+        return Err("url_format");
+    }
+
+    // 解析 (host, port_opt, is_v6)
+    let (host, port_opt, is_v6) = if let Some(after_b) = rest.strip_prefix('[') {
+        let Some((v6_s, tail)) = after_b.split_once(']') else { return Err("url_format") };
+        if v6_s.contains('%') {
+            return Err("url_format");
+        }
+        let v6: Ipv6Addr = v6_s.parse().map_err(|_| "url_format")?;
+        let p = if tail.is_empty() {
+            None
+        } else {
+            let ps = tail.strip_prefix(':').ok_or("url_format")?;
+            let pn: u16 = ps.parse().ok().filter(|n| *n > 0 && !ps.starts_with('0')).ok_or("url_format")?;
+            Some(pn)
+        };
+        (v6.to_string(), p, true)
+    } else if rest.matches(':').count() > 1 {
+        // 裸 IPv6（没写方括号也没带端口）
+        let v6: Ipv6Addr = rest.parse().map_err(|_| "url_format")?;
+        (v6.to_string(), None, true)
+    } else if let Some((h, ps)) = rest.split_once(':') {
+        let pn: u16 = ps.parse().ok().filter(|n| *n > 0 && !ps.starts_with('0')).ok_or("url_format")?;
+        (h.trim_end_matches('.').to_ascii_lowercase(), Some(pn), false)
+    } else {
+        (rest.trim_end_matches('.').to_ascii_lowercase(), None, false)
+    };
+
+    if host.is_empty() || host == "localhost" || host.ends_with(".localhost") || host.ends_with(".local") {
+        return Err("host_unusable");
+    }
+
+    let kind = if is_v6 {
+        let v6: Ipv6Addr = host.parse().map_err(|_| "url_format")?;
+        let seg0 = v6.segments()[0];
+        if v6.is_loopback() || v6.is_unspecified() || v6.is_multicast() || (seg0 & 0xffc0) == 0xfe80 || v6.to_ipv4_mapped().is_some() {
+            return Err("host_unusable");
+        }
+        if (seg0 & 0xfe00) == 0xfc00 {
+            EndpointKind::Lan
+        } else if (seg0 & 0xe000) == 0x2000 && !(seg0 == 0x2001 && v6.segments()[1] == 0x0db8) {
+            EndpointKind::Ipv6
+        } else {
+            return Err("host_unusable");
+        }
+    } else if let Ok(v4) = host.parse::<Ipv4Addr>() {
+        let o = v4.octets();
+        if v4.is_loopback() || v4.is_unspecified() || v4.is_link_local() || v4.is_multicast() || v4.is_broadcast() || o[0] == 0 || o[0] >= 240 || (o[0] == 198 && (o[1] & 0xfe) == 18) {
+            return Err("host_unusable");
+        }
+        if v4.is_private() || (o[0] == 100 && (64..128).contains(&o[1])) {
+            EndpointKind::Lan
+        } else {
+            EndpointKind::Public
+        }
+    } else {
+        // 域名
+        if crate::settings::parse_open_host(&host).is_err() || !host.contains('.') {
+            return Err("url_format");
+        }
+        if explicit_https || explicit_http || (port_opt.is_none() && KNOWN_HTTPS_TUNNEL_SUFFIXES.iter().any(|suf| host.ends_with(suf))) {
+            EndpointKind::Tunnel
+        } else {
+            EndpointKind::Ddns
+        }
+    };
+
+    let auto_https_tunnel = !explicit_https && !explicit_http && kind == EndpointKind::Tunnel && port_opt.is_none();
+    let explicit_https = explicit_https || auto_https_tunnel;
+    let host_lit = if is_v6 { format!("[{host}]") } else { host.clone() };
+
+    let (canonical, https_origin) = if explicit_http {
+        let authority = match port_opt {
+            Some(80) | None => host_lit,
+            Some(p) => format!("{host_lit}:{p}"),
+        };
+        (format!("http://{authority}"), None)
+    } else if explicit_https {
+        let authority = match port_opt {
+            Some(443) | None => host_lit,
+            Some(p) => format!("{host_lit}:{p}"),
+        };
+        let u = format!("https://{authority}");
+        if !proto::valid_https_origin(&u, kind == EndpointKind::Lan) {
+            return Err("url_format");
+        }
+        (u.clone(), Some(u))
+    } else {
+        let p = port_opt.unwrap_or(default_port.max(1));
+        let authority = format!("{host_lit}:{p}");
+        let u = format!("https://{authority}");
+        if !proto::valid_https_origin(&u, kind == EndpointKind::Lan) {
+            return Err("url_format");
+        }
+        (authority, Some(u))
+    };
+
+    Ok(ParsedCustomUrl {
+        canonical,
+        host,
+        https_origin,
+        kind,
+        explicit_https,
+        explicit_http,
+    })
+}
+
+fn ensure_self_cert(store: &Store) -> (Arc<CertifiedKey>, String) {
+    let now = now_s();
+    if let Some(s) = store.get::<SelfStored>(KEY_SELF_CERT).ok().flatten().filter(|s| s.not_after > now + 30 * 86400) {
+        if let Ok(ck) = certified_key(&s.chain, &s.key) {
+            let fp = cert_sha256_hex(&ck.cert[0]);
+            return (Arc::new(ck), fp);
+        }
+    }
+    let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("ecdsa keypair");
+    let mut params = rcgen::CertificateParams::new(vec!["looklook.internal".to_string()]).expect("cert params");
+    params.distinguished_name = rcgen::DistinguishedName::new();
+    let now_dt = time::OffsetDateTime::now_utc();
+    params.not_before = now_dt - time::Duration::days(1);
+    params.not_after = now_dt + time::Duration::days(3650);
+    let cert = params.self_signed(&key).expect("self signed cert");
+    let (chain, key_pem) = (cert.pem(), key.serialize_pem());
+    let not_after = (now_dt + time::Duration::days(3650)).unix_timestamp();
+    let _ = store.set(KEY_SELF_CERT, &SelfStored { chain: chain.clone(), key: key_pem.clone(), not_after });
+    let ck = certified_key(&chain, &key_pem).expect("certified key");
+    let fp = cert_sha256_hex(&ck.cert[0]);
+    (Arc::new(ck), fp)
+}
+
+fn cert_sha256_hex(der: &CertificateDer<'_>) -> String {
+    data_encoding::HEXLOWER.encode(&Sha256::digest(der.as_ref()))
+}
+
+fn extract_sans(der: &CertificateDer<'_>) -> Vec<CertSan> {
+    let Ok((_, c)) = x509_parser::parse_x509_certificate(der.as_ref()) else { return Vec::new() };
+    let mut out = Vec::new();
+    for ext in c.extensions() {
+        if let x509_parser::extensions::ParsedExtension::SubjectAlternativeName(san) = ext.parsed_extension() {
+            for gn in &san.general_names {
+                match gn {
+                    x509_parser::extensions::GeneralName::DNSName(d) => out.push(CertSan::Dns(d.trim_end_matches('.').to_ascii_lowercase())),
+                    x509_parser::extensions::GeneralName::IPAddress(b) if b.len() == 4 => {
+                        out.push(CertSan::Ip(IpAddr::V4(Ipv4Addr::new(b[0], b[1], b[2], b[3]))));
+                    }
+                    x509_parser::extensions::GeneralName::IPAddress(b) if b.len() == 16 => {
+                        if let Ok(arr) = <[u8; 16]>::try_from(*b) {
+                            out.push(CertSan::Ip(IpAddr::V6(Ipv6Addr::from(arr))));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    out
+}
+
+fn san_matches_host(san: &CertSan, host: &str) -> bool {
+    let h = host.trim_matches(['[', ']']).trim_end_matches('.').to_ascii_lowercase();
+    if let Ok(ip) = h.parse::<IpAddr>() {
+        return matches!(san, CertSan::Ip(s_ip) if s_ip.to_canonical() == ip.to_canonical());
+    }
+    let CertSan::Dns(pattern) = san else { return false };
+    if let Some(rest) = pattern.strip_prefix("*.") {
+        // 通配符只匹配单级子域名
+        let Some((sub, tail)) = h.split_once('.') else { return false };
+        !sub.is_empty() && tail == rest
+    } else {
+        *pattern == h
+    }
+}
+
+fn load_custom_pem(cert_path: &str, key_path: &str) -> Result<(CertifiedKey, i64, String, Vec<CertSan>), &'static str> {
+    let chain = std::fs::read_to_string(cert_path).map_err(|_| "cert_read")?;
+    let key = std::fs::read_to_string(key_path).map_err(|_| "key_read")?;
+    let ck = certified_key(&chain, &key).map_err(|_| "cert_invalid")?;
+    let (_, not_after) = validity(&ck.cert[0]).ok_or("cert_invalid")?;
+    if not_after <= now_s() {
+        return Err("cert_expired");
+    }
+    let fp = cert_sha256_hex(&ck.cert[0]);
+    let sans = extract_sans(&ck.cert[0]);
+    Ok((ck, not_after, fp, sans))
 }
 
 impl std::fmt::Debug for Direct {
@@ -210,10 +505,15 @@ impl Direct {
                 s
             }
         };
+        let (self_cert, self_sha256) = ensure_self_cert(&store);
+        let init_meta = ActiveTls { web_tls: false, not_after: 0, sha256_hex: self_sha256.clone(), sans: Vec::new() };
         let d = Arc::new(Self {
             store,
             port,
-            cert: RwLock::new(None),
+            cert: RwLock::new(Some(self_cert.clone())),
+            self_cert,
+            self_sha256,
+            tls_meta: RwLock::new(init_meta),
             status: Mutex::new(Status { phase: "off", ..Status::default() }),
             pending: Pending::default(),
             wake: Notify::new(),
@@ -222,14 +522,17 @@ impl Direct {
             global: Mutex::new(Global::default()),
             jtis: Mutex::new(HashMap::new()),
         });
-        // 启动时马上加载存着的证书，不等后台任务
-        if DirectConfig::load(&d.store).enabled {
+        let cfg = DirectConfig::load(&d.store);
+        if !cfg.tls_cert_path.is_empty() && !cfg.tls_key_path.is_empty() {
+            let _ = d.reload_custom_tls(&cfg.tls_cert_path, &cfg.tls_key_path);
+        } else if cfg.enabled {
             if let Some(s) = d.stored() {
                 if s.not_after > now_s() {
                     d.install(&s);
                 }
             }
         }
+        *GLOBAL_DIRECT.write().unwrap_or_else(|e| e.into_inner()) = Some(Arc::downgrade(&d));
         d
     }
 
@@ -237,7 +540,26 @@ impl Direct {
         DirectConfig::load(&self.store)
     }
 
-    /// 开关。关掉时丢掉证书、换 Cookie 密钥（已经登录的公网浏览器全部失效）。
+    /// 是否允许来自公网的访问（开启了公网直连，或配置了外部穿透/加速地址）。
+    pub fn accepts_public(&self) -> bool {
+        let c = self.config();
+        c.enabled || !c.custom_urls.is_empty()
+    }
+
+    /// 当前正在使用的 TLS 叶子证书 SHA-256（小写 hex，64 字符）。
+    pub fn leaf_sha256(&self) -> String {
+        self.tls_meta.read().unwrap_or_else(|e| e.into_inner()).sha256_hex.clone()
+    }
+
+    fn rotate_cookie_secret(&self) -> anyhow::Result<()> {
+        let s = crate::util::random_bytes::<32>();
+        self.store.set(KEY_SECRET, &data_encoding::HEXLOWER.encode(&s))?;
+        *self.secret.write().unwrap_or_else(|e| e.into_inner()) = s;
+        lock(&self.logins).clear();
+        Ok(())
+    }
+
+    /// 开关“公网直连”。关掉且无自定义穿透地址时换 Cookie 密钥（已经登录的公网浏览器全部失效）。
     pub fn set_enabled(&self, on: bool) -> anyhow::Result<()> {
         let mut c = self.config();
         if c.enabled == on {
@@ -246,25 +568,228 @@ impl Direct {
         c.enabled = on;
         self.store.set(KEY_CONFIG, &c)?;
         if !on {
-            self.uninstall();
-            let s = crate::util::random_bytes::<32>();
-            self.store.set(KEY_SECRET, &data_encoding::HEXLOWER.encode(&s))?;
-            *self.secret.write().unwrap_or_else(|e| e.into_inner()) = s;
-            lock(&self.logins).clear();
+            if c.tls_cert_path.is_empty() || c.tls_key_path.is_empty() {
+                self.uninstall();
+            }
+            if c.custom_urls.is_empty() {
+                self.rotate_cookie_secret()?;
+            }
         }
-        tracing::info!(on, "公网 HTTPS 直连开关");
+        tracing::info!(on, "公网直连开关");
         self.wake();
         Ok(())
     }
 
-    /// 设置变了（开关、公网地址）：后台马上重新看一遍。
+    /// 更新用户填写的穿透 / 反代 / DDNS / 端口映射地址列表。
+    pub fn set_custom_urls(&self, raw_list: &[String]) -> Result<Vec<String>, (&'static str, String)> {
+        let mut out = Vec::new();
+        let mut seen = HashSet::new();
+        for item in raw_list {
+            let trimmed = item.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let parsed = parse_custom_url(trimmed, self.port).map_err(|rule| (rule, trimmed.to_string()))?;
+            if seen.insert(parsed.canonical.clone()) {
+                out.push(parsed.canonical);
+            }
+        }
+        if out.len() > MAX_CUSTOM_URLS {
+            return Err(("url_too_many", String::new()));
+        }
+        let mut c = self.config();
+        let was_non_empty = !c.custom_urls.is_empty();
+        c.custom_urls = out.clone();
+        self.store.set(KEY_CONFIG, &c).map_err(|_| ("internal", String::new()))?;
+        if was_non_empty && out.is_empty() && !c.enabled {
+            let _ = self.rotate_cookie_secret();
+        }
+        self.wake();
+        Ok(out)
+    }
+
+    /// 设置或清除高级自定义 TLS 证书 PEM 文件路径。
+    pub fn set_custom_tls(&self, cert_path: &str, key_path: &str) -> Result<(), &'static str> {
+        let (cp, kp) = (cert_path.trim(), key_path.trim());
+        if cp.is_empty() != kp.is_empty() {
+            return Err("cert_pair");
+        }
+        if !cp.is_empty() {
+            self.reload_custom_tls(cp, kp)?;
+        }
+        let mut c = self.config();
+        c.tls_cert_path = cp.to_string();
+        c.tls_key_path = kp.to_string();
+        self.store.set(KEY_CONFIG, &c).map_err(|_| "internal")?;
+        if cp.is_empty() {
+            self.uninstall();
+            self.set_status(|st| {
+                if !self.config().enabled {
+                    *st = Status { phase: "off", ..Status::default() };
+                }
+            });
+        }
+        self.wake();
+        Ok(())
+    }
+
+    fn reload_custom_tls(&self, cert_path: &str, key_path: &str) -> Result<(), &'static str> {
+        let (ck, not_after, sha256_hex, sans) = load_custom_pem(cert_path, key_path)?;
+        let current_fp = self.leaf_sha256();
+        if current_fp == sha256_hex && self.active() {
+            return Ok(());
+        }
+        *self.cert.write().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(ck));
+        *self.tls_meta.write().unwrap_or_else(|e| e.into_inner()) = ActiveTls {
+            web_tls: true,
+            not_after,
+            sha256_hex,
+            sans,
+        };
+        self.set_status(|st| {
+            st.phase = "ok";
+            st.not_after = Some(not_after);
+            st.renew_at = None;
+            st.method = Some("custom".into());
+            st.error = None;
+            st.detail = None;
+            st.next_try = None;
+        });
+        Ok(())
+    }
+
+    /// 当前配置的自定义穿透/DDNS 主机名列表（小写，供 `local_guard` Host 白名单使用）。
+    pub fn custom_hosts(&self) -> Vec<String> {
+        self.config()
+            .custom_urls
+            .iter()
+            .filter_map(|u| parse_custom_url(u, self.port).ok().map(|p| p.host))
+            .collect()
+    }
+
+    /// 匹配请求 `Host` 是否命中某条自定义穿透/公网地址。
+    pub fn match_custom_host(&self, req_host: &str) -> Option<ParsedCustomUrl> {
+        let h = req_host.trim_matches(['[', ']']).trim_end_matches('.');
+        self.config()
+            .custom_urls
+            .iter()
+            .filter_map(|u| parse_custom_url(u, self.port).ok())
+            .find(|p| p.host.eq_ignore_ascii_case(h))
+    }
+
+    /// 判断本机当前安装的受信任证书是否覆盖这个主机或 IP，返回 `(web_tls, until)`。
+    fn cert_covers(&self, host: &str) -> (bool, i64) {
+        let meta = self.tls_meta.read().unwrap_or_else(|e| e.into_inner());
+        let now = now_s();
+        if meta.web_tls && meta.not_after > now && meta.sans.iter().any(|san| san_matches_host(san, host)) {
+            (true, meta.not_after)
+        } else {
+            (false, 0)
+        }
+    }
+
+    /// 生成当前全部直连可达端点（按优先级：局域网/组网 → 穿透与自定义地址 → 公网 IPv6 → 公网 IPv4 / DDNS）。
+    pub fn endpoints(&self, access: &AccessConfig) -> Vec<DirectEndpoint> {
+        let cfg = self.config();
+        let net = crate::rtc::net::current();
+        let port = self.port;
+        let mut out = Vec::new();
+        let mut seen = HashSet::new();
+        let mut push = |ep: DirectEndpoint| {
+            if out.len() < MAX_CUSTOM_URLS && ep.valid_url() && seen.insert(ep.url.clone()) {
+                out.push(ep);
+            }
+        };
+
+        // 1. 局域网 / Tailscale / ZeroTier 直连
+        if access.allow_lan {
+            for ip in crate::gateway::access::own_lan_ips().into_iter().take(6) {
+                let host_lit = match ip {
+                    IpAddr::V4(v4) => v4.to_string(),
+                    IpAddr::V6(v6) => format!("[{v6}]"),
+                };
+                let (web_tls, until) = self.cert_covers(&ip.to_string());
+                push(DirectEndpoint {
+                    url: format!("https://{host_lit}:{port}"),
+                    kind: EndpointKind::Lan,
+                    web_tls,
+                    until,
+                });
+            }
+        }
+
+        // 2. 用户配置的穿透 / 反代 / DDNS / 端口映射地址
+        for raw in &cfg.custom_urls {
+            let Ok(p) = parse_custom_url(raw, port) else { continue };
+            let Some(url) = p.https_origin else { continue };
+            let (web_tls, until) = if p.explicit_https {
+                (true, 0)
+            } else {
+                self.cert_covers(&p.host)
+            };
+            push(DirectEndpoint { url, kind: p.kind, web_tls, until });
+        }
+
+        // 3. 公网直连（IPv6 / IPv4 / RTC 网络里填的公网地址或 DDNS）
+        if cfg.enabled {
+            if net.ipv6 {
+                if let Some(s) = net.public_v6.as_deref() {
+                    if let Ok(crate::rtc::net::Addr::Name(domain)) = crate::rtc::net::parse_addr(s, true) {
+                        let (web_tls, until) = self.cert_covers(&domain);
+                        push(DirectEndpoint { url: format!("https://{domain}:{port}"), kind: EndpointKind::Ddns, web_tls, until });
+                    }
+                    if let Some(IpAddr::V6(v6)) = crate::rtc::net::public_ip(s, true) {
+                        let (web_tls, until) = self.cert_covers(&v6.to_string());
+                        push(DirectEndpoint { url: format!("https://[{v6}]:{port}"), kind: EndpointKind::Ipv6, web_tls, until });
+                    }
+                }
+                for v6 in crate::rtc::net::nic_v6().into_iter().take(2) {
+                    let (web_tls, until) = self.cert_covers(&v6.to_string());
+                    push(DirectEndpoint { url: format!("https://[{v6}]:{port}"), kind: EndpointKind::Ipv6, web_tls, until });
+                }
+            }
+            if let Some(s) = net.public_v4.as_deref() {
+                if let Ok(crate::rtc::net::Addr::Name(domain)) = crate::rtc::net::parse_addr(s, false) {
+                    let (web_tls, until) = self.cert_covers(&domain);
+                    push(DirectEndpoint { url: format!("https://{domain}:{port}"), kind: EndpointKind::Ddns, web_tls, until });
+                }
+            }
+            if let Some(v4) = public_v4() {
+                let (web_tls, until) = self.cert_covers(&v4.to_string());
+                push(DirectEndpoint { url: format!("https://{v4}:{port}"), kind: EndpointKind::Public, web_tls, until });
+            }
+        }
+
+        out
+    }
+
+    /// 供平台设备列表“直接打开”按钮跳转的最优外部受信任 HTTPS 地址。
+    pub fn direct_info(&self, access: &AccessConfig) -> Option<DirectInfo> {
+        let eps = self.endpoints(access);
+        let rank = |k: EndpointKind| match k {
+            EndpointKind::Tunnel => 0,
+            EndpointKind::Ddns => 1,
+            EndpointKind::Public => 2,
+            EndpointKind::Ipv6 => 3,
+            EndpointKind::Lan => 99,
+        };
+        let best = eps.into_iter().filter(|e| e.kind != EndpointKind::Lan && e.web_tls).min_by_key(|e| rank(e.kind))?;
+        let now = now_s();
+        Some(DirectInfo {
+            url: best.url,
+            until: if best.until > now { best.until } else { now + 2 * 86400 },
+        })
+    }
+
+    /// 设置变了（开关、公网地址、自定义证书）：后台马上重新看一遍。
     pub fn wake(&self) {
         self.wake.notify_one();
     }
 
-    /// 有可用的证书（HTTPS 可以用，公网来源可以算 `Public`）。
+    /// 当前是否装有浏览器受信任的证书（ACME 或用户自定义 PEM）。
+    /// 注意：即使为 `false`，本机持久自签证书也始终在位，供桌面端与手机端安全直连。
     pub fn active(&self) -> bool {
-        self.cert.read().unwrap_or_else(|e| e.into_inner()).is_some()
+        self.tls_meta.read().unwrap_or_else(|e| e.into_inner()).web_tls
     }
 
     pub fn status(&self) -> Status {
@@ -283,12 +808,24 @@ impl Direct {
         self.store.get::<Stored>(KEY_CERT).ok().flatten()
     }
 
-    /// 装上证书（热替换，不用重启监听）。
+    /// 装上受信任的 ACME 证书（热替换，不用重启监听）。
     fn install(&self, s: &Stored) -> bool {
         match certified_key(&s.chain, &s.key) {
             Ok(ck) => {
+                let sha256_hex = cert_sha256_hex(&ck.cert[0]);
+                let sans = extract_sans(&ck.cert[0]);
                 *self.cert.write().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(ck));
-                let url = format!("https://{}:{}", s.ip, self.port);
+                *self.tls_meta.write().unwrap_or_else(|e| e.into_inner()) = ActiveTls {
+                    web_tls: true,
+                    not_after: s.not_after,
+                    sha256_hex,
+                    sans,
+                };
+                let host_lit = match s.ip {
+                    IpAddr::V4(v4) => v4.to_string(),
+                    IpAddr::V6(v6) => format!("[{v6}]"),
+                };
+                let url = format!("https://{host_lit}:{}", self.port);
                 *ADVERTISED.write().unwrap_or_else(|e| e.into_inner()) = Some(DirectInfo { url: url.clone(), until: s.not_after });
                 self.set_status(|st| {
                     st.phase = "ok";
@@ -307,8 +844,15 @@ impl Direct {
         }
     }
 
+    /// 退回到本机持久自签 TLS 证书（桌面端和手机端仍可经设备公钥签名校验直连）。
     fn uninstall(&self) {
-        *self.cert.write().unwrap_or_else(|e| e.into_inner()) = None;
+        *self.cert.write().unwrap_or_else(|e| e.into_inner()) = Some(self.self_cert.clone());
+        *self.tls_meta.write().unwrap_or_else(|e| e.into_inner()) = ActiveTls {
+            web_tls: false,
+            not_after: 0,
+            sha256_hex: self.self_sha256.clone(),
+            sans: Vec::new(),
+        };
         *ADVERTISED.write().unwrap_or_else(|e| e.into_inner()) = None;
     }
 
@@ -370,8 +914,9 @@ impl Direct {
         exp_ms > account.clock.now_ms() && !account.is_revoked(sid) && crate::gateway::ct_eq(v, &self.grant_cookie(&session.user.id, sid, exp_ms))
     }
 
-    fn set_cookie(r: &mut Response, value: &str, max_age: i64) {
-        let c = format!("{COOKIE}={value}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age={}", max_age.max(0));
+    fn set_cookie(r: &mut Response, value: &str, max_age: i64, secure: bool) {
+        let sec = if secure { " Secure;" } else { "" };
+        let c = format!("{COOKIE}={value}; HttpOnly;{sec} SameSite=Strict; Path=/; Max-Age={}", max_age.max(0));
         if let Ok(v) = HeaderValue::from_str(&c) {
             r.headers_mut().append(header::SET_COOKIE, v);
         }
@@ -415,8 +960,22 @@ impl Direct {
         }
     }
 
-    /// 公网来源提交访问码。返回 `Err(界面错误名)`：`short`（访问码不够 12 位，不能用于公网）、`too_many`、`wrong`。
+    /// 公网来源提交访问码（默认发 `Secure` Cookie）。
+    #[cfg(test)]
     pub fn submit_code(&self, cfg: &AccessConfig, limiter: &crate::gateway::access::Limiter, ip: IpAddr, code: &str, next: &str) -> Result<Response, &'static str> {
+        self.submit_code_ext(cfg, limiter, ip, code, next, true)
+    }
+
+    /// 公网 / 穿透来源提交访问码。`secure_cookie`：仅当用户显式填了 `http://` 明文穿透地址时为 `false`。
+    pub fn submit_code_ext(
+        &self,
+        cfg: &AccessConfig,
+        limiter: &crate::gateway::access::Limiter,
+        ip: IpAddr,
+        code: &str,
+        next: &str,
+        secure_cookie: bool,
+    ) -> Result<Response, &'static str> {
         if !public_code_ok(cfg) {
             return Err("short");
         }
@@ -432,7 +991,7 @@ impl Direct {
         limiter.clear(ip);
         self.note_login(ip, "code");
         let mut r = axum::response::Redirect::to(next).into_response();
-        Self::set_cookie(&mut r, &self.code_cookie(cfg), CODE_COOKIE_MAX_AGE);
+        Self::set_cookie(&mut r, &self.code_cookie(cfg), CODE_COOKIE_MAX_AGE, secure_cookie);
         Ok(r)
     }
 
@@ -447,12 +1006,13 @@ impl Direct {
         let Some(session) = account.session() else { return (StatusCode::FORBIDDEN, axum::Json(serde_json::json!({ "error": "not_logged_in" }))).into_response() };
         let now = account.clock.now_ms();
         let mut r = axum::Json(serde_json::json!({ "ok": true })).into_response();
-        Self::set_cookie(&mut r, &self.grant_cookie(&session.user.id, &g.sid, g.abs_exp), (g.abs_exp - now) / 1000);
+        Self::set_cookie(&mut r, &self.grant_cookie(&session.user.id, &g.sid, g.abs_exp), (g.abs_exp - now) / 1000, true);
         r
     }
 
-    /// 校验直连票据（§5）：签名、本机用户与设备、`origin` 是这次请求的源、没过期、没吊销、`jti` 没用过。
-    /// 通过时记一次公网登录（`via`：`grant` 打开直连页面，`site` 专属域名下的直连传输 [`crate::rtc::mux`]）。
+    /// 校验直连票据：
+    /// - `via == "grant"`（打开直连页面设长效 Cookie）：严格要求 `g.origin == origin`，且 `jti` 严格一次性；
+    /// - `via == "site"`（`/__looklook/mux` WebSocket）：允许设备级空 `g.origin`，且允许同一 `jti` 在 15 秒竞速窗口内并发探测多条候选路径。
     pub fn check_grant(&self, account: &crate::account::Account, ip: IpAddr, origin: &str, token: &str, via: &'static str) -> Result<proto::DirectGrant, &'static str> {
         let fail = |why: &'static str| {
             tracing::info!(%ip, why, via, "直连票据没通过");
@@ -461,7 +1021,12 @@ impl Direct {
         let Some(session) = account.session() else { return fail("not_logged_in") };
         let now = account.clock.now_ms();
         let platform = account.platform();
-        let g = match proto::verify_grant(token, |kid| platform.key(kid), &session.user.id, &session.device_id, origin, now) {
+        let verified = if via == "site" {
+            proto::verify_mux_grant(token, |kid| platform.key(kid), &session.user.id, &session.device_id, origin, now)
+        } else {
+            proto::verify_grant(token, |kid| platform.key(kid), &session.user.id, &session.device_id, origin, now)
+        };
+        let g = match verified {
             Ok(g) => g,
             Err(e) => {
                 tracing::debug!(?e, "直连票据校验失败");
@@ -476,18 +1041,29 @@ impl Direct {
         }
         {
             let mut j = lock(&self.jtis);
-            j.retain(|_, exp| *exp > now);
-            if j.insert(g.jti.clone(), g.exp + proto::LEEWAY_MS).is_some() {
-                return fail("replay");
+            j.retain(|_, u| u.exp_ms > now);
+            let max_uses = if via == "site" { MUX_JTI_MAX_USES } else { 1 };
+            match j.get_mut(&g.jti) {
+                Some(u) => {
+                    if via != "site" || u.uses >= max_uses || now.saturating_sub(u.first_ms) > MUX_JTI_RACE_MS {
+                        return fail("replay");
+                    }
+                    u.uses += 1;
+                }
+                None => {
+                    j.insert(g.jti.clone(), JtiUse { first_ms: now, uses: 1, exp_ms: g.exp + proto::LEEWAY_MS });
+                }
             }
         }
-        self.note_login(ip, via);
+        if !ip.is_loopback() {
+            self.note_login(ip, via);
+        }
         Ok(g)
     }
 
     // ---------------- 后台：申请与续期 ----------------
 
-    /// 后台任务：按开关、公网 IP 与证书有效期申请、续期。
+    /// 后台任务：按开关、公网 IP（IPv4 或 IPv6）、自定义证书文件与证书有效期申请、续期。
     pub async fn run(self: Arc<Self>, account: Arc<crate::account::Account>) {
         let mut failures: usize = 0;
         let mut retry_at: i64 = 0;
@@ -502,20 +1078,43 @@ impl Direct {
 
     /// 走一步，返回下次什么时候再看。
     async fn step(self: &Arc<Self>, account: &Arc<crate::account::Account>, failures: &mut usize, retry_at: &mut i64) -> Duration {
-        if !self.config().enabled {
+        let cfg = self.config();
+        // 1. 用户指定了自定义证书 PEM 文件：定期检查文件是否更新（如 acme.sh / Lucky 自动续期），不再跑 ACME
+        if !cfg.tls_cert_path.is_empty() && !cfg.tls_key_path.is_empty() {
+            let prev_fp = self.leaf_sha256();
+            match self.reload_custom_tls(&cfg.tls_cert_path, &cfg.tls_key_path) {
+                Ok(()) => {
+                    if self.leaf_sha256() != prev_fp {
+                        tracing::info!("已热加载更新后的自定义 TLS 证书");
+                        account.wake();
+                    }
+                }
+                Err(code) => {
+                    tracing::warn!(code, "自定义 TLS 证书读取失败或已过期，回退自签证书");
+                    self.uninstall();
+                    self.set_status(|st| {
+                        st.phase = "failed";
+                        st.method = Some("custom".into());
+                        st.error = Some(code.into());
+                    });
+                }
+            }
+            return POLL;
+        }
+
+        if !cfg.enabled {
             self.uninstall();
             *failures = 0;
             self.set_status(|s| *s = Status { phase: "off", ..Status::default() });
             return Duration::from_secs(3600);
         }
-        let Some(ip) = public_v4() else {
+        let Some(ip) = acme_target_ip() else {
             self.uninstall();
             self.set_status(|s| *s = Status { phase: "no_ip", ..Status::default() });
             return POLL;
         };
         let now = now_s();
         let mut stored = self.stored().filter(|s| s.ip == ip);
-        // 证书过期了：停用 HTTPS（不继续用过期证书，docs/09 §11 第 2 条）
         if stored.as_ref().is_some_and(|s| s.not_after <= now) {
             stored = None;
         }
@@ -523,14 +1122,14 @@ impl Direct {
             Some(s) => {
                 if !self.active() || lock(&self.status).ip != Some(ip) {
                     self.install(s);
+                    account.wake();
                 }
             }
             None => {
                 if self.active() {
-                    tracing::info!(%ip, "公网 IP 变了或证书过期，停用 HTTPS，重新申请");
+                    tracing::info!(%ip, "公网地址变了或证书过期，回退自签证书并重新申请");
                     self.uninstall();
                 }
-                // 刚停用（或者 IP 换了）：状态从头开始；还在重试的保留上次的失败原因
                 self.set_status(|st| {
                     if st.phase == "ok" || st.ip != Some(ip) || matches!(st.phase, "off" | "no_ip") {
                         let expired = st.phase == "ok" && st.ip == Some(ip);
@@ -574,6 +1173,7 @@ impl Direct {
                     st.detail = None;
                     st.next_try = None;
                 });
+                account.wake();
                 tracing::info!(%ip, not_after = s.not_after, renew_at = s.renew_at, method = %s.method, "直连证书已更新");
                 let me = self.clone();
                 let account = account.clone();
@@ -583,7 +1183,7 @@ impl Direct {
                 let wait = BACKOFF[(*failures).min(BACKOFF.len() - 1)] as i64;
                 *failures += 1;
                 *retry_at = now_s() + wait;
-                tracing::warn!(%ip, code = e.code, detail = %e.detail, retry_in = wait, "申请直连证书失败");
+                tracing::info!(%ip, code = e.code, detail = %e.detail, retry_in = wait, "未获取到浏览器公网证书，保持桌面端/手机端自签直连与 P2P 可用");
                 self.set_status(|st| {
                     if !self.active() {
                         st.phase = "failed";
@@ -592,7 +1192,6 @@ impl Direct {
                     st.detail = Some(e.detail.clone()).filter(|d| !d.is_empty());
                     st.next_try = Some(*retry_at);
                 });
-                // 证书到期前一直续不上：到期那一刻在上面停用
                 if let Some(s) = &stored {
                     *retry_at = (*retry_at).min(s.not_after);
                 }
@@ -602,7 +1201,7 @@ impl Direct {
     }
 
     /// 申请成功后请主服务从外面访问 `https://IP:端口/__looklook/ping`。
-    async fn check_reach(&self, account: &crate::account::Account, ip: Ipv4Addr) {
+    async fn check_reach(&self, account: &crate::account::Account, ip: IpAddr) {
         let r = account.direct_check(&CheckRequest::Ping { ip: ip.to_string(), port: self.port }).await;
         let reach = match r {
             Some(Ok(c)) if c.ok => "ok".to_string(),
@@ -628,16 +1227,14 @@ impl Direct {
         Ok(acct)
     }
 
-    /// 申请一张证书。`old`：同一个 IP 的旧证书（下单时带 `replaces`）。
-    async fn issue(&self, account: &crate::account::Account, ip: Ipv4Addr, old: Option<&Stored>) -> Result<Stored, Fail> {
-        // 先占好验证用的端口，再自检，最后下单
-        // 不管怎么返回，待验证的 token 都清掉
+    /// 申请一张证书（支持公网 IPv4 与公网 IPv6）。`old`：同一个 IP 的旧证书（下单时带 `replaces`）。
+    async fn issue(&self, account: &crate::account::Account, ip: IpAddr, old: Option<&Stored>) -> Result<Stored, Fail> {
         let _clear = ClearPending(&self.pending);
-        let validator = Validator::open(self).await?;
+        let validator = Validator::open(self, ip.is_ipv6()).await?;
         let method = validator.method();
         self.precheck(account, ip, &validator).await?;
         let acct = self.acme_account().await?;
-        let ids = [Identifier::Ip(IpAddr::V4(ip))];
+        let ids = [Identifier::Ip(ip)];
         let profile = std::env::var("LOOKLOOK_ACME_PROFILE").unwrap_or_else(|_| DEFAULT_PROFILE.into());
         let old_id = old.and_then(|s| leaf_der(&s.chain)).and_then(|der| CertificateIdentifier::try_from(&der).ok());
         let order_req = |replaces: Option<CertificateIdentifier<'static>>| {
@@ -652,7 +1249,6 @@ impl Direct {
         };
         let mut order = match acct.new_order(&order_req(old_id.clone())).await {
             Ok(o) => o,
-            // 服务端不支持 ARI、旧证书已经被替换过等：不带 replaces 再试一次
             Err(_) if old_id.is_some() => acct.new_order(&order_req(None)).await.map_err(Fail::acme)?,
             Err(e) => return Err(Fail::acme(e)),
         };
@@ -673,7 +1269,6 @@ impl Direct {
         let status = order.poll_ready(&RetryPolicy::new().timeout(Duration::from_secs(90))).await.map_err(Fail::acme)?;
         lock(&self.pending).clear();
         if status != OrderStatus::Ready {
-            // 验证失败的具体原因在 challenge 的 error 里
             let mut detail = order.state().error.as_ref().and_then(|p| p.detail.clone());
             let mut az = order.authorizations();
             while let Some(Ok(a)) = az.next().await {
@@ -698,8 +1293,8 @@ impl Direct {
         Ok(Stored { ip, chain, key, not_before, not_after, renew_at, ari_at: now_s(), method: method.into() })
     }
 
-    /// 下单前的自检（docs/09 §6）：转发模式先在本机确认 nginx / Caddy 转发配好了；登录了再请主服务从外面看一次。
-    async fn precheck(&self, account: &crate::account::Account, ip: Ipv4Addr, v: &Validator) -> Result<(), Fail> {
+    /// 下单前的自检：转发模式先在本机确认 nginx / Caddy 转发配好了；登录了再请主服务从外面看一次。
+    async fn precheck(&self, account: &crate::account::Account, ip: IpAddr, v: &Validator) -> Result<(), Fail> {
         let probe = data_encoding::BASE64URL_NOPAD.encode(&crate::util::random_bytes::<16>());
         let expect = format!("{probe}.selfcheck");
         lock(&self.pending).insert(probe.clone(), expect.clone());
@@ -717,7 +1312,6 @@ impl Direct {
         drop(guard);
         match r {
             Some(Ok(c)) if !c.ok => Err(Fail::new("unreachable", c.error.unwrap_or_default())),
-            // 没登录、旧服务端（404）、主服务暂时连不上：不挡着，直接下单
             _ => Ok(()),
         }
     }
@@ -735,6 +1329,23 @@ fn public_v4() -> Option<Ipv4Addr> {
         IpAddr::V4(v) => Some(v),
         _ => None,
     }
+}
+
+/// ACME 自动申请证书的目标公网 IP：优先配置的公网 IPv4，其次公网 IPv6（配置值或本机网卡 GUA）。
+fn acme_target_ip() -> Option<IpAddr> {
+    if let Some(v4) = public_v4() {
+        return Some(IpAddr::V4(v4));
+    }
+    let c = crate::rtc::net::current();
+    if !c.ipv6 {
+        return None;
+    }
+    if let Some(s) = c.public_v6.as_deref() {
+        if let Some(IpAddr::V6(v6)) = crate::rtc::net::public_ip(s, true) {
+            return Some(IpAddr::V6(v6));
+        }
+    }
+    crate::rtc::net::nic_v6().into_iter().next().map(IpAddr::V6)
 }
 
 struct ClearPending<'a>(&'a Pending);
@@ -790,10 +1401,11 @@ fn bind_fail(e: &std::io::Error) -> BindFail {
 }
 
 impl Validator {
-    async fn open(d: &Direct) -> Result<Self, Fail> {
+    async fn open(d: &Direct, ipv6: bool) -> Result<Self, Fail> {
         let http_port = port_env("LOOKLOOK_ACME_HTTP_PORT", 80);
         let tls_port = port_env("LOOKLOOK_ACME_TLS_PORT", 443);
-        let e80 = match tokio::net::TcpListener::bind(SocketAddr::from(([0, 0, 0, 0], http_port))).await {
+        let bind_addr = |port: u16| if ipv6 { SocketAddr::from(([0u16; 8], port)) } else { SocketAddr::from(([0, 0, 0, 0], port)) };
+        let e80 = match tokio::net::TcpListener::bind(bind_addr(http_port)).await {
             Ok(l) => {
                 let stop = tokio_util::sync::CancellationToken::new();
                 tokio::spawn(http01_server(l, d.pending.clone(), stop.clone()));
@@ -802,7 +1414,7 @@ impl Validator {
             }
             Err(e) => e,
         };
-        let e443 = match tokio::net::TcpListener::bind(SocketAddr::from(([0, 0, 0, 0], tls_port))).await {
+        let e443 = match tokio::net::TcpListener::bind(bind_addr(tls_port)).await {
             Ok(l) => {
                 let stop = tokio_util::sync::CancellationToken::new();
                 let cert = Arc::new(RwLock::new(None));
@@ -834,7 +1446,7 @@ impl Validator {
     }
 
     /// 准备好验证的回应。
-    fn prepare(&self, d: &Direct, token: &str, key_auth: &str, digest: &[u8], ip: Ipv4Addr) -> Result<(), Fail> {
+    fn prepare(&self, d: &Direct, token: &str, key_auth: &str, digest: &[u8], ip: IpAddr) -> Result<(), Fail> {
         match self {
             Validator::Tls { cert, .. } => {
                 let ck = alpn_cert(ip, digest).map_err(|e| Fail::new("internal", e))?;
@@ -889,7 +1501,7 @@ async fn tls_alpn_server(l: tokio::net::TcpListener, cert: Arc<RwLock<Option<Arc
 }
 
 /// tls-alpn-01 的自签证书（RFC 8737 / 8738）：SAN 是这个 IP，带 critical 的 acmeIdentifier 扩展。
-fn alpn_cert(ip: Ipv4Addr, digest: &[u8]) -> Result<CertifiedKey, String> {
+fn alpn_cert(ip: IpAddr, digest: &[u8]) -> Result<CertifiedKey, String> {
     let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).map_err(|e| e.to_string())?;
     let mut params = rcgen::CertificateParams::new(vec![ip.to_string()]).map_err(|e| e.to_string())?;
     params.distinguished_name = rcgen::DistinguishedName::new();
@@ -898,12 +1510,17 @@ fn alpn_cert(ip: Ipv4Addr, digest: &[u8]) -> Result<CertifiedKey, String> {
     certified_key(&cert.pem(), &key.serialize_pem())
 }
 
-/// 转发模式的本机自检：经 127.0.0.1:80 用这个 IP 当 Host 请求验证路径，能拿到回应说明 nginx / Caddy 的转发配好了。
-async fn local_forward_ok(ip: Ipv4Addr, token: &str, expect: &str) -> bool {
+/// 转发模式的本机自检：经回环用这个 IP 当 Host 请求验证路径，能拿到回应说明 nginx / Caddy 的转发配好了。
+async fn local_forward_ok(ip: IpAddr, token: &str, expect: &str) -> bool {
     let port = port_env("LOOKLOOK_ACME_HTTP_PORT", 80);
     let Ok(client) = reqwest::Client::builder().no_proxy().timeout(Duration::from_secs(5)).redirect(reqwest::redirect::Policy::limited(3)).build() else { return false };
-    let url = format!("http://127.0.0.1:{port}{}{token}", proto::ACME_CHALLENGE_PREFIX);
-    let host = if port == 80 { ip.to_string() } else { format!("{ip}:{port}") };
+    let loop_lit = if ip.is_ipv6() { "[::1]" } else { "127.0.0.1" };
+    let url = format!("http://{loop_lit}:{port}{}{token}", proto::ACME_CHALLENGE_PREFIX);
+    let host_ip = match ip {
+        IpAddr::V4(v4) => v4.to_string(),
+        IpAddr::V6(v6) => format!("[{v6}]"),
+    };
+    let host = if port == 80 { host_ip } else { format!("{host_ip}:{port}") };
     match client.get(&url).header(header::HOST, host).send().await {
         Ok(r) if r.status().is_success() => r.text().await.is_ok_and(|t| t.trim() == expect),
         _ => false,
@@ -1126,7 +1743,7 @@ mod tests {
         let paths = crate::paths::Paths { home: dir.path().into(), ttyd: None, mux: None, termd: None, fonts: None, trzsz: None };
         let account = crate::account::Account::new(s.clone(), paths, "https://looklook.test", "").unwrap();
         let d = Direct::new(s.clone(), 1234);
-        let ip = Ipv4Addr::LOCALHOST;
+        let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
         let block = std::env::var("PEBBLE_BLOCK_HTTP").is_ok();
         let _held = if block { Some(std::net::TcpListener::bind(("0.0.0.0", port_env("LOOKLOOK_ACME_HTTP_PORT", 80))).unwrap()) } else { None };
         let st = d.issue(&account, ip, None).await.unwrap_or_else(|e| panic!("{} {}", e.code, e.detail));
@@ -1151,11 +1768,56 @@ mod tests {
 
     #[test]
     fn self_signed_alpn_cert_and_validity() {
-        let ck = alpn_cert(Ipv4Addr::new(203, 0, 113, 7), &[7u8; 32]).unwrap();
+        let ck = alpn_cert(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)), &[7u8; 32]).unwrap();
         let (nb, na) = validity(&ck.cert[0]).unwrap();
         assert!(na > nb);
         let (_, c) = x509_parser::parse_x509_certificate(ck.cert[0].as_ref()).unwrap();
         let ext = c.extensions().iter().find(|e| e.oid.to_id_string() == "1.3.6.1.5.5.7.1.31").expect("acmeIdentifier");
         assert!(ext.critical);
+    }
+
+    #[test]
+    fn custom_urls_and_always_on_self_tls() {
+        let (dir, s) = store();
+        let d = Direct::new(s, 1234);
+        assert_eq!(d.leaf_sha256().len(), 64, "启动即自带本机自签证书指纹");
+        assert!(!d.active(), "自签证书不标为公网受信任证书");
+
+        let saved = d
+            .set_custom_urls(&[
+                "https://Code.Example.com/".into(),
+                "home.example.com:18443".into(),
+                "[2408:8207::1]:1234".into(),
+                "demo.trycloudflare.com".into(),
+                "http://frp.example.com:8080/".into(),
+            ])
+            .unwrap();
+        assert_eq!(
+            saved,
+            vec![
+                "https://code.example.com",
+                "home.example.com:18443",
+                "[2408:8207::1]:1234",
+                "https://demo.trycloudflare.com",
+                "http://frp.example.com:8080",
+            ]
+        );
+        let eps = d.endpoints(&AccessConfig::default());
+        assert_eq!(eps.len(), 4, "明文 http 不进 wss 端点列表");
+        assert!(eps[0].web_tls && eps[0].kind == EndpointKind::Tunnel);
+        assert!(!eps[1].web_tls && eps[1].kind == EndpointKind::Ddns);
+        assert!(!eps[2].web_tls && eps[2].kind == EndpointKind::Ipv6);
+        assert!(eps[3].web_tls && eps[3].kind == EndpointKind::Tunnel);
+
+        // 自定义 PEM 证书覆盖 *.example.com 后，home.example.com 自动升级为 web_tls = true
+        let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let cert = rcgen::CertificateParams::new(vec!["*.example.com".into()]).unwrap().self_signed(&key).unwrap();
+        let (cp, kp) = (dir.path().join("cert.pem"), dir.path().join("key.pem"));
+        std::fs::write(&cp, cert.pem()).unwrap();
+        std::fs::write(&kp, key.serialize_pem()).unwrap();
+        d.set_custom_tls(cp.to_str().unwrap(), kp.to_str().unwrap()).unwrap();
+        assert!(d.active());
+        let eps = d.endpoints(&AccessConfig::default());
+        assert!(eps.iter().find(|e| e.url == "https://home.example.com:18443").unwrap().web_tls);
     }
 }

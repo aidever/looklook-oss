@@ -229,12 +229,13 @@ impl PeerConnectionHandler for PcHandler {
     }
 }
 
-/// 连接实际走的路（界面电脑菜单里的色点，见 src-ui/shared/paths.js）：两边都是内网地址为局域网直连，
-/// 有一边是中继为中转，其余（含两边都有公网 IPv6 直接连上）为公网直连。
+/// 连接实际走的路（界面电脑菜单里的色点，见 src-ui/shared/paths.jsx）：两边都是内网地址为局域网直连，
+/// 经 `/__looklook/mux` 走穿透/IPv6/公网/DDNS 为 `Https`，有一边是中继为中转，其余 WebRTC 直连为 `P2p`。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PathKind {
     Lan,
+    Https,
     P2p,
     Relay,
 }

@@ -34,12 +34,14 @@ pub const EXCHANGE_PATH: &str = "/api/sync/exchange";
 /// 别的电脑（旧版本）发来的也不收。`notify`：飞书、各通知渠道只留在配它的那台电脑上（2026-11-10，见 notify.rs）。
 const LOCAL_ONLY: &[&str] = &["notify"];
 
-/// 助理记忆里的“关于你”（一条一个记录，见 assistant_memory.rs）。这台电脑退出同步时当作只在本机
+/// 旧版助理记忆里的“关于你”（一条一个记录）。新版只读一次，转成 `you/` 的页（assistant_memory.rs `adopt_v1`）
 pub const ASSISTANT_ME: &str = "assistant_me";
+/// 助理记忆的 `you/`（一页一个记录，见 assistant_memory.rs）。这台电脑退出同步时，两个集合都当作只在本机
+pub const ASSISTANT_YOU: &str = "assistant_you";
 static ME_OFF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn local_only(collection: &str) -> bool {
-    LOCAL_ONLY.contains(&collection) || (collection == ASSISTANT_ME && ME_OFF.load(std::sync::atomic::Ordering::SeqCst))
+    LOCAL_ONLY.contains(&collection) || ((collection == ASSISTANT_ME || collection == ASSISTANT_YOU) && ME_OFF.load(std::sync::atomic::Ordering::SeqCst))
 }
 
 /// “关于你”在这台电脑上同不同步（公司电脑可以退出）
@@ -49,7 +51,7 @@ pub fn set_me_sync(on: bool) {
 
 /// 退出“关于你”同步：本机的记录直接删掉（不写墓碑：别的电脑上的不受影响）
 pub fn drop_me(store: &Store) -> Result<()> {
-    store.tx(|tx| tx.execute("DELETE FROM sync_record WHERE collection=?1", [ASSISTANT_ME]).map(|_| ()))
+    store.tx(|tx| tx.execute("DELETE FROM sync_record WHERE collection IN (?1, ?2)", [ASSISTANT_ME, ASSISTANT_YOU]).map(|_| ()))
 }
 
 /// 重新加入：退出期间收到又丢掉的记录要别的电脑再发一遍——忘掉看到过别的电脑第几号
@@ -402,7 +404,7 @@ pub async fn exchange(app: &App, req: ExchangeReq) -> Result<ExchangeResp, Local
     if changed > 0 {
         tracing::info!(dev = %req.from, changed, "设置同步：收到另一台电脑的改动");
         app.chat.guard_changed();
-        if p.records.iter().any(|r| r.collection == ASSISTANT_ME) {
+        if p.records.iter().any(|r| r.collection == ASSISTANT_ME || r.collection == ASSISTANT_YOU) {
             crate::gateway::assistant::me_reconcile(app);
         }
     }

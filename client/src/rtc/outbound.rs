@@ -54,12 +54,22 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// 直连候选启动后等这么久还没连上，同时启动 WebRTC 打洞/中转兜底竞速。
+const MUX_HEADSTART: Duration = Duration::from_millis(1500);
+/// 多条直连候选之间的错峰间隔（Happy Eyeballs）。
+const MUX_STAGGER: Duration = Duration::from_millis(150);
+
+enum Transport {
+    Pc(Pc),
+    Mux(super::mux::MuxConn),
+}
+
 /// 到一台电脑的连接。
 pub struct Link {
     closed: CancellationToken,
     // 释放时先关通道，再关连接（见 peer.rs）
     ctl: Mutex<Option<Channel>>,
-    pc: Mutex<Option<Pc>>,
+    transport: Mutex<Option<Transport>>,
     /// 丢包率探测（`super::probe`）。
     probe: Arc<Mutex<probe::Stats>>,
     /// 设了“只直连”却没连通，改按平常（可走中转）连上的。
@@ -71,7 +81,10 @@ impl Link {
         if self.closed.is_cancelled() {
             bail!("连接已关闭");
         }
-        lock(&self.pc).as_mut().ok_or_else(|| anyhow!("连接已关闭"))?.channel(label)
+        match lock(&self.transport).as_mut().ok_or_else(|| anyhow!("连接已关闭"))? {
+            Transport::Pc(pc) => pc.channel(label),
+            Transport::Mux(mux) => mux.channel(label),
+        }
     }
 
     fn alive(&self) -> bool {
@@ -79,7 +92,10 @@ impl Link {
     }
 
     fn path(&self) -> Option<super::peer::PathInfo> {
-        lock(&self.pc).as_ref()?.path()
+        match lock(&self.transport).as_ref()? {
+            Transport::Pc(pc) => pc.path(),
+            Transport::Mux(mux) => Some(mux.path.clone()),
+        }
     }
 
     /// 往返时间：开一条通道（不计入）后请求那台电脑的 `/api/ping`，到收到响应头为止。旧版电脑也支持。
@@ -107,12 +123,13 @@ impl Link {
 
 impl Drop for Link {
     fn drop(&mut self) {
+        self.closed.cancel();
         let ctl = lock(&self.ctl).take();
-        let pc = lock(&self.pc).take();
+        let tr = lock(&self.transport).take();
         // rtcDelete* 会等回调结束：不在异步线程上做
         std::thread::spawn(move || {
             drop(ctl);
-            drop(pc);
+            drop(tr);
         });
     }
 }
@@ -331,20 +348,53 @@ impl Outbound {
     async fn connect(&self, account: &Arc<Account>, dev: &str) -> Result<Arc<Link>, LinkError> {
         let mut devices = self.devices(account, false).await.map_err(LinkError::Platform)?;
         if !devices.items.iter().any(|d| d.id == dev && d.online) {
-            // 刚上线的电脑：缓存里可能还是离线
+            // 刚上线的电脑或缓存里的预签票据可能快到期：强制刷新一次
             devices = self.devices(account, true).await.map_err(LinkError::Platform)?;
             if !devices.items.iter().any(|d| d.id == dev && d.online) {
                 return Err(LinkError::Offline);
             }
         }
+        // 若缓存的设备列表里有端点但 mux_token 已经取过好一会儿，刷新拿一张新票据
+        let target = devices.items.iter().find(|d| d.id == dev).cloned();
+        let site_origin = account.session().map(|s| s.user_host_url.trim_end_matches('/').to_string()).unwrap_or_default();
+        if let Some(t) = target.filter(|t| !t.endpoints.is_empty() && t.mux_token.is_some() && !site_origin.is_empty()) {
+            let token = t.mux_token.clone().unwrap_or_default();
+            let cands = ordered_endpoints(&t.endpoints, !t.keys.is_empty());
+            if !cands.is_empty() {
+                let mux_fut = race_mux(cands, token, site_origin, dev.to_string(), t.keys);
+                tokio::pin!(mux_fut);
+                let headstart = tokio::time::sleep(MUX_HEADSTART);
+                tokio::pin!(headstart);
+                let start_webrtc = tokio::select! {
+                    r = &mut mux_fut => match r {
+                        Some(link) => return Ok(link),
+                        // 所有直连端点都已快速失败（如端口未开）：不等 1.5s，立即启动 WebRTC
+                        None => false,
+                    },
+                    _ = &mut headstart => true,
+                };
+                if start_webrtc {
+                    let rtc_fut = self.connect_webrtc(account, dev, &devices.ice_servers);
+                    tokio::pin!(rtc_fut);
+                    return tokio::select! {
+                        Some(link) = &mut mux_fut => Ok(link),
+                        r = &mut rtc_fut => r,
+                    };
+                }
+            }
+        }
+        self.connect_webrtc(account, dev, &devices.ice_servers).await
+    }
+
+    async fn connect_webrtc(&self, account: &Arc<Account>, dev: &str, ice_servers: &[IceServer]) -> Result<Arc<Link>, LinkError> {
         if direct_only(dev) {
             match self.handshake(account, dev, &[], DIRECT_OPEN_LIMIT, false).await {
                 Err(LinkError::Failed(e)) => tracing::warn!(dev, error = %format!("{e:#}"), "只直连没连通，改按平常连（可走中转）"),
                 r => return r,
             }
-            return self.handshake(account, dev, &devices.ice_servers, OPEN_LIMIT, true).await;
+            return self.handshake(account, dev, ice_servers, OPEN_LIMIT, true).await;
         }
-        self.handshake(account, dev, &devices.ice_servers, OPEN_LIMIT, false).await
+        self.handshake(account, dev, ice_servers, OPEN_LIMIT, false).await
     }
 
     /// `ice` 为空：只直连（不用 STUN / TURN）。`direct_fallback`：是只直连没连通后改按平常连的。
@@ -376,7 +426,13 @@ impl Outbound {
         let path = pc.path();
         tracing::info!(dev, kind = ?path.as_ref().map(|p| p.kind), local = path.as_ref().map(|p| p.local.as_str()), remote = path.as_ref().map(|p| p.remote.as_str()), "已连上另一台电脑");
         let probe_ch = pc.unreliable_channel(probe::LABEL);
-        let link = Arc::new(Link { closed: CancellationToken::new(), ctl: Mutex::new(Some(ctl)), pc: Mutex::new(Some(pc)), probe: Default::default(), direct_fallback });
+        let link = Arc::new(Link {
+            closed: CancellationToken::new(),
+            ctl: Mutex::new(Some(ctl)),
+            transport: Mutex::new(Some(Transport::Pc(pc))),
+            probe: Default::default(),
+            direct_fallback,
+        });
         tokio::spawn(watch_link(link.closed.clone(), state, dev.to_string()));
         match probe_ch {
             Ok(ch) => {
@@ -391,6 +447,54 @@ impl Outbound {
         }
         Ok(link)
     }
+}
+
+fn ordered_endpoints(eps: &[looklook_protocol::direct::DirectEndpoint], has_keys: bool) -> Vec<looklook_protocol::direct::DirectEndpoint> {
+    use looklook_protocol::direct::EndpointKind;
+    let rank = |k: EndpointKind| match k {
+        EndpointKind::Lan => 0,
+        EndpointKind::Tunnel => 1,
+        EndpointKind::Ipv6 => 2,
+        EndpointKind::Public => 3,
+        EndpointKind::Ddns => 4,
+    };
+    let mut v: Vec<_> = eps.iter().filter(|e| e.web_tls || has_keys).cloned().collect();
+    v.sort_by_key(|e| rank(e.kind));
+    v
+}
+
+/// 按优先级错峰并发尝试各条直连端点，返回第一个完成 `ctl hello` 鉴权的连接（其余任务随 `JoinSet` 释放立即中止）。
+async fn race_mux(
+    cands: Vec<looklook_protocol::direct::DirectEndpoint>,
+    token: String,
+    site_origin: String,
+    dev: String,
+    keys: Vec<looklook_protocol::dto::DeviceKey>,
+) -> Option<Arc<Link>> {
+    let mut set = tokio::task::JoinSet::new();
+    for (idx, ep) in cands.into_iter().enumerate() {
+        let (token, site_origin, dev, keys) = (token.clone(), site_origin.clone(), dev.clone(), keys.clone());
+        set.spawn(async move {
+            if idx > 0 {
+                tokio::time::sleep(MUX_STAGGER * idx as u32).await;
+            }
+            super::mux::MuxConn::connect(&ep, &token, &site_origin, &dev, &keys).await
+        });
+    }
+    while let Some(joined) = set.join_next().await {
+        if let Ok(Ok((mux, ctl))) = joined {
+            tracing::info!(dev, kind = ?mux.path.kind, remote = %mux.path.remote, "经直连复用通道连上另一台电脑");
+            let closed = mux.closed.clone();
+            return Some(Arc::new(Link {
+                closed,
+                ctl: Mutex::new(Some(ctl)),
+                transport: Mutex::new(Some(Transport::Mux(mux))),
+                probe: Default::default(),
+                direct_fallback: false,
+            }));
+        }
+    }
+    None
 }
 
 /// 连接失败、关闭，或断开超过 [`DISCONNECT_GRACE`] 时标记为关闭（下一个请求重新建连）。
@@ -779,7 +883,7 @@ mod loopback {
         let m = ctl.recv().await.unwrap();
         let Some(Frame::Ctl(v)) = frame::parse(&m) else { panic!("hello") };
         assert_eq!(v["dev"], "devb");
-        Arc::new(Link { closed: CancellationToken::new(), ctl: Mutex::new(Some(ctl)), pc: Mutex::new(Some(a)), probe: Default::default(), direct_fallback: false })
+        Arc::new(Link { closed: CancellationToken::new(), ctl: Mutex::new(Some(ctl)), transport: Mutex::new(Some(Transport::Pc(a))), probe: Default::default(), direct_fallback: false })
     }
 
     #[tokio::test(flavor = "multi_thread")]

@@ -1154,6 +1154,9 @@ pub(crate) mod e2e {
                             terminals: vec![],
                             keys: vec![DeviceKey { id: format!("k-{id}"), public_key: b64(k.verifying_key().as_bytes()) }],
                             direct: None,
+                            endpoints: vec![],
+                            local_port: None,
+                            mux_token: None,
                             reach: None,
                         })
                         .collect();

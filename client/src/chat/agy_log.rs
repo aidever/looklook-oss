@@ -153,6 +153,8 @@ pub struct AgyLog {
     inputs: HashMap<String, Value>,
     /// 这一轮里已经有过回复（再来的用户消息算插话）
     replied: bool,
+    /// 这一轮从第几段开始（[`AgyLog::turn_start`] 时记下）
+    turn_from: usize,
     dirty: Option<usize>,
     reset: bool,
     /// `session/load` 已经重放完（或者是新会话）
@@ -443,6 +445,18 @@ impl AgyLog {
     /// 一轮开始
     pub fn turn_start(&mut self) {
         self.replied = false;
+        self.turn_from = self.entries.len();
+    }
+
+    /// 这一轮（还没 [`AgyLog::turn_end`]）最后一段是回复文字：返回它。agy 把额度用完之类的报错当成最后一段回复发来，
+    /// 见 `agy_profiles::quota_reply`
+    pub fn turn_tail_text(&self) -> Option<&str> {
+        let (e, _) = self.entries.last().filter(|_| self.entries.len() > self.turn_from)?;
+        if let Entry::Text(t) = e {
+            Some(t)
+        } else {
+            None
+        }
     }
 
     /// 一轮结束：`stop` 是 `session/prompt` 的 `stopReason`，`error` 是这一轮出错的说明
@@ -724,6 +738,24 @@ mod tests {
 
     fn kinds(log: &AgyLog) -> Vec<String> {
         log.items.iter().map(|i| serde_json::to_value(&i.body).unwrap()["k"].as_str().unwrap_or("").to_string()).collect()
+    }
+
+    #[test]
+    fn turn_tail_is_this_turns_last_text() {
+        let text = |t: &str| json!({ "sessionUpdate": "agent_message_chunk", "content": { "type": "text", "text": t } });
+        let mut log = AgyLog::default();
+        log.turn_start();
+        log.user("hi", 0);
+        assert_eq!(log.turn_tail_text(), None, "还没回复");
+        log.update(&text("Looking.\n"));
+        log.update(&text("\n⚠ Individual quota reached. Resets in 58m39s.\n"));
+        assert_eq!(log.turn_tail_text(), Some("Looking.\n\n⚠ Individual quota reached. Resets in 58m39s.\n"), "同一段回复接在一起");
+        log.turn_end(Some("end_turn"), None, None);
+        log.turn_start();
+        log.user("go on", 0);
+        assert_eq!(log.turn_tail_text(), None, "上一轮的回复不算");
+        log.update(&json!({ "sessionUpdate": "tool_call", "toolCallId": "c1", "name": "list_dir", "status": "completed", "rawInput": {} }));
+        assert_eq!(log.turn_tail_text(), None, "最后是工具调用");
     }
 
     #[test]

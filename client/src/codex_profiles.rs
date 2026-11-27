@@ -12,6 +12,7 @@
 //!   终端里接到 app-server 上的 TUI 也要定义同一个服务商并选上（TUI 自己先解析配置，不认识的服务商会报错）。
 //! - **升级**：以前“模型服务商”里给 Codex 选的接口（kv `model_provider.codex` + `model/codex.key`）变成一个配置，设为默认。
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -50,6 +51,10 @@ pub struct Profile {
     pub base_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// 模型对应：Codex 自己的模型名（界面上显示、选的）→ 发给服务商的模型名。
+    /// Codex 本身没有这个机制，是看看在发出去的地方（`thread/start`、`turn/start`、终端的 `-c model=`）换的，见 [`Profile::remote`]
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub models: BTreeMap<String, String>,
     /// 模型设置：上下文窗口、自动压缩、推理强度等（model_tuning.rs）
     #[serde(default, skip_serializing_if = "CodexTuning::is_empty")]
     pub tuning: CodexTuning,
@@ -60,6 +65,16 @@ pub struct Profile {
 impl Profile {
     pub fn is_api(&self) -> bool {
         self.base_url.is_some()
+    }
+
+    /// 发给服务商的模型名：界面上选的是对应过的 Codex 模型名时换成服务商的
+    pub fn remote(&self, m: &str) -> String {
+        self.models.get(m).cloned().unwrap_or_else(|| m.to_string())
+    }
+
+    /// 实际发出去的默认模型
+    fn remote_default(&self) -> Option<String> {
+        self.model.as_deref().map(|m| self.remote(m)).filter(|m| crate::model::codex_model_ok(m))
     }
 
     /// app-server、TUI 里的服务商名
@@ -86,7 +101,7 @@ impl Profile {
     /// 选上这个服务商和模型的 `-c`，加上模型设置
     fn select(&self, env: LaunchEnv) -> LaunchEnv {
         let env = env.config(format!("model_provider={}", self.provider_name()));
-        let env = match self.model.as_deref().filter(|m| crate::model::codex_model_ok(m)) {
+        let env = match self.remote_default() {
             Some(m) => env.config(format!("model={m}")),
             None => env,
         };
@@ -95,7 +110,7 @@ impl Profile {
 }
 
 fn builtin() -> Profile {
-    Profile { id: OFFICIAL.into(), name: String::new(), preset: None, provider_id: None, base_url: None, model: None, tuning: CodexTuning::default(), created_at: String::new() }
+    Profile { id: OFFICIAL.into(), name: String::new(), preset: None, provider_id: None, base_url: None, model: None, models: BTreeMap::new(), tuning: CodexTuning::default(), created_at: String::new() }
 }
 
 fn builtin_of(store: &Store) -> Profile {
@@ -176,6 +191,9 @@ pub struct Input {
     /// 空字符串表示不指定
     #[serde(default)]
     pub model: Option<String>,
+    /// 模型对应（Codex 的模型名 → 服务商的），值为空的去掉
+    #[serde(default)]
+    pub models: Option<BTreeMap<String, String>>,
     /// 不填沿用已保存的 Key
     #[serde(default)]
     pub api_key: Option<String>,
@@ -195,6 +213,23 @@ fn clean_model(m: Option<&str>) -> Result<Option<String>, LocalError> {
         return Err(LocalError::invalid("model", "invalid"));
     }
     Ok(m)
+}
+
+/// 最多对应几个
+const MAP_MAX: usize = 40;
+
+fn clean_map(m: BTreeMap<String, String>) -> Result<BTreeMap<String, String>, LocalError> {
+    let mut out = BTreeMap::new();
+    for (k, v) in m {
+        let (Some(k), Some(v)) = (clean_model(Some(&k))?, clean_model(Some(&v))?) else { continue };
+        if k != v {
+            out.insert(k, v);
+        }
+    }
+    if out.len() > MAP_MAX {
+        return Err(LocalError::invalid("models", "too_many"));
+    }
+    Ok(out)
 }
 
 fn clean_url(u: &str) -> Result<String, LocalError> {
@@ -241,6 +276,7 @@ pub fn add(store: &Store, home: &Path, input: Input) -> Result<Profile, LocalErr
         provider_id: input.provider_id.filter(|s| !s.is_empty()),
         base_url: Some(clean_url(input.base_url.as_deref().unwrap_or(""))?),
         model: clean_model(input.model.as_deref())?,
+        models: clean_map(input.models.unwrap_or_default())?,
         tuning: CodexTuning::default(),
         created_at: crate::util::now_rfc3339(),
     };
@@ -265,10 +301,38 @@ pub fn update(store: &Store, home: &Path, id: &str, input: Input) -> Result<Prof
     if input.model.is_some() {
         p.model = clean_model(input.model.as_deref())?;
     }
+    if let Some(m) = input.models {
+        p.models = clean_map(m)?;
+    }
     save_key(home, id, input.api_key.as_deref())?;
     let out = p.clone();
     store.set(LIST_KEY, &all)?;
     Ok(out)
+}
+
+/// 测试用的配置（见 `claude_profiles::draft`）：已保存的改上表单里填的，没保存的按表单新建一个（不存）；返回配置和 Key
+pub fn draft(store: &Store, home: &Path, id: Option<&str>, input: Input) -> Result<(Profile, String), LocalError> {
+    let mut p = match id {
+        Some(id) => get(store, id).filter(Profile::is_api).ok_or_else(LocalError::not_found)?,
+        None => builtin(),
+    };
+    if let Some(url) = input.base_url.as_deref() {
+        p.base_url = Some(clean_url(url)?);
+    }
+    if input.model.is_some() {
+        p.model = clean_model(input.model.as_deref())?;
+    }
+    if let Some(m) = input.models {
+        p.models = clean_map(m)?;
+    }
+    let key = match input.api_key.as_deref().map(str::trim).filter(|k| !k.is_empty()) {
+        Some(k) => k.to_string(),
+        None => id.and_then(|id| std::fs::read_to_string(key_path(home, id)).ok()).map(|k| k.trim().to_string()).filter(|k| !k.is_empty()).ok_or_else(|| LocalError::new("MODEL_KEY_REQUIRED"))?,
+    };
+    if p.base_url.is_none() {
+        return Err(LocalError::invalid("base_url", "required"));
+    }
+    Ok((p, key))
 }
 
 /// 改模型设置（本机默认也能设）。新建、重新启动的会话生效；对话模式下第三方接口的超时要等 app-server 重启
@@ -370,7 +434,7 @@ pub fn thread_params(home: &Path, p: &Profile) -> Value {
     let ok = usable(home, p);
     if ok {
         v["modelProvider"] = json!(p.provider_name());
-        if let Some(m) = p.model.as_deref().filter(|m| crate::model::codex_model_ok(m)) {
+        if let Some(m) = p.remote_default() {
             v["model"] = json!(m);
         }
     }
@@ -390,7 +454,7 @@ pub fn migrate(store: &Store, home: &Path) {
     let old_key = home.join("model").join("codex.key");
     let key = std::fs::read_to_string(&old_key).ok().map(|k| k.trim().to_string()).filter(|k| !k.is_empty());
     if let Some(key) = key {
-        let input = Input { name: Some(old.name.clone()), preset: None, provider_id: old.provider_id.clone(), base_url: Some(old.base_url.clone()), model: old.model.clone(), api_key: Some(key) };
+        let input = Input { name: Some(old.name.clone()), preset: None, provider_id: old.provider_id.clone(), models: None, base_url: Some(old.base_url.clone()), model: old.model.clone(), api_key: Some(key) };
         match add(store, home, input) {
             Ok(p) => {
                 let _ = set_default(store, &p.id);
@@ -467,6 +531,23 @@ mod tests {
         std::fs::remove_file(key_path(&dir, &b.id)).unwrap();
         assert!(launch_env(&dir, &b).is_none(), "Key 不在时按官方方式启动");
         assert!(!server_env(&store, &dir).unwrap().wrap("x", Family::Posix).contains(&b.provider_name()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 模型对应：界面上是 Codex 的名字，发出去（thread/start、终端的 -c model=）是服务商的
+    #[test]
+    fn model_map() {
+        let (dir, store) = tmp_store("map");
+        let a = api(&store, &dir, "a", Some("gpt-6.1-sol"));
+        let map = BTreeMap::from([("gpt-6.1-sol".to_string(), "kimi-k3".to_string()), ("gpt-mini".to_string(), " ".to_string()), ("same".to_string(), "same".to_string())]);
+        let a = update(&store, &dir, &a.id, Input { models: Some(map), ..Default::default() }).unwrap();
+        assert_eq!(a.models, BTreeMap::from([("gpt-6.1-sol".to_string(), "kimi-k3".to_string())]), "空的、对应到自己的去掉");
+        assert_eq!(a.remote("gpt-6.1-sol"), "kimi-k3");
+        assert_eq!(a.remote("glm-5"), "glm-5");
+        assert_eq!(thread_params(&dir, &a)["model"], "kimi-k3");
+        assert!(launch_env(&dir, &a).unwrap().wrap("codex", Family::Posix).ends_with(" -c model=kimi-k3"));
+        let bad = BTreeMap::from([("x".to_string(), "a b".to_string())]);
+        assert!(update(&store, &dir, &a.id, Input { models: Some(bad), ..Default::default() }).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

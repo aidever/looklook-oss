@@ -3,7 +3,7 @@
 // 按用户实际的安装方式更新（npm / pnpm / bun、Claude Code 安装脚本的 `claude update`、Homebrew、`agy update`）；
 // 自动更新等到没有会话正在用这个工具时才装，不打断在跑的会话。装的进度和“一键安装”共用 `GET /tools/install/{tool}`。
 import { Download, RefreshCw } from 'lucide-react';
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 
 import { LaunchIcon } from '../shared/brands.jsx';
@@ -43,12 +43,14 @@ function LastOutcome({ item }) {
   );
 }
 
-function AgentRow({ item, onChanged }) {
+function AgentRow({ item, onChanged, onAuto }) {
   const { t } = useTranslation();
   const toast = useToast();
   const confirm = useConfirm();
   const [busy, setBusy] = useState('');
   const [job, setJob] = useState(null);
+  const autoSeq = useRef(0);
+  const autoChain = useRef(Promise.resolve());
   const running = item.running || job?.state === 'running';
   const name = NAMES[item.tool];
 
@@ -67,16 +69,19 @@ function AgentRow({ item, onChanged }) {
     return () => clearInterval(iv);
   }, [running, item.tool]);
 
-  const setAuto = async (on) => {
-    setBusy('auto');
-    try {
-      await api.put(`/agent-updates/${item.tool}`, { auto: on });
-      onChanged();
-    } catch (e) {
-      toast(errorText(t, e), 'error');
-    } finally {
-      setBusy('');
-    }
+  // 立即更新开关状态，按顺序发给后端；连续点击跳过中间态，失败回滚
+  const setAuto = (on) => {
+    const seq = ++autoSeq.current;
+    onAuto(item.tool, on);
+    autoChain.current = autoChain.current.then(async () => {
+      if (autoSeq.current !== seq) return;
+      try {
+        await api.put(`/agent-updates/${item.tool}`, { auto: on });
+      } catch (e) {
+        if (autoSeq.current === seq) onAuto(item.tool, !on);
+        toast(errorText(t, e), 'error');
+      }
+    });
   };
 
   // 没装：一键安装（没有 Node.js 时客户端先装 Node.js；Claude Code 先用官方原生安装）
@@ -143,7 +148,7 @@ function AgentRow({ item, onChanged }) {
       {item.installed && item.can_update && (
         <div className="aup-ctl">
           <label className="aup-auto">
-            <Switch checked={item.auto} disabled={busy === 'auto'} label={t('aup.auto_label', { name })} onChange={setAuto} />
+            <Switch checked={item.auto} label={t('aup.auto_label', { name })} onChange={setAuto} />
             <span className="small">{t('aup.auto')}</span>
           </label>
           {item.update && (
@@ -224,15 +229,28 @@ export function SetupAll({ items, onChanged }) {
 
 export default function AgentUpdatesCard() {
   const { t } = useTranslation();
-  const [data, error, reload] = useLoad(() => api.get('/agent-updates'), []);
+  const [loaded, error, reload] = useLoad(() => api.get('/agent-updates'), []);
+  const [patched, setPatched] = useState(null);
+  useEffect(() => {
+    setPatched(loaded);
+  }, [loaded]);
+  const data = patched ?? loaded;
   const [checking, setChecking] = useState(false);
   const [checkError, setCheckError] = useState(null);
+  const setAuto = (tool, on) => {
+    setPatched((prev) => {
+      const cur = prev ?? loaded;
+      if (!cur) return cur;
+      return { ...cur, items: cur.items.map((i) => (i.tool === tool ? { ...i, auto: on } : i)) };
+    });
+  };
   const check = async () => {
     setChecking(true);
     setCheckError(null);
     try {
-      await api.post('/agent-updates/check');
-      reload();
+      const next = await api.post('/agent-updates/check');
+      if (next?.items) setPatched(next);
+      else reload();
     } catch (e) {
       setCheckError(e);
     } finally {
@@ -257,7 +275,7 @@ export default function AgentUpdatesCard() {
         <>
           <SetupAll items={data.items} onChanged={reload} />
           {data.items.map((item) => (
-            <AgentRow key={item.tool} item={{ ...item, os: data.os }} onChanged={reload} />
+            <AgentRow key={item.tool} item={{ ...item, os: data.os }} onChanged={reload} onAuto={setAuto} />
           ))}
           <p className="small muted aup-foot">
             {data.checked_at ? (

@@ -475,6 +475,29 @@ fn model_options(list: &Value) -> Vec<Value> {
         .unwrap_or_default()
 }
 
+/// 第三方接口里对应过的 Codex 模型 → 模型菜单的选项：名字、强度照 Codex 目录（`catalog`，取不到时就用模型名），
+/// `model` 是服务商的名字（回复里报的是它）、说明里写上；配置的默认模型是对应过的那个时它当默认
+fn mapped_options(profile: &crate::codex_profiles::Profile, catalog: &Value) -> Vec<Value> {
+    let known = catalog.as_array().cloned().unwrap_or_default();
+    let mut out: Vec<Value> = profile
+        .models
+        .iter()
+        .map(|(native, remote)| {
+            let mut o = known.iter().find(|o| o["value"].as_str() == Some(native.as_str())).cloned().unwrap_or_else(|| json!({ "value": native, "label": native, "efforts": [] }));
+            o["model"] = json!(remote);
+            o["description"] = json!(remote);
+            o["section"] = json!("main");
+            o["fast_tier"] = Value::Null;
+            o["default"] = json!(profile.model.as_deref() == Some(native.as_str()));
+            o
+        })
+        .collect();
+    // 目录里的顺序（新的在前）；不在目录里的放后面
+    let rank = |o: &Value| known.iter().position(|k| k["value"] == o["value"]).unwrap_or(usize::MAX);
+    out.sort_by_key(rank);
+    out
+}
+
 /// 第三方接口的模型 → 模型菜单的选项：指定的模型放最前面当默认，服务商的其他模型放“服务商的其他模型”
 fn provider_model_options(chosen: Option<&str>, ids: &[String]) -> Vec<Value> {
     let opt = |id: &str, main: bool| json!({ "value": id, "label": id, "section": if main { "main" } else { "provider" }, "model": id, "efforts": [], "default": main });
@@ -1594,6 +1617,11 @@ impl Chat {
             let current = st.model.clone().or(st.actual_model.clone());
             (st.binding.as_ref().map(|b| b.session_id.clone()), st.codex.turn.clone(), st.phase, st.model.clone().filter(|_| chosen), st.effort.clone(), current)
         };
+        // 界面上选的是 Codex 的模型名、配置里对应到了服务商的模型：发服务商的（见 codex_profiles::Profile::remote）
+        let (model, current) = {
+            let p = crate::codex_profiles::for_instance(&self.store, id);
+            (model.map(|m| p.remote(&m)), current.map(|m| p.remote(&m)))
+        };
         if phase == Phase::Approval && !non_starting_goal {
             return Err(LocalError::new("CHAT_BUSY"));
         }
@@ -1711,7 +1739,11 @@ impl Chat {
         // 助理的大脑：记下用户原话（派活时附上；看看送进去的结果消息不算）
         let brain = crate::assistant::is_brain(&self.store, id);
         if brain {
-            crate::assistant::note_said(&self.store, text);
+            if phase == Phase::Running {
+                crate::assistant::note_said_more(&self.store, text);
+            } else {
+                crate::assistant::note_said(&self.store, text);
+            }
         }
         let mut input = text_input(text, images);
         // `$技能名`：和 TUI 一样另外带上技能（名字 + SKILL.md 的路径），Codex 才会按技能读进来
@@ -2143,7 +2175,16 @@ impl Chat {
         if let Some(base) = &third {
             let key = std::fs::read_to_string(xp::key_path(&self.paths.home, &profile.id)).unwrap_or_default();
             let ids = super::models::provider_models(&format!("{}/models", base.trim_end_matches('/')), key.trim()).await;
-            ours = provider_model_options(profile.model.as_deref(), &ids);
+            // 对应过的 Codex 模型：照 Codex 目录里的名字、强度显示，实际发服务商的（`model` 填服务商的名字，回复里的模型对得上）
+            let catalog = if profile.models.is_empty() { Value::Null } else { self.codex_catalog().await.unwrap_or(Value::Null) };
+            ours = mapped_options(profile, &catalog);
+            let taken: Vec<String> = ours.iter().filter_map(|o| o["model"].as_str().map(String::from)).collect();
+            let chosen = profile.model.as_deref().filter(|m| !profile.models.contains_key(*m));
+            for o in provider_model_options(chosen, &ids) {
+                if !o["model"].as_str().is_some_and(|m| taken.iter().any(|t| t == m)) {
+                    ours.push(o);
+                }
+            }
         }
         let options = if ours.is_empty() { self.codex_catalog().await? } else { json!(ours) };
         let provider = third.map(|_| json!({ "name": profile.name })).unwrap_or(Value::Null);
@@ -2493,6 +2534,7 @@ impl Chat {
             }
             st.actual_model.clone().or_else(|| st.model.clone())
         };
+        let model = model.map(|m| crate::codex_profiles::for_instance(&self.store, &id).remote(&m));
         let Some(server) = self.codex.server.lock().await.clone() else { return };
         let named = |r: &Value| r["thread"]["name"].as_str().is_some_and(|n| !n.trim().is_empty());
         match server.call("thread/read", json!({ "threadId": tid })).await {
@@ -3310,6 +3352,22 @@ mod tests {
         assert!(provider_model_options(None, &[]).is_empty());
     }
 
+    /// 对应过的 Codex 模型：名字、强度照目录，`model` 是服务商的（回复里报的是它，按钮上照样显示 Codex 的名字）
+    #[test]
+    fn mapped_model_options() {
+        let catalog = json!([
+            { "value": "gpt-6.1-sol", "label": "GPT-6.1-Sol", "efforts": ["low", "high"], "section": "main", "model": "gpt-6.1-sol", "fast_tier": "priority" },
+            { "value": "gpt-mini", "label": "GPT-Mini", "efforts": [], "section": "main", "model": "gpt-mini" },
+        ]);
+        let mut p = crate::codex_profiles::for_instance(&crate::store::Store::open(&tempfile::tempdir().unwrap().path().join("t.db")).unwrap(), "x");
+        p.model = Some("gpt-6.1-sol".into());
+        p.models = [("gpt-6.1-sol", "kimi-k3"), ("zz-custom", "glm-5")].into_iter().map(|(a, b)| (a.to_string(), b.to_string())).collect();
+        let o = mapped_options(&p, &catalog);
+        let v: Vec<(&str, &str, &str)> = o.iter().map(|x| (x["value"].as_str().unwrap(), x["label"].as_str().unwrap(), x["model"].as_str().unwrap())).collect();
+        assert_eq!(v, [("gpt-6.1-sol", "GPT-6.1-Sol", "kimi-k3"), ("zz-custom", "zz-custom", "glm-5")]);
+        assert_eq!((o[0]["efforts"].clone(), o[0]["default"].clone(), o[0]["fast_tier"].clone()), (json!(["low", "high"]), json!(true), Value::Null));
+    }
+
     #[test]
     fn decisions_and_answers() {
         let ans = |d: &str, a: Option<Value>| PermissionAnswer { id: 1, decision: d.into(), message: None, answers: a };
@@ -3674,7 +3732,7 @@ mod window_guess_tests {
     #[test]
     fn guess_follows_config_then_catalog() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut p = crate::codex_profiles::Profile { id: "builtin".into(), name: String::new(), preset: None, provider_id: None, base_url: None, model: None, tuning: Default::default(), created_at: String::new() };
+        let mut p = crate::codex_profiles::Profile { id: "builtin".into(), name: String::new(), preset: None, provider_id: None, base_url: None, model: None, models: Default::default(), tuning: Default::default(), created_at: String::new() };
         assert_eq!(codex_window_guess(tmp.path(), &p, "gpt-5.5"), None, "目录里没有：不估");
         std::fs::write(tmp.path().join("models_cache.json"), r#"{"models":[{"slug":"gpt-5.5","context_window":272000,"effective_context_window_percent":95}]}"#).unwrap();
         assert_eq!(codex_window_guess(tmp.path(), &p, "gpt-5.5"), Some((258_400, super::super::models::WindowSource::Catalog)));

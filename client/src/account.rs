@@ -712,6 +712,8 @@ impl Account {
             // 每次都带全量终端列表，作为单独上报失败时的兜底；读不到本机列表时不更新（None）
             terminals: self.terminal_ids().ok(),
             direct: crate::direct_tls::advertised(),
+            endpoints: crate::direct_tls::advertised_endpoints(),
+            local_port: crate::direct_tls::local_port(),
             rtc_reach: crate::rtc::nat::reported(),
         }
     }
@@ -1339,7 +1341,7 @@ mod tests {
             let target = target.clone();
             async move {
                 let path = uri.path().to_string();
-                let dev = |id: &str, t: &[&str]| RemoteDevice { id: id.into(), name: id.into(), os: "linux".into(), online: true, last_seen_ms: 0, terminals: t.iter().map(|s| s.to_string()).collect(), keys: Vec::new(), direct: None, reach: None };
+                let dev = |id: &str, t: &[&str]| RemoteDevice { id: id.into(), name: id.into(), os: "linux".into(), online: true, last_seen_ms: 0, terminals: t.iter().map(|s| s.to_string()).collect(), keys: Vec::new(), direct: None, endpoints: Vec::new(), local_port: None, mux_token: None, reach: None };
                 let (status, out) = if path.ends_with("/rtc/devices") {
                     let d = RemoteDevices { items: vec![dev("dev1", &[]), dev("devb", &["tb1"])], default: Some("dev1".into()), max: 7, ice_servers: vec![] };
                     (StatusCode::OK, serde_json::to_vec(&d).unwrap())

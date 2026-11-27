@@ -56,10 +56,25 @@ impl Ctx {
     }
 }
 
+/// `/__looklook/mux` 上 `ctl hello` 附带的设备身份与 TLS 叶子证书绑定证明。
+#[derive(Debug, Clone)]
+pub struct HelloProof {
+    pub key: String,
+    pub cert: String,
+    pub sig: String,
+}
+
+pub type HelloSigner = Arc<dyn Fn(&str) -> Option<HelloProof> + Send + Sync>;
+
 /// 服务一条通道，直到它关闭或请求完成。
-pub async fn serve(ctx: Ctx, mut ch: Channel) {
+pub async fn serve(ctx: Ctx, ch: Channel) {
+    serve_mux(ctx, ch, None).await;
+}
+
+/// 服务一条通道（可选在 `ctl hello` 上对发起方 `nonce` 返回设备公钥签名与 TLS 证书指纹）。
+pub async fn serve_mux(ctx: Ctx, mut ch: Channel, hello_signer: Option<HelloSigner>) {
     let r = if ch.label == "ctl" {
-        control(&ctx, &mut ch).await
+        control(&ctx, &mut ch, hello_signer).await
     } else {
         match ch.recv().await.as_deref().map(frame::parse) {
             Some(Some(Frame::Ctl(head))) => match frame::kind(&head) {
@@ -77,14 +92,24 @@ pub async fn serve(ctx: Ctx, mut ch: Channel) {
     }
 }
 
-async fn control(ctx: &Ctx, ch: &mut Channel) -> Result<()> {
+async fn control(ctx: &Ctx, ch: &mut Channel, hello_signer: Option<HelloSigner>) -> Result<()> {
     while let Some(m) = ch.recv().await {
         if let Some(Frame::Ctl(v)) = frame::parse(&m) {
             match frame::kind(&v) {
                 "hello" => {
                     // 心跳只在页面在前台时发
                     ctx.terms.set_away(&ctx.sid, false);
-                    ch.send(&frame::ctl(&json!({ "t": "hello", "proto": looklook_protocol::rtc::PROTO, "dev": ctx.device })))?;
+                    let mut reply = json!({ "t": "hello", "proto": looklook_protocol::rtc::PROTO, "dev": ctx.device });
+                    if let (Some(nonce), Some(sign)) = (v.get("nonce").and_then(Value::as_str), hello_signer.as_ref()) {
+                        if !nonce.is_empty() && nonce.len() <= 128 {
+                            if let Some(p) = sign(nonce) {
+                                reply["key"] = json!(p.key);
+                                reply["cert"] = json!(p.cert);
+                                reply["sig"] = json!(p.sig);
+                            }
+                        }
+                    }
+                    ch.send(&frame::ctl(&reply))?;
                 }
                 "bg" => ctx.terms.set_away(&ctx.sid, true),
                 "fg" => ctx.terms.set_away(&ctx.sid, false),

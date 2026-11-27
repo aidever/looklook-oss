@@ -491,7 +491,7 @@ impl Chat {
                 self.codex_release(&inst).await;
             }
             "agy" => {
-                if let Err(e) = self.agy_interrupt(id).await {
+                if let Err(e) = self.agy_cancel_turn(id).await {
                     tracing::debug!(id, error = ?e, "停会话：agy 这一轮没停下");
                 }
             }
@@ -525,6 +525,7 @@ impl Chat {
         let _ = self.store.remove(&binding_key(id));
         let _ = self.store.remove(&windows_key(id));
         let _ = self.store.remove(&board::key(id));
+        let _ = self.store.remove(&agy_chat::limit_key(id));
     }
 
     fn require(&self, id: &str) -> Result<(), LocalError> {
@@ -584,8 +585,7 @@ impl Chat {
             "queued": st.queued.iter().chain(&st.codex.steered).collect::<Vec<_>>(),
             // Codex / agy：排到这一轮之后的（这一轮结束后作为下一轮发出，可逐条取回）
             "later": st.codex.later.iter().chain(&st.agy.queued).map(|(t, i)| json!({ "text": t, "images": i.len() })).collect::<Vec<_>>(),
-            "limit": (st.limit_wait.is_some() || st.limit_auto_at.is_some() || st.sdk.limit_resume.is_some())
-                .then(|| json!({ "waiting": st.limit_wait, "auto_at": st.limit_auto_at, "resume_at": st.sdk.limit_resume, "guess": st.sdk.limit_guess })),
+            "limit": Self::limit_view(&st),
             "effort": st.effort,
             // Codex 的 /goal
             "goal": st.codex.goal,
@@ -616,6 +616,11 @@ impl Chat {
         // agy：上一轮额度用完（换哪个账号接着）、刚自动换过账号（放在 json! 外面：宏展开有递归上限）
         v["agy_quota"] = json!(st.agy.quota_out);
         v["agy_switched"] = json!(st.agy.switched);
+        // agy 的历史只在内存里（session/load 重放完才有）：已有会话还没加载完时标上，界面先显示加载中，不要闪成新会话
+        let loading = inst.agent.launch() == "agy"
+            && st.phase != Phase::Detached
+            && st.binding.as_ref().is_some_and(|b| !lock(&agy_log::shared(&b.session_id)).loaded);
+        v["loading"] = json!(loading);
         v
     }
 
@@ -955,7 +960,7 @@ impl Chat {
         let busy = |p: &std::path::Path| self.project_busy(p, id);
         let settings = crate::assistant::settings(&self.store);
         let mode = self.assistant_mode(id);
-        crate::assistant::gate(&self.paths, mode, crate::assistant::ceiling(&settings), &crate::guard::load(&self.store), tool, input, &busy)
+        crate::assistant::gate(&self.paths, mode, crate::assistant::start_ceiling(&settings, input["engine"].as_str()), &crate::guard::load(&self.store), tool, input, &busy)
     }
 
     /// 助理盯着的会话现在怎么样了（每一轮告诉大脑）
@@ -982,13 +987,18 @@ impl Chat {
 
     /// 同上，返回正在干活的那个会话
     pub fn busy_session(&self, path: &std::path::Path, except: &str) -> Option<String> {
+        // 杂事目录不是一个项目：里面各干各的，不互相排队
+        if path.starts_with(crate::assistant::scratch(&self.paths)) {
+            return None;
+        }
         let root = crate::assistant::project_root(path);
         self.store.instances().unwrap_or_default().into_iter().find_map(|r| {
             if r.id == except || crate::assistant::is_hidden(&self.store, &r.id) {
                 return None;
             }
             let dir = std::path::Path::new(&r.workdir);
-            if crate::assistant::project_root(dir) != root && !path.starts_with(dir) {
+            // 同一个项目，或者一个在另一个里面（父目录、子仓库）
+            if crate::assistant::project_root(dir) != root && !path.starts_with(dir) && !dir.starts_with(path) {
                 return None;
             }
             let b = self.brief(&r.id)?;
@@ -1536,7 +1546,7 @@ impl Chat {
             Phase::Approval | Phase::Tui => "attn",
             Phase::Running => "working",
             // 额度用完、正在等重置后自动继续
-            _ if st.limit_wait.is_some() || st.sdk.limit_resume.is_some() => "working",
+            _ if st.limit_wait.is_some() || st.sdk.limit_resume.is_some() || st.agy.limit_resume.is_some() => "working",
             _ if ended => "ended",
             Phase::Idle => "idle",
             Phase::Detached => "stopped",
@@ -1554,8 +1564,7 @@ impl Chat {
             "doing": st.doing,
             "activity": st.live.activity,
             "turn": turn,
-            "limit": (st.limit_wait.is_some() || st.limit_auto_at.is_some() || st.sdk.limit_resume.is_some())
-                .then(|| json!({ "waiting": st.limit_wait, "auto_at": st.limit_auto_at, "resume_at": st.sdk.limit_resume, "guess": st.sdk.limit_guess })),
+            "limit": Self::limit_view(&st),
             // 这一轮做完了、后台还有任务（shell、子代理……，Claude Code 状态栏上的个数）：做完会接着回来，会话列表上算在干活。
             // 不并进 board：看板上的“正在干活”是这一轮还没完（卡住提醒、停止都按它），后台开着的开发服务器不该算
             "background": st.background.iter().map(|(n, kind)| json!({ "n": n, "kind": kind })).collect::<Vec<_>>(),
@@ -1633,6 +1642,7 @@ impl Chat {
     /// - 补上一轮结束时的摘要、记下标题，改过的存进数据库。
     pub async fn background(self: Arc<Self>) {
         self.sdk_limit_restore();
+        self.agy_limit_restore();
         let mut tick = 0u32;
         loop {
             tokio::time::sleep(Duration::from_secs(3)).await;
@@ -1648,6 +1658,9 @@ impl Chat {
                 }
                 if tick.is_multiple_of(20) && inst.agent.launch() == "codex" {
                     self.codex_reap(&inst).await;
+                }
+                if inst.agent.launch() == "agy" {
+                    self.agy_limit_tick(&inst);
                 }
                 let claude = !matches!(inst.agent.launch(), "codex" | "agy") && !sdk;
                 let phase = lock(&inst.st).phase;
@@ -2567,10 +2580,21 @@ impl Chat {
         }
     }
 
+    /// 额度用完、在等重置后自动继续（终端里 Claude Code 的额度菜单、stream-json 的 Claude Code、agy）：界面上的提示和倒计时
+    fn limit_view(st: &State) -> Option<Value> {
+        let resume_at = st.sdk.limit_resume.or(st.agy.limit_resume);
+        (st.limit_wait.is_some() || st.limit_auto_at.is_some() || resume_at.is_some())
+            .then(|| json!({ "waiting": st.limit_wait, "auto_at": st.limit_auto_at, "resume_at": resume_at, "guess": st.sdk.limit_guess || st.agy.limit_guess }))
+    }
+
     /// 这一轮因为账号停着：在等额度重置后自动继续，或者 StopFailure 报了账号问题（界面上 `ACCOUNT_ERRORS` 那几种）
     fn stuck_on_account(st: &State) -> bool {
         const ACCOUNT_ERRORS: &[&str] = &["oauth_org_not_allowed", "account_on_hold", "billing_error", "authentication_failed", "rate_limit", "quota_expired"];
-        st.limit_wait.is_some() || st.limit_auto_at.is_some() || st.sdk.limit_resume.is_some() || st.error.as_deref().is_some_and(|e| ACCOUNT_ERRORS.contains(&e))
+        st.limit_wait.is_some()
+            || st.limit_auto_at.is_some()
+            || st.sdk.limit_resume.is_some()
+            || st.agy.limit_resume.is_some()
+            || st.error.as_deref().is_some_and(|e| ACCOUNT_ERRORS.contains(&e))
     }
 
     /// 这个会话能换账号：Claude Code、不在容器里（容器里的不用看看的账号，model_wrap）
@@ -2652,6 +2676,11 @@ impl Chat {
     /// 助理派出去的会话用这个模型（不记成“上次选的”：不是用户在对话里选的）
     pub async fn apply_model(&self, id: &str, model: &str) -> Result<(), LocalError> {
         self.setting_now(id, "model", model).await
+    }
+
+    /// 助理派出去的会话用这个思考强度（同 [`Self::apply_model`]，不记成“上次选的”）
+    pub async fn apply_effort(&self, id: &str, effort: &str) -> Result<(), LocalError> {
+        self.setting_now(id, "effort", effort).await
     }
 
     /// 会话现在的权限模式（界面状态栏上的那个）
@@ -2826,6 +2855,14 @@ impl Chat {
         models::merge_settings_env(&mut ctx);
         models::overlay_env(&mut ctx, crate::claude_profiles::settings_env(&self.paths.home, &profile).as_ref());
         ctx
+    }
+
+    /// Codex 自己的模型目录（第三方接口的“模型对应”里列这些）；Codex 没装、起不来时空的
+    pub async fn codex_models_catalog(&self) -> Value {
+        if crate::tools::detect(self.instances.shell()).await.codex.is_none() {
+            return json!([]);
+        }
+        self.codex_catalog().await.unwrap_or_else(|_| json!([]))
     }
 
     /// 草稿页（新会话还没建）的模型菜单：`profile` 这个账号 / 配置（空 = 默认的那个）能用的模型，

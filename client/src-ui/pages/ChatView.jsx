@@ -172,7 +172,7 @@ import { useSubmitLock } from '../shared/submitLock.js';
 import { KindIcon, ProfilesApi, ProfilesList, profileName } from './ClaudeProfiles.jsx';
 import SkillsSection, { SkillsApi } from './Skills.jsx';
 import { FindBar, MessageSheet, OutlineTab, UserActs, fillInput, useChatKeys, useLongPress } from './ChatTools.jsx';
-import { LaunchIcon } from '../shared/brands.jsx';
+import { GeminiSparkle, LaunchIcon } from '../shared/brands.jsx';
 import { ChatHowTo, NotifyAsk } from './ChatTips.jsx';
 import { endpoints as fileEndpoints, Preview as FilePreview } from './FileBrowser.jsx';
 import { AgentsSection, CodexExtras, FeedbackDialog, HookAdd, McpLogin, PluginsSection, SandboxRow, StatusDialog } from './ChatManage.jsx';
@@ -946,14 +946,25 @@ function ToolCallCard({ id, block, result, live }) {
   );
 }
 
-/** 助理记、忘了一条记忆：一行淡字（“记住了：标题”），点开看记了什么；没记上的写原因 */
+/** 记忆页的名字：`/memories/projects/shop.md` → `shop` */
+const memPageName = (p) =>
+  String(p || '')
+    .replace(/^\/?memories\/?/, '')
+    .replace(/\.md$/, '')
+    .split('/')
+    .pop();
+
+/** 助理写了记忆：一行淡字（“记住了：页名”），点开看写了什么；没写上的写原因；动到你写的行显示“等你确认”。
+ *  `memory` 工具（create / str_replace / insert / delete / rename），旧对话里的 memory_save / memory_forget 也照样画 */
 function MemoryLine({ id, block, result, live }) {
   const { t } = useT();
   const [open, setOpen] = useState(false);
-  // 撤销这次（记住了 / 忘掉了 返回的变化 id）：null 没点过、'busy'、'done'
+  // 撤销这次（返回的改动 id）：null 没点过、'busy'、'done'
   const [undo, setUndo] = useState(null);
   const toast = useToast();
-  const forget = block.name.endsWith('_forget');
+  const inp = block.input || {};
+  const legacy = block.name.endsWith('_save') || block.name.endsWith('_forget');
+  const forget = legacy ? block.name.endsWith('_forget') : inp.command === 'delete';
   const state = toolState(block, result, live);
   let out = null;
   try {
@@ -961,11 +972,26 @@ function MemoryLine({ id, block, result, live }) {
   } catch {
     out = null;
   }
-  const title = out?.title || block.input?.title || '';
-  // 动到你写的、钉住的：变成提议，等你在记忆页点头
-  const proposed = state === 'ok' && Boolean(out?.proposal);
+  const title = legacy ? out?.title || inp.title || '' : memPageName(inp.command === 'rename' ? inp.new_path : inp.path) || memPageName(out?.page);
+  // 动到你写的行：等你在记忆页点头
+  const proposed = state === 'ok' && Boolean(out?.proposal || out?.pending);
   const label = `chat.memory.${state === 'err' ? (forget ? 'forget_failed' : 'save_failed') : state === 'run' || state === 'idle' ? (forget ? 'forgetting' : 'saving') : proposed ? 'proposed' : forget ? 'forgot' : 'saved'}`;
-  const detail = state === 'err' ? String(result?.content ?? '').trim() : forget ? block.input?.why || '' : block.input?.text || '';
+  const detail =
+    state === 'err'
+      ? String(result?.content ?? '').trim()
+      : legacy
+        ? forget
+          ? inp.why || ''
+          : inp.text || ''
+        : inp.command === 'create'
+          ? String(inp.file_text || '').replace(/^---\n[\s\S]*?\n---\n+/, '')
+          : inp.command === 'str_replace'
+            ? inp.new_str || ''
+            : inp.command === 'insert'
+              ? inp.insert_text || ''
+              : inp.command === 'rename'
+                ? `${memPageName(inp.old_path)} → ${memPageName(inp.new_path)}`
+                : '';
   const canUndo = state === 'ok' && out?.change && !proposed;
   const doUndo = () => {
     setUndo('busy');
@@ -980,10 +1006,7 @@ function MemoryLine({ id, block, result, live }) {
     <div className="chat-memory" data-state={state} data-undone={undo === 'done' ? '' : undefined}>
       <button type="button" onClick={() => setOpen(!open)} aria-expanded={open} disabled={!detail}>
         {state === 'run' ? <LoaderCircle size={13} className="spin" aria-hidden="true" /> : forget ? <BrainCircuit size={13} aria-hidden="true" /> : <Brain size={13} aria-hidden="true" />}
-        <span className="ellipsis">
-          {title ? t(`${label}_t`, { title }) : t(label)}
-          {!forget && block.input?.kind && <span className="chat-memory-kind"> · {t(`asst.mem.kind.${block.input.kind}`, { defaultValue: block.input.kind })}</span>}
-        </span>
+        <span className="ellipsis">{title ? t(`${label}_t`, { title }) : t(label)}</span>
       </button>
       {canUndo && (
         <button type="button" className="chat-memory-undo" onClick={doUndo} disabled={Boolean(undo)}>
@@ -2829,11 +2852,14 @@ function AccountFail({ id, error }) {
   );
 }
 
-/** agy 这一轮额度用完了：一键换到额度够的账号接着这段对话（发 continue），或者从列表里另选；勾上以后额度用完就自动换 */
-function AgyQuotaOut({ id, out }) {
+/** agy 这一轮额度用完了：一键换到额度够的账号接着这段对话（发 continue），或者从列表里另选；勾上以后额度用完就自动换。
+ *  没换账号时看看替它等重置（`wait`：status.limit，到 `resume_at` 自动发 continue），可以取消 */
+function AgyQuotaOut({ id, out, wait }) {
   const { t } = useT();
   const toast = useToast();
   const [busy, setBusy] = useState(false);
+  const [cancelling, setCancelling] = useState(false);
+  const waiting = !out.auto && wait?.resume_at > 0;
   const client = deviceApi(terminalDevice(id));
   const [auto, setAuto] = useState(null);
   useEffect(() => {
@@ -2863,13 +2889,38 @@ function AgyQuotaOut({ id, out }) {
       toast(errorText(t, e), 'error');
     }
   };
+  // 在等重置时，停止 = 不自动继续
+  const cancel = async () => {
+    setCancelling(true);
+    try {
+      await api.post(`/instances/${id}/chat/interrupt`);
+    } catch (e) {
+      toast(errorText(t, e), 'error');
+    } finally {
+      setCancelling(false);
+    }
+  };
+  const name = profileName(t, out.from, 'agy');
   return (
-    <div className="chat-limit is-stopped" role="status">
+    <div className={waiting ? 'chat-limit' : 'chat-limit is-stopped'} role="status">
       <span className="chat-limit-head">
-        <TriangleAlert size={15} aria-hidden="true" />
-        {t('chat.agyq.head', { name: profileName(t, out.from, 'agy') })}
+        {waiting ? <Hourglass size={15} aria-hidden="true" /> : <TriangleAlert size={15} aria-hidden="true" />}
+        {t(waiting ? 'chat.agyq.head_wait' : 'chat.agyq.head', { name })}
       </span>
-      <p className="chat-note">{out.auto ? t('chat.agyq.auto_now', { name: profileName(t, to, 'agy') }) : to ? t('chat.agyq.hint', { left: Math.round(to.left) }) : t('chat.agyq.none')}</p>
+      {waiting && (
+        <div className="chat-limit-when">
+          {/* 报错和额度里都没说什么时候重置：照实说是试试看 */}
+          <span className="chat-note">{t(wait.guess ? 'chat.limit.guess_at' : 'chat.limit.resume_at', { when: clockAt(wait.resume_at) })}</span>
+        </div>
+      )}
+      {out.auto ? (
+        <p className="chat-note">{t('chat.agyq.auto_now', { name: profileName(t, to, 'agy') })}</p>
+      ) : to ? (
+        <p className="chat-note">{t('chat.agyq.hint', { left: Math.round(to.left) })}</p>
+      ) : (
+        !waiting && <p className="chat-note">{t('chat.agyq.none')}</p>
+      )}
+      {waiting && <p className="chat-note">{t('chat.limit.keep_open')}</p>}
       {!out.auto && (
         <div className="chat-acts">
           {to && (
@@ -2878,6 +2929,11 @@ function AgyQuotaOut({ id, out }) {
             </Button>
           )}
           <SwitchProfile id={id} agent="agy" manage />
+          {waiting && (
+            <Button variant="ghost" onClick={cancel} busy={cancelling}>
+              {t('chat.limit.cancel_wait')}
+            </Button>
+          )}
         </div>
       )}
       {auto != null && (
@@ -2921,7 +2977,7 @@ function AccountsDialog({ id, agent, onClose }) {
     } else reload();
   }, [id, setup?.login_required]);
   return (
-    <Modal open wide className={`chat-acct-modal${codex ? ' chat-acct-codex' : ''}`} onClose={onClose} title={t(codex ? 'chat.accounts_title_codex' : agy ? 'chat.accounts_title_agy' : 'chat.accounts_title')}>
+    <Modal open wide className={`chat-acct-modal${codex ? ' chat-acct-codex' : agy ? ' chat-acct-agy' : ''}`} onClose={onClose} title={t(codex ? 'chat.accounts_title_codex' : agy ? 'chat.accounts_title_agy' : 'chat.accounts_title')}>
       {codex ? (
         setup ? <CodexLogin id={id} onDone={codexDone} again={!setup.login_required} /> : <Skeleton height={60} />
       ) : (
@@ -3035,7 +3091,7 @@ function SwitchProfile({ id, agent = 'claude', manage, goOn = true }) {
       className="btn btn-ghost"
       icon={UserRound}
       text={t(goOn ? 'chat.limit.switch' : 'chat.limit.switch_short')}
-      label={t(goOn ? 'chat.limit.switch_hint' : 'chat.limit.switch_plain_hint')}
+      label={t(agent === 'agy' ? (goOn ? 'chat.limit.switch_hint_agy' : 'chat.limit.switch_plain_hint_agy') : goOn ? 'chat.limit.switch_hint' : 'chat.limit.switch_plain_hint')}
       disabled={busy}
       items={[
         ...others.map((p) => ({
@@ -6639,6 +6695,15 @@ function CodexGlyph({ launch = 'codex' }) {
   );
 }
 
+/** Antigravity / Gemini 运行中：Gemini 四角星轻轻旋转呼吸 */
+function GeminiGlyph() {
+  return (
+    <span className="chat-working-mark gemini" aria-hidden="true">
+      <GeminiSparkle size={16} />
+    </span>
+  );
+}
+
 /** 点了停止、这一轮还没真正停下：Live 改说“正在停止…”，不再挂着上一个工具名 */
 const stopAt = new Map();
 function markStop(id, on) {
@@ -6688,7 +6753,7 @@ function Live({ id, status, items, since }) {
       {/* stream-json、Codex 的预览是 Markdown 原文：和写完的回复一样排版（换成正式消息时不跳）；TUI 抓屏的已经排过版，照原样 */}
       {shown && (status?.preview_md ? <Markdown text={preview} /> : <div className="chat-preview">{preview}</div>)}
       <p className="chat-working">
-        {agent === 'claude' ? <SpinGlyph /> : <CodexGlyph launch={agent} />}
+        {agent === 'claude' ? <SpinGlyph /> : agent === 'agy' ? <GeminiGlyph /> : <CodexGlyph launch={agent} />}
         <span className="ellipsis">{act.text || (status?.tool ? t('chat.running_tool', { tool: status.tool }) : t('chat.working'))}</span>
         {act.orig && <span className="chat-working-orig" lang="en">{act.orig}</span>}
         {act.detail && (
@@ -6919,10 +6984,10 @@ function ChatFresh({ kind, title, agent }) {
       <span className="chat-fresh-mark" aria-hidden="true">
         <i />
         <i />
-        {agent === 'claude' ? <Asterisk size={30} /> : <LaunchIcon launch={agent} size={30} mono />}
+        {agent === 'claude' ? <Asterisk size={30} /> : agent === 'agy' ? <GeminiSparkle size={32} /> : <LaunchIcon launch={agent} size={30} mono />}
       </span>
-      <p className="chat-fresh-title">{kind === 'resume' ? t('chat.fresh_resume') : t('chat.fresh_new')}</p>
-      {kind === 'resume' && title ? <p className="chat-note ellipsis chat-fresh-sub">{title}</p> : <p className="chat-note chat-fresh-sub">{t('chat.fresh_new_note')}</p>}
+      <p className="chat-fresh-title">{kind === 'load' ? t('chat.fresh_load') : kind === 'resume' ? t('chat.fresh_resume') : t('chat.fresh_new')}</p>
+      {kind === 'new' ? <p className="chat-note chat-fresh-sub">{t('chat.fresh_new_note')}</p> : title ? <p className="chat-note ellipsis chat-fresh-sub">{title}</p> : null}
       <span className="chat-fresh-dots" aria-hidden="true">
         <i />
         <i />
@@ -7159,7 +7224,7 @@ export default function ChatView({ id, launch, workdir = null, active, touch, of
   }, [chat.start, items.length, loadOlder]);
   if (chat.error && !status) {
     return (
-      <div className="chat-view">
+      <div className="chat-view" data-agent={agentId}>
         <div className="chat-detached">
           <b>{t('chat.unavailable')}</b>
           <p className="muted">{errorText(t, chat.error)}</p>
@@ -7188,11 +7253,15 @@ export default function ChatView({ id, launch, workdir = null, active, touch, of
                   {t('chat.older')}
                 </button>
               )}
-              {fresh.waiting && <ChatFresh kind={fresh.kind} title={fresh.title} agent={agentId} />}
-              {!items.length && status && phase !== 'detached' && !first && !echo && !fresh.waiting && (
+              {fresh.waiting ? (
+                <ChatFresh kind={fresh.kind} title={fresh.title} agent={agentId} />
+              ) : (
+                !!status?.loading && phase !== 'detached' && !items.length && !first && !echo && <ChatFresh kind="load" title={title} agent={agentId} />
+              )}
+              {!items.length && status && phase !== 'detached' && !status.loading && !first && !echo && !fresh.waiting && (
                 <div className="chat-empty">
                   <span className="chat-empty-mark" aria-hidden="true">
-                    {agentId === 'claude' ? <Asterisk size={40} /> : <LaunchIcon launch={agentId} size={40} mono />}
+                    {agentId === 'claude' ? <Asterisk size={40} /> : agentId === 'agy' ? <GeminiSparkle size={38} /> : <LaunchIcon launch={agentId} size={40} mono />}
                   </span>
                   <p className="chat-empty-title">{t('chat.empty')}</p>
                   {/* 几个常用的开头：点了填进输入框，可以改了再发 */}
@@ -7269,10 +7338,11 @@ export default function ChatView({ id, launch, workdir = null, active, touch, of
           )}
           {/* 第一句在等它起来：上面已经写着“正在启动”，这里不再说一遍 */}
           {phase === 'detached' && !first && !fresh.waiting && <Detached id={id} status={status} />}
-          {(status?.limit?.waiting || status?.limit?.resume_at > 0) && phase !== 'tui' && <LimitWait id={id} waiting={status.limit.waiting} resumeAt={status.limit.resume_at} guess={status.limit.guess} />}
+          {agentId !== 'agy' && (status?.limit?.waiting || status?.limit?.resume_at > 0) && phase !== 'tui' && <LimitWait id={id} waiting={status.limit.waiting} resumeAt={status.limit.resume_at} guess={status.limit.guess} />}
           {status?.other && phase !== 'tui' && phase !== 'detached' && <OtherScreen id={id} onTab={onTab} />}
           {agentId === 'claude' && phase === 'idle' && !status?.limit?.waiting && !status?.limit?.resume_at && ACCOUNT_ERRORS.includes(status?.error) && <AccountFail id={id} error={status.error} />}
-          {agentId === 'agy' && phase === 'idle' && status?.agy_quota && <AgyQuotaOut id={id} out={status.agy_quota} />}
+          {/* agy 额度用完：等重置自动继续也在这张卡片里（换账号、自动换的开关都在这） */}
+          {agentId === 'agy' && status?.agy_quota && (phase === 'idle' || status?.limit?.resume_at > 0) && <AgyQuotaOut id={id} out={status.agy_quota} wait={status.limit} />}
           {agentId === 'agy' && status?.agy_switched && !status?.agy_quota && <AgySwitched sw={status.agy_switched} />}
           {agentId === 'codex' && status != null && <CodexSetup id={id} phase={phase} onTab={onTab} />}
           {phase !== 'detached' && <AgentStrip id={id} items={items} live={live} bg={bg} onOpen={openAgent} />}

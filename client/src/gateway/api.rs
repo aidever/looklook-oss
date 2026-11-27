@@ -60,16 +60,17 @@ pub fn routes(app: App) -> Router<App> {
         .route("/assistant/restart", post(super::assistant::restart))
         .route("/assistant/of/{id}", get(super::assistant::of_session))
         .route("/assistant/dispatches/{id}/fix", post(super::assistant::fix))
-        .route("/assistant/memory", get(super::assistant::memory).post(super::assistant::memory_add))
-        .route("/assistant/memory/{id}", axum::routing::put(super::assistant::memory_put).delete(super::assistant::memory_delete))
-        .route("/assistant/memory/{id}/restore", post(super::assistant::memory_restore))
-        .route("/assistant/memory/changes/{id}/undo", post(super::assistant::memory_undo))
-        .route("/assistant/memory/{id}/versions", get(super::assistant::memory_versions))
-        .route("/assistant/memory/{id}/purge", post(super::assistant::memory_purge))
-        .route("/assistant/memory/changes/{id}/revert", post(super::assistant::memory_revert))
-        .route("/assistant/memory/proposals/{id}/{action}", post(super::assistant::memory_proposal))
-        .route("/assistant/memory-roster", post(super::assistant::memory_roster))
+        .route("/assistant/memory", get(super::assistant::memory))
+        .route("/assistant/memory/page", get(super::assistant::memory_page).put(super::assistant::memory_page_put))
+        .route("/assistant/memory/page/rename", post(super::assistant::memory_page_rename))
+        .route("/assistant/memory/page/delete", post(super::assistant::memory_page_delete))
+        .route("/assistant/memory/page/purge", post(super::assistant::memory_purge))
+        .route("/assistant/memory/changes/{id}/{action}", post(super::assistant::memory_change))
+        .route("/assistant/memory/pending/{id}/{action}", post(super::assistant::memory_pending))
+        .route("/assistant/memory/runs/{id}", get(super::assistant::memory_run_get))
+        .route("/assistant/memory/runs/{id}/{action}", post(super::assistant::memory_run))
         .route("/assistant/memory-search", post(super::assistant::memory_search_api))
+        .route("/assistant/memory-source", get(super::assistant::memory_source))
         .route("/assistant/memory-search/{h}/forget", post(super::assistant::memory_forget_hit))
         .route("/assistant/memory-imported", get(super::assistant::memory_imported))
         .route("/assistant/memory-settings", post(super::assistant::memory_settings))
@@ -299,6 +300,7 @@ pub fn routes(app: App) -> Router<App> {
         .route("/device/name", put(put_device_name))
         .route("/access", get(get_access).put(put_access))
         .route("/public-https", get(get_public_https).put(put_public_https))
+        .route("/connection", get(get_connection).put(put_connection))
         .route("/mcp", get(get_mcp).put(put_mcp))
         .route("/mcp/install", post(mcp_install))
         .route("/mcp/uninstall", post(mcp_uninstall))
@@ -326,6 +328,9 @@ pub fn routes(app: App) -> Router<App> {
         .route("/codex-profiles/default", put(set_default_codex_profile))
         .route("/codex-profiles/{id}", put(update_codex_profile).delete(delete_codex_profile))
         .route("/codex-profiles/{id}/usage", post(codex_profile_usage))
+        .route("/codex-profiles/test", post(test_codex_profile))
+        .route("/codex-profiles/provider-models", post(codex_provider_models))
+        .route("/codex-profiles/catalog", get(codex_catalog))
         .route("/codex-profiles/{id}/tuning", put(set_codex_tuning))
         .route("/codex-profiles/{id}/tuning/current", get(codex_tuning_current))
         .route("/usage-stats", get(usage_stats))
@@ -335,6 +340,8 @@ pub fn routes(app: App) -> Router<App> {
         .route("/claude-profiles/default", put(set_default_claude_profile))
         .route("/claude-profiles/{id}", put(update_claude_profile).delete(delete_claude_profile))
         .route("/claude-profiles/{id}/status", get(claude_profile_status))
+        .route("/claude-profiles/test", post(test_claude_profile))
+        .route("/claude-profiles/provider-models", post(claude_provider_models))
         .route("/claude-profiles/{id}/usage", post(claude_profile_usage))
         .route("/claude-profiles/{id}/tuning", put(set_claude_tuning))
         .route("/claude-profiles/{id}/tuning/current", get(claude_tuning_current))
@@ -2575,6 +2582,7 @@ async fn put_access(State(app): State<App>, peer: Option<Extension<Peer>>, Json(
         c.open_host = if h.trim().is_empty() { String::new() } else { parsed.to_string() };
     }
     c.save(&app.store)?;
+    let lan_changed = c.allow_lan != app.access().allow_lan;
     let domains_changed = !c.domains().eq(app.access().domains());
     *app.access.write().unwrap_or_else(|e| e.into_inner()) = c;
     let _ = app.write_open_file();
@@ -2582,10 +2590,13 @@ async fn put_access(State(app): State<App>, peer: Option<Extension<Peer>>, Json(
         // 马上解析新加的域名，界面能直接看到它解析到哪个 IP
         app.resolved.refresh(&app.access()).await;
     }
+    if lan_changed {
+        app.account.wake();
+    }
     Ok(Json(access_view(&app, peer.map(|p| p.0))))
 }
 
-// ---------------- 公网 HTTPS 直连（服务端 docs/09） ----------------
+// ---------------- 公网 HTTPS 直连与统一连接加速 ----------------
 
 fn public_https_view(app: &App) -> Value {
     let st = app.direct.status();
@@ -2616,7 +2627,79 @@ struct PublicHttpsReq {
 
 async fn put_public_https(State(app): State<App>, Json(req): Json<PublicHttpsReq>) -> R<Json<Value>> {
     app.direct.set_enabled(req.enabled)?;
+    app.account.wake();
     Ok(Json(public_https_view(&app)))
+}
+
+fn connection_view(app: &App, peer: Option<Peer>) -> Value {
+    let acc = app.access();
+    let dir = app.direct.config();
+    let net = crate::rtc::net::NetConfig::load(&app.store);
+    json!({
+        "port": app.ui_addr.port(),
+        "allow_lan": acc.allow_lan,
+        "lan_ips": crate::gateway::access::own_lan_ips().into_iter().map(|ip| ip.to_string()).collect::<Vec<_>>(),
+        "public_direct": dir.enabled,
+        "custom_urls": dir.custom_urls,
+        "tls_cert_path": dir.tls_cert_path,
+        "tls_key_path": dir.tls_key_path,
+        "direct_status": app.direct.status(),
+        "endpoints": app.direct.endpoints(&acc),
+        "logins": app.direct.logins(),
+        "tos_url": crate::direct_tls::TOS_URL,
+        "code": acc.code,
+        "code_ok": crate::direct_tls::public_code_ok(&acc),
+        "code_enabled": acc.code_enabled,
+        "allowed_ips": acc.allowed_ips,
+        "resolved": app.resolved.view(&acc),
+        "open_host": acc.open_host,
+        "net": crate::rtc::net::view(&net),
+        "logged_in": app.account.session().is_some(),
+        "peer": peer,
+        "exe": std::env::current_exe().ok().map(|p| p.display().to_string()),
+    })
+}
+
+async fn get_connection(State(app): State<App>, peer: Option<Extension<Peer>>) -> R<Json<Value>> {
+    Ok(Json(connection_view(&app, peer.map(|p| p.0))))
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct ConnectionReq {
+    allow_lan: Option<bool>,
+    public_direct: Option<bool>,
+    custom_urls: Option<Vec<String>>,
+    tls_cert_path: Option<String>,
+    tls_key_path: Option<String>,
+}
+
+async fn put_connection(State(app): State<App>, peer: Option<Extension<Peer>>, Json(req): Json<ConnectionReq>) -> R<Json<Value>> {
+    if let Some(allow_lan) = req.allow_lan {
+        let mut c = app.access();
+        if c.allow_lan != allow_lan {
+            c.allow_lan = allow_lan;
+            c.save(&app.store)?;
+            *app.access.write().unwrap_or_else(|e| e.into_inner()) = c;
+        }
+    }
+    if let Some(urls) = req.custom_urls {
+        app.direct.set_custom_urls(&urls).map_err(|(rule, val)| {
+            let e = LocalError::invalid("custom_urls", rule);
+            if val.is_empty() { e } else { e.with("value", val) }
+        })?;
+    }
+    if req.tls_cert_path.is_some() || req.tls_key_path.is_some() {
+        let cur = app.direct.config();
+        let cp = req.tls_cert_path.as_deref().unwrap_or(&cur.tls_cert_path);
+        let kp = req.tls_key_path.as_deref().unwrap_or(&cur.tls_key_path);
+        app.direct.set_custom_tls(cp, kp).map_err(|rule| LocalError::invalid("tls_cert", rule))?;
+    }
+    if let Some(on) = req.public_direct {
+        app.direct.set_enabled(on)?;
+    }
+    app.account.wake();
+    Ok(Json(connection_view(&app, peer.map(|p| p.0))))
 }
 
 // ---------------- AI 助手接入（MCP） ----------------
@@ -2794,7 +2877,7 @@ struct AgentAutoReq {
 
 async fn agent_update_set(State(app): State<App>, Path(tool): Path<String>, Json(req): Json<AgentAutoReq>) -> R<Json<Value>> {
     crate::agent_update::set_auto(&app.store, &tool, req.auto)?;
-    Ok(Json(crate::agent_update::view(&app.store, &app.instances, &app.chat).await))
+    Ok(Json(json!({ "tool": tool, "auto": req.auto })))
 }
 
 /// 现在更新（进度看 `GET /tools/install/{tool}`）
@@ -2955,12 +3038,15 @@ async fn platform_endpoint(app: &App, id: &str, client: &str) -> R<(String, Stri
 struct ApiSource<'a> {
     agent: &'a str,
     accept: bool,
+    /// 只是测试、列模型（不存）：不要求先同意免责声明、不算选用人数
+    test: bool,
     provider_id: Option<String>,
     preset: Option<String>,
 }
 
 async fn api_source(app: &App, src: ApiSource<'_>, base_url: &mut Option<String>, name: &mut Option<String>) -> R<()> {
-    if src.accept {
+    if src.test {
+    } else if src.accept {
         crate::model::accept_disclaimer(&app.store)?;
     } else if crate::model::disclaimer_accepted(&app.store).is_none() {
         return Err(LocalError::new("MODEL_DISCLAIMER_REQUIRED"));
@@ -2968,6 +3054,10 @@ async fn api_source(app: &App, src: ApiSource<'_>, base_url: &mut Option<String>
     let client = if src.agent == "codex" { "codex" } else { "claude_code" };
     let found = if let Some(id) = src.provider_id.filter(|s| !s.is_empty()) {
         let found = platform_endpoint(app, &id, client).await?;
+        if src.test {
+            *base_url = Some(found.1);
+            return Ok(());
+        }
         // 统计选用人数；失败不影响使用
         let account = app.account.clone();
         tokio::spawn(async move {
@@ -3066,7 +3156,7 @@ struct CodexProfileReq {
 }
 
 async fn codex_api_input(app: &App, req: &mut CodexProfileReq) -> R<()> {
-    let src = ApiSource { agent: "codex", accept: req.accept, provider_id: req.input.provider_id.clone(), preset: req.input.preset.clone() };
+    let src = ApiSource { agent: "codex", accept: req.accept, test: false, provider_id: req.input.provider_id.clone(), preset: req.input.preset.clone() };
     api_source(app, src, &mut req.input.base_url, &mut req.input.name).await
 }
 
@@ -3095,6 +3185,49 @@ async fn delete_codex_profile(State(app): State<App>, Path(id): Path<String>) ->
 async fn set_default_codex_profile(State(app): State<App>, Json(req): Json<DefaultReq>) -> R<Json<Value>> {
     crate::codex_profiles::set_default(&app.store, &req.id)?;
     Ok(Json(codex_profiles_view(&app)))
+}
+
+#[derive(Deserialize)]
+struct CodexDraftReq {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(flatten)]
+    input: crate::codex_profiles::Input,
+}
+
+async fn codex_draft(app: &App, mut req: CodexDraftReq) -> R<(crate::codex_profiles::Profile, String)> {
+    let src = ApiSource { agent: "codex", accept: false, test: true, provider_id: req.input.provider_id.clone(), preset: req.input.preset.clone() };
+    api_source(app, src, &mut req.input.base_url, &mut req.input.name).await?;
+    Ok(crate::codex_profiles::draft(&app.store, &app.paths.home, req.id.as_deref().filter(|s| !s.is_empty()), req.input)?)
+}
+
+/// 测默认模型和每个对应过的模型（直接请求服务商的 Responses 接口，见 model_test.rs）
+async fn test_codex_profile(State(app): State<App>, Json(req): Json<CodexDraftReq>) -> R<Json<Value>> {
+    let (p, key) = codex_draft(&app, req).await?;
+    let mut list: Vec<(String, String)> = vec![];
+    if let Some(m) = p.model.as_deref() {
+        list.push(("main".into(), p.remote(m)));
+    }
+    // 默认模型就是对应过的那个时上面测过了
+    for (native, remote) in p.models.iter().filter(|(n, _)| p.model.as_deref() != Some(n.as_str())) {
+        list.push((native.clone(), remote.clone()));
+    }
+    if list.is_empty() {
+        return Err(LocalError::invalid("model", "required"));
+    }
+    Ok(Json(crate::model_test::codex(p.base_url.as_deref().unwrap_or_default(), &key, &list).await))
+}
+
+async fn codex_provider_models(State(app): State<App>, Json(req): Json<CodexDraftReq>) -> R<Json<Value>> {
+    let (p, key) = codex_draft(&app, req).await?;
+    let base = p.base_url.unwrap_or_default();
+    let list = crate::chat::models::fetch_models(&format!("{}/models", base.trim_end_matches('/')), &key).await;
+    Ok(Json(json!({ "models": list, "error": list.is_none() })))
+}
+
+/// Codex 自己的模型目录（“模型对应”左边那一列）
+async fn codex_catalog(State(app): State<App>) -> Json<Value> {
+    Json(json!({ "models": app.chat.codex_models_catalog().await }))
 }
 
 /// 模型设置（上下文窗口、自动压缩等，见 model_tuning.rs）；本机默认也能设
@@ -3182,7 +3315,7 @@ struct ClaudeProfileReq {
 
 /// 第三方接口：免责声明、地址来源（见 [`api_source`]）；快速配置没说 Key 怎么发时按预设的
 async fn claude_api_input(app: &App, req: &mut ClaudeProfileReq) -> R<()> {
-    let src = ApiSource { agent: "claude", accept: req.accept, provider_id: req.input.provider_id.clone(), preset: req.input.preset.clone() };
+    let src = ApiSource { agent: "claude", accept: req.accept, test: false, provider_id: req.input.provider_id.clone(), preset: req.input.preset.clone() };
     api_source(app, src, &mut req.input.base_url, &mut req.input.name).await?;
     if req.input.auth.is_none() {
         req.input.auth = req.input.preset.as_deref().and_then(crate::model_presets::get).map(|p| p.auth);
@@ -3207,6 +3340,40 @@ async fn update_claude_profile(State(app): State<App>, Path(id): Path<String>, J
     }
     crate::claude_profiles::update(&app.store, &app.paths.home, &id, req.input)?;
     Ok(Json(claude_profiles_view(&app)))
+}
+
+/// 测试、列模型用的表单（还没保存的也行）：`id` 是在编辑的那个（Key 没填时用它保存的）
+#[derive(Deserialize)]
+struct ClaudeDraftReq {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(flatten)]
+    input: crate::claude_profiles::Input,
+}
+
+async fn claude_draft(app: &App, mut req: ClaudeDraftReq) -> R<(crate::claude_profiles::Profile, String)> {
+    let src = ApiSource { agent: "claude", accept: false, test: true, provider_id: req.input.provider_id.clone(), preset: req.input.preset.clone() };
+    api_source(app, src, &mut req.input.base_url, &mut req.input.name).await?;
+    if req.input.auth.is_none() {
+        req.input.auth = req.input.preset.as_deref().and_then(crate::model_presets::get).map(|p| p.auth);
+    }
+    Ok(crate::claude_profiles::draft(&app.store, &app.paths.home, req.id.as_deref().filter(|s| !s.is_empty()), req.input)?)
+}
+
+/// 每个档位（默认和四个别名）真的跑一次 Claude Code，见 model_test.rs
+async fn test_claude_profile(State(app): State<App>, Json(req): Json<ClaudeDraftReq>) -> R<Json<Value>> {
+    let (p, key) = claude_draft(&app, req).await?;
+    let env = crate::claude_profiles::test_env(&p, &key).ok_or_else(|| LocalError::invalid("base_url", "invalid"))?;
+    let slots = p.models.slots();
+    Ok(Json(crate::model_test::claude(app.instances.shell(), &app.paths.home, &env, &slots).await))
+}
+
+/// 服务商自己列出的模型（表单里给每个档位选）
+async fn claude_provider_models(State(app): State<App>, Json(req): Json<ClaudeDraftReq>) -> R<Json<Value>> {
+    let (p, key) = claude_draft(&app, req).await?;
+    let base = p.base_url.unwrap_or_default();
+    let list = crate::chat::models::fetch_models(&format!("{}/v1/models?limit=1000", base.trim_end_matches('/')), &key).await;
+    Ok(Json(json!({ "models": list, "error": list.is_none() })))
 }
 
 /// 模型设置（上下文窗口、自动压缩等，见 model_tuning.rs）；本机默认账号也能设

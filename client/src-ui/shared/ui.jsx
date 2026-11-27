@@ -141,10 +141,10 @@ export function Note({ kind = 'info', icon, children }) {
 }
 
 /** 一行提示，点开看全文：给次要但需要知道的提醒，不占主要内容的位置。 */
-export function FoldNote({ kind = 'info', icon, summary, children }) {
+export function FoldNote({ kind = 'info', icon, summary, open, children }) {
   const Icon = icon ?? NOTE_ICON[kind] ?? Info;
   return (
-    <details className={`note note-${kind} note-fold`}>
+    <details className={`note note-${kind} note-fold`} open={open || undefined}>
       <summary>
         <Icon className="icon" size={16} aria-hidden="true" />
         <span className="grow">{summary}</span>

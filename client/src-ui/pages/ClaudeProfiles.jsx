@@ -2,7 +2,7 @@
 // 新建的会话用默认的（开始页可以另选），之后切换默认不影响已经建好的会话。两个助手共用这里的组件，`agent` 区分。
 // 官方账号的登录由 Claude Code 自己完成（后台运行 `claude auth login`，界面显示授权页地址、收授权码），看看不经手令牌。
 // 第三方接口可以从“常见服务商”里选（model_presets.rs）：地址填好了，贴上 Key 就行，模型从 models.dev 的列表里选。
-import { Check, Cpu, ExternalLink, Gauge, KeyRound, LogIn, Plus, Server, SlidersHorizontal, Sparkles, UserRound } from 'lucide-react';
+import { Check, CircleCheck, CircleX, Cpu, ExternalLink, Gauge, KeyRound, ListRestart, LogIn, Plus, Server, SlidersHorizontal, Sparkles, UserRound, Zap } from 'lucide-react';
 import { createContext, useContext, useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 
@@ -23,9 +23,45 @@ export const ProfilesApi = ApiCtx.Provider;
 const CUSTOM = 'custom';
 // 本机的 Ollama（docs/PLAN_2026-10-27.md §4）：检测到才出现，一键填好地址和 Key，模型从已下载的里选
 const OLLAMA = 'ollama';
-const MODEL_KEYS = ['main', 'opus', 'sonnet', 'haiku'];
+const MODEL_KEYS = ['main', 'fable', 'opus', 'sonnet', 'haiku'];
 // 每项对应的 Claude Code 环境变量（标签下面小字显示，名字长，单独一行可折行）
-const MODEL_ENV = { main: 'ANTHROPIC_MODEL', opus: 'ANTHROPIC_DEFAULT_OPUS_MODEL', sonnet: 'ANTHROPIC_DEFAULT_SONNET_MODEL', haiku: 'ANTHROPIC_DEFAULT_HAIKU_MODEL' };
+const MODEL_ENV = {
+  main: 'ANTHROPIC_MODEL',
+  fable: 'ANTHROPIC_DEFAULT_FABLE_MODEL',
+  opus: 'ANTHROPIC_DEFAULT_OPUS_MODEL',
+  sonnet: 'ANTHROPIC_DEFAULT_SONNET_MODEL',
+  haiku: 'ANTHROPIC_DEFAULT_HAIKU_MODEL',
+};
+
+/** 服务商列出的模型里给 Claude 的一个家族挑一个：名字里带家族名的，版本号最大的那个 */
+function guessModel(ids, family) {
+  const hits = ids.filter((id) => id.toLowerCase().includes(family));
+  return hits.sort((a, b) => b.localeCompare(a, undefined, { numeric: true }))[0] ?? '';
+}
+
+/** 测试结果：每个档位一行，成功的写用时，失败的写服务商的原话 */
+function TestResults({ agent, data, catalog }) {
+  const { t } = useTranslation();
+  if (data.error) return <Note kind="error">{t(data.error === 'claude_missing' ? 'cprof.test_no_claude' : 'cprof.test_failed', { error: data.error })}</Note>;
+  const slotName = (slot) => {
+    if (slot === 'main') return t('cprof.test_main');
+    if (agent === 'codex') return catalog?.find((m) => m.value === slot)?.label ?? slot;
+    return t(`cprof.model.${slot}`);
+  };
+  return (
+    <ul className="cprof-test">
+      {data.results.map((r) => (
+        <li key={r.slot} className={r.ok ? 'ok' : 'bad'}>
+          {r.ok ? <CircleCheck size={16} aria-label={t('cprof.test_ok')} /> : <CircleX size={16} aria-label={t('cprof.test_bad')} />}
+          <span className="cprof-test-body">
+            <b>{slotName(r.slot)}</b> <span className="mono small muted">{r.model ?? r.actual ?? t('cprof.test_unmapped')}</span>
+            {r.ok ? <span className="small muted"> · {(r.ms / 1000).toFixed(1)}s</span> : <span className="cprof-test-err small">{r.error === 'timeout' ? t('cprof.test_timeout') : r.error}</span>}
+          </span>
+        </li>
+      ))}
+    </ul>
+  );
+}
 
 // 每个助手的接口路径和文案前缀
 const AGENTS = {
@@ -328,6 +364,14 @@ function ApiForm({ agent, initial, accepted, onClose, onSaved }) {
   const [main, setMain] = useState(agent === 'codex' ? (initial?.model ?? '') : (initial?.models?.main ?? ''));
   const [fast, setFast] = useState(initial?.models?.haiku ?? '');
   const [key, setKey] = useState('');
+  // Codex：模型对应（Codex 的模型名 → 服务商的）
+  const [codexMap, setCodexMap] = useState(() => ({ ...(initial?.models ?? {}) }));
+  // 服务商自己列出的模型（点“获取”后才有）；测试结果
+  const [remote, setRemote] = useState(null);
+  const [testRes, setTestRes] = useState(null);
+  const fetchAct = useAction();
+  const testAct = useAction();
+  const [catalog] = useLoad(() => (agent === 'codex' ? api.get('/codex-profiles/catalog').then((r) => r.models, () => []) : Promise.resolve(null)), [agent]);
   // Key 放 x-api-key 头（ANTHROPIC_API_KEY）：Anthropic Console 的 Key（sk-ant-api…）只认这个，填进来时自动勾上
   const [xApiKey, setXApiKey] = useState(initial?.auth === 'api_key');
   const [agree, setAgree] = useState(false);
@@ -375,20 +419,53 @@ function ApiForm({ agent, initial, accepted, onClose, onSaved }) {
         name: pick === CUSTOM || initial || name.trim() ? name : undefined,
         api_key: key.trim() || undefined,
         accept: !accepted && agree,
+        ...modelBody(),
       };
-      if (agent === 'codex') body.model = main.trim();
-      else if (preset) {
-        body.models = { main: main.trim(), opus: main.trim(), sonnet: main.trim(), haiku: fast.trim() };
-        body.auth = preset.auth;
-      } else {
-        body.models = models;
-        body.auth = xApiKey ? 'api_key' : 'bearer';
-      }
-      if (urlChanged) Object.assign(body, pick === CUSTOM ? { base_url: baseUrl } : preset ? { preset: preset.id } : { provider_id: pick });
+      if (urlChanged) Object.assign(body, source());
       const r = initial ? await api.put(`${cfg.base}/${initial.id}`, body) : await api.post(cfg.base, body);
       onSaved(r);
     });
   };
+  // 地址从哪来（自己填的、快速配置、平台推荐的）
+  const source = () => (pick === CUSTOM ? { base_url: baseUrl } : preset ? { preset: preset.id } : { provider_id: pick });
+  // 模型和 Key 的发法
+  const modelBody = () => {
+    if (agent === 'codex') return { model: main.trim(), models: Object.fromEntries(Object.entries(codexMap).map(([k, v]) => [k, v.trim()]).filter(([, v]) => v)) };
+    if (preset) return { models: { main: main.trim(), fable: main.trim(), opus: main.trim(), sonnet: main.trim(), haiku: fast.trim() }, auth: preset.auth };
+    return { models, auth: xApiKey ? 'api_key' : 'bearer' };
+  };
+  // 测试、获取模型列表：用表单里现在填的（还没保存也行），Key 没填时用保存的
+  const draft = () => (ollama ? { base_url: local.base_url, api_key: 'ollama', models: Object.fromEntries(MODEL_KEYS.map((k) => [k, localModel || local.models[0]])) } : { id: initial?.id, api_key: key.trim() || undefined, ...modelBody(), ...source() });
+  const canProbe = ollama ? Boolean(local.models[0]) : pick !== null && pick !== OLLAMA && (pick !== CUSTOM || baseUrl.trim()) && (keepKey || key.trim());
+  const runTest = () => {
+    setTestRes(null);
+    testAct.run(async () => setTestRes(await api.post(`${cfg.base}/test`, draft())));
+  };
+  // 拿服务商的模型列表：给每一档下拉选；Claude 还没填的档位按名字猜一个（含 fable/opus/… 的）
+  const fetchModels = () =>
+    fetchAct.run(async () => {
+      const r = await api.post(`${cfg.base}/provider-models`, draft());
+      if (r.error || !r.models?.length) {
+        setRemote([]);
+        return;
+      }
+      setRemote(r.models);
+      if (agent === 'claude' && !preset) {
+        setModels((m) => Object.fromEntries(MODEL_KEYS.map((k) => [k, m[k] || (k === 'main' ? '' : guessModel(r.models, k))])));
+      }
+    });
+  // 下拉里的：快速配置自带的（带价格）+ 服务商列出的
+  const choices = [...(preset?.available ?? []), ...(remote ?? []).filter((id) => !preset?.available?.some((m) => m.id === id)).map((id) => ({ id }))];
+  // “从服务商获取模型”按钮和结果说明
+  const fetchRow = (
+    <div className="cprof-fetch">
+      <Button variant="ghost" icon={ListRestart} busy={fetchAct.busy} disabled={!canProbe} onClick={fetchModels}>
+        {t('cprof.fetch_models')}
+      </Button>
+      {remote && <span className="small muted">{remote.length ? t('cprof.fetch_count', { n: remote.length }) : t('cprof.fetch_none')}</span>}
+      <ErrorNote error={fetchAct.error} />
+    </div>
+  );
   const option = (id, head, desc, extra) => (
     <button key={id} type="button" role="radio" aria-checked={pick === id} className="launch model-option" onClick={() => setPick(id)}>
       <span className="model-option-head">
@@ -516,11 +593,11 @@ function ApiForm({ agent, initial, accepted, onClose, onSaved }) {
         {!ollama && (preset || agent === 'codex') && (
           <div className="cprof-models">
             <Field label={t(agent === 'codex' ? 'cprof.model_codex' : 'cprof.model_main')} hint={agent === 'codex' ? t('model.model_hint') : undefined}>
-              <ModelInput id="ll-model-main" value={main} onChange={setMain} available={preset?.available} placeholder={t('cprof.model_default')} />
+              <ModelInput id="ll-model-main" value={main} onChange={setMain} available={choices} placeholder={t('cprof.model_default')} />
             </Field>
             {agent === 'claude' && (
               <Field label={t('cprof.model_fast')} hint={t('cprof.model_fast_hint')}>
-                <ModelInput id="ll-model-fast" value={fast} onChange={setFast} available={preset?.available} placeholder={t('cprof.model_default')} />
+                <ModelInput id="ll-model-fast" value={fast} onChange={setFast} available={choices} placeholder={t('cprof.model_default')} />
               </Field>
             )}
           </div>
@@ -546,10 +623,11 @@ function ApiForm({ agent, initial, accepted, onClose, onSaved }) {
                 </span>
               </span>
             </label>
-            <FoldNote summary={t('cprof.models')}>
+            <FoldNote summary={t('cprof.models')} open={Boolean(remote) || MODEL_KEYS.some((k) => initial?.models?.[k])}>
               <p className="small muted" style={{ marginTop: 0 }}>
                 {t('cprof.models_hint')}
               </p>
+              {fetchRow}
               <div className="cprof-models">
                 {MODEL_KEYS.map((k) => (
                   <Field
@@ -561,13 +639,46 @@ function ApiForm({ agent, initial, accepted, onClose, onSaved }) {
                       </>
                     }
                   >
-                    <input className="mono" value={models[k]} onChange={(e) => setModels({ ...models, [k]: e.target.value })} maxLength={100} spellCheck={false} autoCapitalize="none" />
+                    <ModelInput id={`ll-model-${k}`} value={models[k]} onChange={(v) => setModels((m) => ({ ...m, [k]: v }))} available={choices} />
                   </Field>
                 ))}
               </div>
             </FoldNote>
           </>
         )}
+        {agent === 'codex' && !ollama && (
+          <FoldNote summary={t('xprof.map')} open={Boolean(remote) || Object.keys(initial?.models ?? {}).length > 0}>
+            <p className="small muted" style={{ marginTop: 0 }}>
+              {t('xprof.map_hint')}
+            </p>
+            {fetchRow}
+            {!catalog && <Skeleton height={40} />}
+            {catalog?.length === 0 && <p className="small muted">{t('xprof.map_no_catalog')}</p>}
+            <div className="cprof-models">
+              {[...(catalog ?? []).filter((m) => m.section !== 'more' || codexMap[m.value]), ...Object.keys(codexMap).filter((k) => !catalog?.some((m) => m.value === k)).map((k) => ({ value: k, label: k }))].map((m) => (
+                <Field
+                  key={m.value}
+                  label={
+                    <>
+                      {m.label}
+                      {m.label !== m.value && <span className="cprof-env mono">{m.value}</span>}
+                    </>
+                  }
+                >
+                  <ModelInput id={`ll-xmap-${m.value}`} value={codexMap[m.value] ?? ''} onChange={(v) => setCodexMap((c) => ({ ...c, [m.value]: v }))} available={choices} placeholder={t('xprof.map_ph')} />
+                </Field>
+              ))}
+            </div>
+          </FoldNote>
+        )}
+        <div className="cprof-test-row">
+          <Button variant="ghost" icon={Zap} busy={testAct.busy} disabled={!canProbe} onClick={runTest}>
+            {t('cprof.test')}
+          </Button>
+          <span className="small muted">{testAct.busy ? t('cprof.testing') : t(agent === 'codex' ? 'xprof.test_hint' : 'cprof.test_hint')}</span>
+        </div>
+        <ErrorNote error={testAct.error} />
+        {testRes && <TestResults agent={agent} data={testRes} catalog={catalog} />}
         <ErrorNote error={error} />
         <div className="modal-actions">
           <Button variant="ghost" onClick={onClose}>

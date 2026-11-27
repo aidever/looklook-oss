@@ -161,9 +161,15 @@ pub struct HeartbeatRequest {
     /// 本设备当前全部终端实例 id（多设备，docs/05 §5）。平台据此维护终端路由表；None = 不更新。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminals: Option<Vec<String>>,
-    /// 公网 HTTPS 直连地址（服务端 docs/09 §5）：有有效证书时带上；None = 没开或还没有证书（平台清掉）。
+    /// 公网 HTTPS 直连地址（服务端 docs/09 §5）：有有效外部浏览器直连地址时带上；None = 没开或没有可用外部地址（平台清掉）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub direct: Option<crate::direct::DirectInfo>,
+    /// 本设备当前全部可尝试的直连端点（局域网、穿透/反代、IPv6、公网 IPv4、DDNS），供浏览器与各端并发竞速。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub endpoints: Vec<crate::direct::DirectEndpoint>,
+    /// 本设备本地控制台监听端口（供同机浏览器或本机环境尝试 `127.0.0.1:<local_port>` 零延迟回环直连）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_port: Option<u16>,
     /// 直连自检的结论（docs/08 §8）：检测过才带；旧服务端忽略。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rtc_reach: Option<RtcReach>,
@@ -215,6 +221,15 @@ pub struct RemoteDevice {
     /// 公网 HTTPS 直连地址（docs/09 §5）：启动页、设备列表据此显示“直接打开”。证书已过期的不给。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub direct: Option<crate::direct::DirectInfo>,
+    /// 这台设备当前有效的直连端点列表（局域网、穿透、IPv6、公网 IPv4、DDNS）。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub endpoints: Vec<crate::direct::DirectEndpoint>,
+    /// 这台设备的本机监听端口（供同机浏览器探测 `ws://127.0.0.1:<port>/__looklook/mux`）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_port: Option<u16>,
+    /// 平台预签的 60 秒设备级 `/__looklook/mux` 直连票据（省一次 RTT，可直接并发探测各候选端点）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mux_token: Option<String>,
     /// 直连自检的档位（docs/08 §8，只给 `verdict`）：启动页连接详情走中转时据此说明原因。没检测过不给。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reach: Option<String>,

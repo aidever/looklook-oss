@@ -12,11 +12,10 @@ import { useStatus } from '../App.jsx';
 import { More, Row } from '../shared/page.jsx';
 import { LocalOnlyToggle, useDevices } from '../shared/devices.jsx';
 import { api } from '../shared/api.js';
-import AccessCard from './Access.jsx';
-import DirectCard from './DirectConnect.jsx';
-import PublicHttpsCard from './PublicHttps.jsx';
+import ConnectionCards from './Connection.jsx';
 import { AttachmentsCard } from '../shared/Attachments.jsx';
 import { BrowserBindingCard } from '../shared/BrowserBinding.jsx';
+import { ClaudeLinkGuardCard } from '../shared/linkOpen.jsx';
 import { MacFoldersCard } from '../shared/MacFolders.jsx';
 import { MOVED_TO_AI } from './Ai.jsx';
 import { FolderField, ShellPicker } from './Terminals.jsx';
@@ -61,8 +60,8 @@ const SECTIONS = [
   ['network', Globe],
   ['about', Info],
 ];
-// 别处链接用的锚点（#relays、#access）落到所在的分区
-const ALIAS = { [RELAYS_ANCHOR]: 'network', access: 'network' };
+// 别处链接用的锚点（#relays、#access、#public-https）落到所在的分区
+const ALIAS = { [RELAYS_ANCHOR]: 'network', access: 'network', 'public-https': 'network' };
 
 function sectionOf(hash) {
   const h = hash.replace(/^#/, '');
@@ -229,6 +228,7 @@ export default function Settings() {
         </Card>
         {caps.os === 'darwin' && status.access === 'local' && <MacFoldersCard />}
         <BrowserBindingCard />
+        <ClaudeLinkGuardCard />
         <SyncCard />
         <IdleCard value={s.idle_stop_days ?? 7} onChange={set('idle_stop_days')} />
         <AttachmentsCard />
@@ -317,14 +317,8 @@ export default function Settings() {
             <LocalOnlyToggle menu={false} />
           </Card>
         )}
+        <ConnectionCards />
         <RelayPicker />
-        <DirectCard />
-        <div id="access" className="anchor">
-          <AccessCard />
-        </div>
-        <div id="public-https" className="anchor">
-          <PublicHttpsCard />
-        </div>
       </>
     ),
     about: (
@@ -371,9 +365,10 @@ export default function Settings() {
     if (moved) navigate(`/ai${hash}`, { replace: true });
   }, [moved, hash, navigate]);
 
-  // 从别处带着 #access 跳过来时滚到访问控制
+  // 从别处带着 #access 或 #public-https 跳过来时滚到对应卡片
   useEffect(() => {
-    if (hash === '#access') setTimeout(() => document.getElementById('access')?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 50);
+    const target = hash === '#access' ? 'access' : hash === '#public-https' ? 'public-https' : null;
+    if (target) setTimeout(() => document.getElementById(target)?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 50);
   }, [hash]);
 
   return (

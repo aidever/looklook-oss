@@ -3,18 +3,22 @@
 // - 未绑定指纹浏览器：本机打开 / 复制链接 / 绑定指纹浏览器（原位弹窗完成绑定）；
 // - 已绑定指纹浏览器：在指纹浏览器中打开（含实时状态点；若未启动则弹窗确认启动并打开）/ 本机打开 / 复制链接；
 // - ⌘ / Ctrl + 点击同样弹菜单（不再直开），右键与长按保持原生菜单。
-import { Copy, ExternalLink, Globe, Link2, Settings2, X } from 'lucide-react';
+import { Copy, ExternalLink, Globe, Link2, Settings2, ShieldAlert, X } from 'lucide-react';
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { useTranslation } from 'react-i18next';
 
-import { deviceApi } from './api.js';
+import { useStatus } from '../App.jsx';
+import { api, deviceApi } from './api.js';
 import { BrowserBindingModal, cachedBinding, fetchBinding, invalidateBinding } from './BrowserBinding.jsx';
 import { copyText } from './chatCopy.js';
+import { CLAUDE_DOMAINS, matchClaudeDomain } from './claudeDomains.js';
 import { errorText } from './i18n.js';
 import { isDesktopApp } from './layers.js';
+import { Row } from './page.jsx';
+import { SyncLabel } from './SettingsSync.jsx';
 import { termFocus } from './termFrame.js';
-import { useConfirm, useToast } from './ui.jsx';
+import { Card, ErrorNote, Switch, useAction, useConfirm, useToast } from './ui.jsx';
 
 const isWebUrl = (u) => /^https?:\/\//i.test(u);
 
@@ -34,11 +38,13 @@ function splitUrlPreview(url) {
 
 export function useLinkOpen(device, onClosed) {
   const { t } = useTranslation();
+  const { status } = useStatus();
   const toast = useToast();
   const confirm = useConfirm();
   const [menu, setMenu] = useState(null);
   const [bindModal, setBindModal] = useState(null);
   const [busy, setBusy] = useState(false);
+  const guardEnabled = status?.settings?.claude_link_guard !== false;
 
   useEffect(() => {
     fetchBinding(device, false);
@@ -140,17 +146,36 @@ export function useLinkOpen(device, onClosed) {
     [openMenuAt],
   );
 
+  const openLocalWithGuard = useCallback(
+    async (url) => {
+      const { host } = splitUrlPreview(url);
+      const ok = await confirm({
+        title: t('link_menu.claude_local_confirm_title'),
+        body: <span className="link-guard-confirm">{t('link_menu.claude_local_confirm_body', { host })}</span>,
+        confirm: t('link_menu.claude_local_confirm_ok'),
+        danger: true,
+      });
+      if (!ok) return;
+      window.open(url, '_blank', 'noopener,noreferrer');
+    },
+    [confirm, t],
+  );
+
+  const claudeDomain = menu && guardEnabled ? matchClaudeDomain(menu.url) : null;
+
   const node = (
     <>
       {menu && (
         <LinkActionPopover
           {...menu}
+          claudeDomain={claudeDomain}
           busy={busy}
           onClose={closeMenu}
           onFingerprint={() => openInFingerprint(menu.url, menu.binding)}
+          onLocalOpen={claudeDomain ? () => openLocalWithGuard(menu.url) : null}
           onBind={() => setBindModal({ initial: menu.binding, pendingUrl: menu.url })}
           onCopy={async () => {
-            if (await copyText(menu.url)) toast(t('link_menu.copied'));
+            if (await copyText(menu.url)) toast(t(claudeDomain ? 'link_menu.claude_copied' : 'link_menu.copied'));
             else window.prompt('', menu.url);
           }}
         />
@@ -203,11 +228,12 @@ export function useTerminalLinkOpen(frame, device, enabled = true) {
   return links;
 }
 
-function LinkActionPopover({ url, x, y, top, binding, busy, onClose, onFingerprint, onBind, onCopy }) {
+function LinkActionPopover({ url, x, y, top, binding, claudeDomain, busy, onClose, onFingerprint, onLocalOpen, onBind, onCopy }) {
   const { t } = useTranslation();
   const ref = useRef(null);
   const sheet = isMobileViewport();
   const [pos, setPos] = useState({ left: x, top: y, visibility: 'hidden' });
+  const claudeWarn = Boolean(claudeDomain);
 
   useLayoutEffect(() => {
     if (sheet) return;
@@ -221,7 +247,7 @@ function LinkActionPopover({ url, x, y, top, binding, busy, onClose, onFingerpri
       top: Math.max(10, below ? y : Math.max(10, top - h)),
       visibility: 'visible',
     });
-  }, [sheet, x, y, top, binding]);
+  }, [sheet, x, y, top, binding, claudeWarn]);
 
   useEffect(() => {
     const away = (e) => {
@@ -290,13 +316,18 @@ function LinkActionPopover({ url, x, y, top, binding, busy, onClose, onFingerpri
       {sheet && <div className="link-pop-backdrop" onClick={onClose} aria-hidden="true" />}
       <div
         ref={ref}
-        className={`link-pop ${sheet ? 'link-pop-sheet' : 'link-pop-fixed'}`}
+        className={`link-pop ${sheet ? 'link-pop-sheet' : 'link-pop-fixed'}${claudeWarn ? ' is-claude-warn' : ''}`}
         role="menu"
         style={sheet ? undefined : pos}
         aria-label={url}
       >
         {sheet && <div className="link-pop-grab" aria-hidden="true" />}
         <div className="link-pop-head" title={url}>
+          {claudeWarn && (
+            <span className="link-pop-warn-ico" aria-hidden="true">
+              <ShieldAlert size={15} />
+            </span>
+          )}
           <span className="link-pop-url">
             <strong className="link-pop-host">{host}</strong>
             {tail && <span className="link-pop-path">{tail}</span>}
@@ -318,6 +349,18 @@ function LinkActionPopover({ url, x, y, top, binding, busy, onClose, onFingerpri
             </button>
           )}
         </div>
+
+        {claudeWarn && (
+          <div className="link-pop-warn" role="alert">
+            <div className="link-pop-warn-title">
+              <ShieldAlert size={14} aria-hidden="true" />
+              <span>{t('link_menu.claude_warn_title')}</span>
+            </div>
+            <p className="link-pop-warn-desc">
+              {t(bound ? 'link_menu.claude_warn_desc_bound' : 'link_menu.claude_warn_desc_unbound', { domain: claudeDomain })}
+            </p>
+          </div>
+        )}
 
         <div className="link-pop-body">
           {bound && (
@@ -342,29 +385,47 @@ function LinkActionPopover({ url, x, y, top, binding, busy, onClose, onFingerpri
             </button>
           )}
 
-          <a
-            role="menuitem"
-            className={`link-pop-btn ${bound ? '' : 'is-primary'}`}
-            href={url}
-            target="_blank"
-            rel="noopener noreferrer"
-            onClick={onClose}
-          >
-            <span className="link-pop-ico">
-              <ExternalLink size={17} aria-hidden="true" />
-            </span>
-            <span className="link-pop-txt">
-              <span className="link-pop-title">{t(isDesktopApp ? 'link_menu.open_local_desktop' : 'link_menu.open_local')}</span>
-              <span className="link-pop-sub">{t('link_menu.open_local_hint')}</span>
-            </span>
-          </a>
+          {claudeWarn ? (
+            <button
+              type="button"
+              role="menuitem"
+              className="link-pop-btn is-danger-action"
+              onClick={pick(onLocalOpen)}
+            >
+              <span className="link-pop-ico">
+                <ExternalLink size={17} aria-hidden="true" />
+              </span>
+              <span className="link-pop-txt">
+                <span className="link-pop-title">{t(isDesktopApp ? 'link_menu.open_local_desktop' : 'link_menu.open_local')}</span>
+                <span className="link-pop-sub is-warn-sub">{t('link_menu.claude_local_hint')}</span>
+              </span>
+            </button>
+          ) : (
+            <a
+              role="menuitem"
+              className={`link-pop-btn ${bound ? '' : 'is-primary'}`}
+              href={url}
+              target="_blank"
+              rel="noopener noreferrer"
+              onClick={onClose}
+            >
+              <span className="link-pop-ico">
+                <ExternalLink size={17} aria-hidden="true" />
+              </span>
+              <span className="link-pop-txt">
+                <span className="link-pop-title">{t(isDesktopApp ? 'link_menu.open_local_desktop' : 'link_menu.open_local')}</span>
+                <span className="link-pop-sub">{t('link_menu.open_local_hint')}</span>
+              </span>
+            </a>
+          )}
 
-          <button type="button" role="menuitem" className="link-pop-btn" onClick={pick(onCopy)}>
+          <button type="button" role="menuitem" className={`link-pop-btn${claudeWarn ? ' is-warn-copy' : ''}`} onClick={pick(onCopy)}>
             <span className="link-pop-ico">
               <Copy size={16} aria-hidden="true" />
             </span>
             <span className="link-pop-txt">
               <span className="link-pop-title">{t('link_menu.copy')}</span>
+              {claudeWarn && <span className="link-pop-sub is-warn-sub">{t('link_menu.claude_copy_hint')}</span>}
             </span>
           </button>
 
@@ -386,5 +447,49 @@ function LinkActionPopover({ url, x, y, top, binding, busy, onClose, onFingerpri
       </div>
     </>,
     document.body,
+  );
+}
+
+/** 设置页“通用”里的系统拦截开关：Claude 域名链接风控拦截（默认开启，关闭需二次确认）。 */
+export function ClaudeLinkGuardCard() {
+  const { t, i18n } = useTranslation();
+  const { status, reload } = useStatus();
+  const confirm = useConfirm();
+  const toast = useToast();
+  const { busy, error, run } = useAction();
+  const enabled = status?.settings?.claude_link_guard !== false;
+  const sep = i18n.language?.startsWith('en') ? ', ' : '、';
+
+  const onToggle = async (next) => {
+    if (!next) {
+      const ok = await confirm({
+        title: t('link_guard.disable_title'),
+        body: <span className="link-guard-confirm">{t('link_guard.disable_body')}</span>,
+        confirm: t('link_guard.disable_confirm'),
+        danger: true,
+      });
+      if (!ok) return;
+    }
+    const res = await run(() => api.put('/settings', { claude_link_guard: next }));
+    if (res) {
+      reload();
+      toast(t(next ? 'link_guard.enabled_toast' : 'link_guard.disabled_toast'));
+    }
+  };
+
+  return (
+    <Card id="claude-link-guard" title={t('link_guard.card_title')} sub={t('link_guard.card_desc')}>
+      <Row
+        label={<SyncLabel text={t('link_guard.toggle')} />}
+        hint={
+          enabled
+            ? t('link_guard.state_on', { domains: CLAUDE_DOMAINS.slice(0, 3).join(sep) })
+            : t('link_guard.state_off')
+        }
+      >
+        <Switch checked={enabled} disabled={busy} onChange={onToggle} label={t('link_guard.toggle')} />
+      </Row>
+      <ErrorNote error={error} />
+    </Card>
   );
 }

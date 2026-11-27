@@ -34,6 +34,8 @@ pub enum Incoming {
     Update { session: String, update: Value },
     /// `session/request_permission`：用 [`AcpConn::respond`] 答复
     Permission { id: Value, params: Value },
+    /// 前面的都处理完了就答复（[`AcpConn::settled`]）
+    Mark(oneshot::Sender<()>),
     /// 进程退出了 / stdout 断了
     Closed,
 }
@@ -49,6 +51,8 @@ pub struct AcpConn {
     /// `initialize` 报的版本
     pub version: Mutex<Option<String>>,
     child: Mutex<Option<tokio::process::Child>>,
+    /// 发给处理 [`Incoming`] 的那边（[`AcpConn::settled`] 插记号用）
+    events: mpsc::UnboundedSender<Incoming>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -114,6 +118,7 @@ impl AcpConn {
             pid,
             version: Mutex::new(None),
             child: Mutex::new(Some(child)),
+            events: tx.clone(),
         });
         let reader = me.clone();
         tokio::spawn(async move {
@@ -238,6 +243,15 @@ impl AcpConn {
         self.call_timeout(method, params, CALL_WAIT).await
     }
 
+    /// 等 agy 在这之前发来的通知都处理完：请求的答复直接交给等着的人，通知要排队交给 [`Incoming`] 那边，
+    /// `session/prompt` 的答复可能比这一轮最后一段回复先到。最多等 2 秒（那边没在处理时不卡住）
+    pub async fn settled(&self) {
+        let (tx, rx) = oneshot::channel();
+        if self.events.send(Incoming::Mark(tx)).is_ok() {
+            let _ = tokio::time::timeout(Duration::from_secs(2), rx).await;
+        }
+    }
+
     pub fn notify(&self, method: &str, params: Value) {
         self.send(json!({ "jsonrpc": "2.0", "method": method, "params": params }));
     }
@@ -303,6 +317,7 @@ mod tests {
             pid: None,
             version: Mutex::new(None),
             child: Mutex::new(None),
+            events: in_tx.clone(),
         });
         // 请求 A（id=1）很快超时；请求 B（id=2）并发等待且 id 更大
         let c1 = conn.clone();

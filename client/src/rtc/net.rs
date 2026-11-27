@@ -459,12 +459,12 @@ fn first_ip(body: &str, v6: bool) -> Option<IpAddr> {
 // ---------- 接口 ----------
 
 /// 网卡上的公网 IPv6（GUA），它们本来就会作为 host 候选，界面上提示“一般不用填”。
-fn nic_v6() -> Vec<Ipv6Addr> {
+pub fn nic_v6() -> Vec<Ipv6Addr> {
     let mut v: Vec<Ipv6Addr> = local_ip_address::list_afinet_netifas()
         .unwrap_or_default()
         .into_iter()
         .filter_map(|(_, ip)| match ip {
-            IpAddr::V6(v) if (v.segments()[0] & 0xe000) == 0x2000 => Some(v),
+            IpAddr::V6(v) if (v.segments()[0] & 0xe000) == 0x2000 && !(v.segments()[0] == 0x2001 && v.segments()[1] == 0x0db8) => Some(v),
             _ => None,
         })
         .collect();
@@ -507,8 +507,9 @@ pub async fn put_net(State(app): State<App>, Json(u): Json<NetUpdate>) -> Result
     set_current(c.clone());
     // 新填的域名马上解析一次，界面能立刻显示解析结果
     resolve(&c).await;
-    // 公网地址变了：直连证书按新地址重新申请（docs/09 §4.1 第 7 条）
+    // 公网地址变了：直连证书按新地址重新申请，并立即通过心跳刷新端点列表
     app.direct.wake();
+    app.account.wake();
     // 端口范围、公网 IPv4 变了：后台重做一次 NAT 检测（结论随心跳上报，设置页下次打开时显示）
     if (old.port_begin, old.port_end, &old.public_v4) != (c.port_begin, c.port_end, &c.public_v4) {
         let (account, store) = (app.account.clone(), app.store.clone());

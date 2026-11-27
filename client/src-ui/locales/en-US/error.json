@@ -109,7 +109,14 @@
     "rtc_ports": "must be within 1025–65535, first ≤ last",
     "rtc_ports_span": "needs at least 8 ports",
     "ipv4": "is not an IPv4 address or domain",
-    "ipv6": "is not an IPv6 address or domain"
+    "ipv6": "is not an IPv6 address or domain",
+    "url_format": "has an invalid format, e.g. https://code.example.com or home.example.com:1234",
+    "url_too_many": "allows at most 16 addresses",
+    "cert_pair": "needs both the certificate file and the private key file",
+    "cert_read": "could not read the certificate file; check the local path and permissions",
+    "key_read": "could not read the private key file; check the local path and permissions",
+    "cert_invalid": "is not a valid PEM certificate / private key pair",
+    "cert_expired": "has already expired"
   },
   "DEVICE_TIMEOUT": "This computer didn't answer in time; retrying",
   "CLIENT_UNREACHABLE": "Can't reach Looklook on this computer; it may have quit",
@@ -165,7 +172,9 @@
     "resume": "conversation to continue",
     "rtc_ports": "Port range",
     "public_v4": "Public IPv4",
-    "public_v6": "Public IPv6"
+    "public_v6": "Public IPv6",
+    "custom_urls": "Tunnel & direct addresses",
+    "tls_cert": "Custom HTTPS certificate"
   },
   "reason": {
     "MEMBERSHIP_EXPIRED": "membership expired",
@@ -339,9 +348,8 @@
   "PLUGIN_FAILED": "Plugin operation failed: {{detail}}",
   "CLAUDE_CLI_TIMEOUT": "The Claude Code command took too long",
   "AGENT_EXISTS": "A subagent with that name already exists",
-  "MEMORY_TOO_LONG": "One memory is at most 600 characters. Keep what matters later; split unrelated points",
-  "MEMORY_TITLE_LONG": "Title is at most 80 characters",
-  "MEMORY_EMPTY": "Fill in both the title and the text",
+  "MEMORY_TOO_LONG": "A page is at most 8,000 characters; split it into several",
+  "MEMORY_EMPTY": "Fill in both the name and the content",
   "MEMORY_SECRET": "That looks like a key, token or password; memories don't store those",
   "MEMORY_UNDO_LATER": "This memory changed again afterwards; undo the later change first",
   "MEMORY_UNDONE": "Already undone",
@@ -373,5 +381,9 @@
   "ENCODING_UNMAPPABLE": "“{{char}}” can't be saved in {{encoding}}",
   "SITE_EXPIRED": "Preview expired, open it again",
   "ARCHIVE_BAD": "The archive is damaged or unreadable",
-  "ARCHIVE_UNSUPPORTED": "This archive type isn't supported"
+  "ARCHIVE_UNSUPPORTED": "This archive type isn't supported",
+  "MEMORY_EXISTS": "A page with that name already exists",
+  "MEMORY_STALE": "This page just changed; refresh and try again",
+  "MEMORY_BAD_NAME": "Names can't contain characters like / or \\",
+  "MEMORY_FULL": "Memory already has 150 pages; delete some first"
 }

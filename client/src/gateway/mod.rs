@@ -192,15 +192,35 @@ async fn security_headers(req: Request, next: Next) -> Response {
     r
 }
 
-/// 直接入口：按来源 IP 放行，检查 Host，需要时检查访问码。
+/// 是否包含反向代理或内网穿透软件附加的转发头。
+fn has_proxy_headers(h: &HeaderMap) -> bool {
+    const KEYS: &[&str] = &[
+        "forwarded",
+        "x-forwarded-for",
+        "x-forwarded-host",
+        "x-forwarded-proto",
+        "x-real-ip",
+        "cf-connecting-ip",
+        "true-client-ip",
+    ];
+    KEYS.iter().any(|k| h.contains_key(*k))
+}
+
+/// Host 头主机名（去掉端口与方括号后）是否为本机回环。
+fn is_loopback_host(name: &str) -> bool {
+    let n = name.trim_end_matches('.');
+    n.eq_ignore_ascii_case("localhost")
+        || n.to_ascii_lowercase().ends_with(".localhost")
+        || n.parse::<IpAddr>().is_ok_and(|ip| ip.to_canonical().is_loopback())
+}
+
+/// 直接入口：按来源 IP 放行，识别反代/穿透来源强制认证，检查 Host，需要时检查访问码。
 pub async fn local_guard(State(app): State<App>, mut req: Request, next: Next) -> Response {
     use looklook_protocol::direct as dp;
     // 没有连接信息只会出现在测试里，按本机处理。
     let conn = req.extensions().get::<ConnectInfo<Conn>>().map(|c| c.0);
     let peer_ip = conn.map(|c| c.remote.ip().to_canonical()).unwrap_or(IpAddr::from([127, 0, 0, 1]));
     let tls = conn.is_some_and(|c| c.tls);
-    // 免认证的几个路径（docs/09 §8）：ACME http-01 验证（只回应当前待验证的 token，用户的 nginx 转发进来时来源是本机）、
-    // 自检（固定内容）
     let path = req.uri().path();
     if req.method() == Method::GET && path.starts_with(dp::ACME_CHALLENGE_PREFIX) {
         return app.direct.challenge(path);
@@ -208,41 +228,79 @@ pub async fn local_guard(State(app): State<App>, mut req: Request, next: Next) -
     if req.method() == Method::GET && path == dp::PING_PATH && tls {
         return ([(header::CACHE_CONTROL, "no-store")], dp::PING_BODY).into_response();
     }
-    // 连接两端是同一个 IP，或者是启动时指定也当作本机的来源（Docker 里运行时宿主机经网关连进来）
-    let same_host = conn.and_then(|c| c.local).is_some_and(|l| l.ip().to_canonical() == peer_ip) || access::local_from(peer_ip);
+
     let cfg = app.access();
-    let mut peer = access::classify(peer_ip, &cfg, same_host, &app.resolved.ips(&cfg));
-    // 白名单域名的 IP 可能刚变（DDNS）：重新解析一次再判断
-    if peer == access::Peer::Denied && app.resolved.refresh_if_stale(&cfg).await {
-        peer = access::classify(peer_ip, &cfg, same_host, &app.resolved.ips(&cfg));
-    }
-    // 公网 HTTPS 直连（docs/09 §4.3）：开着、有证书、这条连接是 HTTPS 时，其余公网来源算 Public（必须认证）；
-    // 明文 HTTP 上的仍然拒绝
-    if peer == access::Peer::Denied && tls && app.direct.active() {
-        peer = access::Peer::Public;
-    }
-    if !host_name(req.headers()).is_some_and(|n| access::host_allowed(n, cfg.open_host().as_ref())) {
+    let custom_hosts = app.direct.custom_hosts();
+    let req_host = host_name(req.headers());
+    let proxied = has_proxy_headers(req.headers());
+    let custom_match = req_host.and_then(|h| app.direct.match_custom_host(h));
+    let is_custom_host = custom_match.is_some();
+    let is_https_custom = custom_match.is_some_and(|m| !m.explicit_http);
+
+    // 真正的本机直连（免密）：不能是 TLS 端口转发，不能带反代头，也不能是穿透域名；
+    // 回环来源还要求 Host 本身是 localhost / 127.0.0.1 / ::1（或用户设的本机 open_host），防止 frpc/cloudflared 转到 127.0.0.1 时绕过认证。
+    let open_host = cfg.open_host();
+    let loopback_host_ok = req_host.is_some_and(|h| is_loopback_host(h) || open_host.as_ref().is_some_and(|oh| oh.matches(&h.trim_end_matches('.').to_ascii_lowercase())));
+    let genuine_loopback = peer_ip.is_loopback() && !tls && !proxied && !is_custom_host && loopback_host_ok;
+    let same_host = !tls
+        && !proxied
+        && !is_custom_host
+        && (conn.and_then(|c| c.local).is_some_and(|l| !peer_ip.is_loopback() && l.ip().to_canonical() == peer_ip) || access::local_from(peer_ip));
+
+    let mut peer = if genuine_loopback || same_host {
+        access::Peer::Local
+    } else if is_custom_host || proxied {
+        // 凡是匹配穿透/自定义公网域名，或带反代转发头的请求，一律按公网入口强制要求认证，绝不当成免密本机或免密局域网
+        if (tls && app.direct.accepts_public()) || is_custom_host {
+            access::Peer::Public
+        } else {
+            access::Peer::Denied
+        }
+    } else {
+        let mut p = access::classify(peer_ip, &cfg, false, &app.resolved.ips(&cfg));
+        if p == access::Peer::Local {
+            // peer_ip 是 127.0.0.1 但没过 genuine_loopback（例如 frp TCP 隧道带了外部 Host 或走 TLS）
+            p = if (tls && app.direct.accepts_public()) || is_custom_host {
+                access::Peer::Public
+            } else {
+                access::Peer::Denied
+            };
+        }
+        if p == access::Peer::Denied && app.resolved.refresh_if_stale(&cfg).await {
+            p = access::classify(peer_ip, &cfg, false, &app.resolved.ips(&cfg));
+        }
+        if p == access::Peer::Denied && tls && app.direct.accepts_public() {
+            p = access::Peer::Public;
+        }
+        p
+    };
+
+    if !req_host.is_some_and(|n| access::host_allowed_with_custom(n, open_host.as_ref(), &custom_hosts)) {
         if peer == access::Peer::Denied {
             return assets::denied_page(&peer_ip.to_string());
         }
         return (StatusCode::FORBIDDEN, "forbidden host").into_response();
     }
+    // 浏览器经本机回环、局域网/公网 TLS，或用户配置的 HTTPS 穿透/反代连 `/__looklook/mux`（凭平台签发的 DirectGrant 认证）
+    if (tls || genuine_loopback || is_https_custom) && req.method() == Method::GET && req.uri().path() == dp::MUX_PATH {
+        if peer == access::Peer::Denied && (is_https_custom || (tls && (cfg.allow_lan || app.direct.accepts_public()))) {
+            peer = access::Peer::Public;
+        }
+        if peer != access::Peer::Denied {
+            return crate::rtc::mux::entry(&app, peer_ip, tls, is_https_custom, req).await;
+        }
+    }
     if peer == access::Peer::Denied {
         return assets::denied_page(&peer_ip.to_string());
     }
-    if tls && req.uri().path() == dp::CLIENT_PATH {
+    if (tls || is_https_custom) && req.uri().path() == dp::CLIENT_PATH {
         return direct_entry(&app, peer_ip, req).await;
     }
-    // 专属域名下的直连传输（docs/09 §13）：凭平台票据认证，不用 Cookie（跨源请求带不上 SameSite=Strict 的 Cookie）
-    if tls && req.method() == Method::GET && req.uri().path() == dp::MUX_PATH {
-        return crate::rtc::mux::entry(&app, peer_ip, req).await;
-    }
-    // HTML 预览的静态目录（fsview.rs）：页面在不同源的沙盒 iframe 里，它取相对资源时浏览器不带 SameSite Cookie；
-    // 地址里 128 位随机令牌本身就是凭证（10 分钟、只读、只限那个文件夹），不再要访问码。来源 IP、Host 照常检查
     let site = req.method() == Method::GET && req.uri().path().starts_with("/api/fs/site/");
+    let secure_cookie = tls || is_https_custom || req.headers().get("x-forwarded-proto").and_then(|v| v.to_str().ok()) == Some("https");
     if !site && peer == access::Peer::Public && !app.direct.cookie_ok(cookie(req.headers(), crate::direct_tls::COOKIE), &cfg, &app.account) {
         if req.uri().path() == access::FORM_PATH && req.method() == Method::POST {
-            return submit_public_code(&app, &cfg, peer_ip, req).await;
+            return submit_public_code(&app, &cfg, peer_ip, secure_cookie, req).await;
         }
         if req.uri().path().starts_with("/api/") {
             return LocalError::new("ACCESS_CODE_REQUIRED").into_response();
@@ -289,12 +347,12 @@ async fn submit_code(app: &App, cfg: &access::AccessConfig, ip: IpAddr, req: Req
 }
 
 /// 公网来源提交访问码（docs/09 §4.3）：至少 12 位，按 IP 与全局限制失败次数，对了发 `ll_direct`。
-async fn submit_public_code(app: &App, cfg: &access::AccessConfig, ip: IpAddr, req: Request) -> Response {
+async fn submit_public_code(app: &App, cfg: &access::AccessConfig, ip: IpAddr, secure_cookie: bool, req: Request) -> Response {
     use axum::extract::FromRequest;
     let form = axum::Form::<std::collections::HashMap<String, String>>::from_request(req, &()).await.map(|f| f.0).unwrap_or_default();
     let field = |k: &str| form.get(k).map(String::as_str).unwrap_or("");
     let next = Some(field("next")).filter(|n| n.starts_with('/') && !n.starts_with("//") && !n.starts_with("/\\")).unwrap_or("/");
-    match app.direct.submit_code(cfg, &app.limiter, ip, field("code"), next) {
+    match app.direct.submit_code_ext(cfg, &app.limiter, ip, field("code"), next, secure_cookie) {
         Ok(r) => r,
         Err(e) => assets::code_page(next, Some(e)),
     }
@@ -753,5 +811,86 @@ mod tests {
         assert_eq!(cookie(&m, "ll_loc"), None);
         assert!(ct_eq("abc", "abc"));
         assert!(!ct_eq("abc", "abd"));
+    }
+
+    /// 验证统一入口边界：
+    /// 1. 本机真实回环免密；
+    /// 2. 穿透/反代从 127.0.0.1 转发（带外部 Host 或 X-Forwarded-For）绝不免密，强制要求公网认证；
+    /// 3. 局域网在 `allow_lan=true, code_enabled=false` 时免密不误锁；
+    /// 4. 公网即使在 `code_enabled=false` 时也始终强制要求 ≥12 位访问码或平台票据。
+    #[tokio::test]
+    async fn local_guard_enforces_tunnel_and_public_auth_without_locking_lan() {
+        use std::net::SocketAddr;
+        use tower::ServiceExt;
+
+        let home = tempfile::tempdir().unwrap();
+        let key = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+        let a = crate::ssh_transfer::e2e::app(home.path(), "http://127.0.0.1:9", "deva", key);
+
+        // 开启局域网直连（code_enabled 保持默认 false），开启公网直连，添加一条穿透地址
+        {
+            let mut c = a.access();
+            c.allow_lan = true;
+            c.code_enabled = false;
+            c.save(&a.store).unwrap();
+            *a.access.write().unwrap() = c;
+        }
+        a.direct.set_enabled(true).unwrap();
+        a.direct.set_custom_urls(&["https://code.example.com".into()]).unwrap();
+
+        let send = |remote: &str, tls: bool, headers: &[(&str, &str)], path: &str| {
+            let app = local_app(a.clone());
+            let remote_addr: SocketAddr = remote.parse().unwrap();
+            let mut b = Request::builder().uri(path);
+            for (k, v) in headers {
+                b = b.header(*k, *v);
+            }
+            let mut req = b.body(axum::body::Body::empty()).unwrap();
+            req.extensions_mut().insert(ConnectInfo(Conn { remote: remote_addr, local: None, tls }));
+            async move {
+                let res = app.oneshot(req).await.unwrap();
+                let st = res.status();
+                let bytes = axum::body::to_bytes(res.into_body(), 1 << 20).await.unwrap();
+                (st, serde_json::from_slice::<serde_json::Value>(&bytes).unwrap_or_default())
+            }
+        };
+
+        // 1) 真实本机回环免密通过
+        let (st, _) = send("127.0.0.1:54321", false, &[("host", "127.0.0.1:1234")], "/api/settings").await;
+        assert_eq!(st, StatusCode::OK, "本机回环应免密放行");
+
+        // 2) cloudflared / Caddy 转到 127.0.0.1（Host 是穿透域名）必须拦截要访问码
+        let (st, v) = send(
+            "127.0.0.1:54322",
+            false,
+            &[("host", "code.example.com"), ("x-forwarded-for", "198.51.100.8"), ("x-forwarded-proto", "https")],
+            "/api/settings",
+        )
+        .await;
+        assert_eq!((st, v["error"]["code"].as_str()), (StatusCode::UNAUTHORIZED, Some("ACCESS_CODE_REQUIRED")), "穿透域名经回环转发绝不能免密");
+
+        // 3) frpc TCP 隧道不改 Host 但也不带反代头？若带外部 Host（如 home.example.com）且未配白名单则拒绝；配进 custom_urls 则走 Public 认证
+        let (st, _) = send("127.0.0.1:54323", false, &[("host", "code.example.com")], "/api/settings").await;
+        assert_eq!(st, StatusCode::UNAUTHORIZED, "就算反代没加 X-Forwarded-For，只要是穿透域名也必须要求认证");
+
+        // 4) 反代把 Host 改写成 127.0.0.1 但带了 X-Forwarded-For：拒绝免密
+        let (st, _) = send(
+            "127.0.0.1:54324",
+            false,
+            &[("host", "127.0.0.1:1234"), ("x-forwarded-for", "198.51.100.8")],
+            "/api/settings",
+        )
+        .await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "带反代转发头伪装 127.0.0.1 必须拒绝");
+
+        // 5) 局域网设备（含 Tailscale 100.64/10）在 code_enabled=false 时免密放行
+        let (st, _) = send("192.168.1.50:54325", false, &[("host", "192.168.1.2:1234")], "/api/settings").await;
+        assert_eq!(st, StatusCode::OK, "局域网直连默认免密，避免误锁");
+        let (st, _) = send("100.88.1.9:54326", false, &[("host", "100.88.1.2:1234")], "/api/settings").await;
+        assert_eq!(st, StatusCode::OK, "Tailscale CGNAT 网段按虚拟局域网直连处理");
+
+        // 6) 公网 IP 经 TLS 连入：即使 code_enabled=false 也强制要求访问码
+        let (st, v) = send("203.0.113.9:54327", true, &[("host", "203.0.113.1:1234")], "/api/settings").await;
+        assert_eq!((st, v["error"]["code"].as_str()), (StatusCode::UNAUTHORIZED, Some("ACCESS_CODE_REQUIRED")));
     }
 }

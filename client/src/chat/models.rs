@@ -251,17 +251,26 @@ pub fn options(ctx: &Ctx) -> Vec<Opt> {
     for f in FAMILIES {
         let up = f.to_ascii_uppercase();
         let Some(target) = ctx.var(&format!("ANTHROPIC_DEFAULT_{up}_MODEL")) else { continue };
+        // 显示原来的名字（目录里这个家族常用的那一项，如“Opus 5.5”），说明里写实际发给接口的模型
+        let native = out.iter().find(|o| o.section == "main" && o.value != "default" && family_of(&o.value) == Some(f)).map(|o| o.label.clone());
         out.retain(|o| !(o.section == "main" && o.value != "default" && family_of(&o.value) == Some(f)));
         let like = models.iter().find(|m| m["id"].as_str().is_some_and(|id| base_id(id) == base_id(&target)));
         out.push(Opt {
             value: f.into(),
-            label: ctx.var(&format!("ANTHROPIC_DEFAULT_{up}_MODEL_NAME")).unwrap_or_else(|| target.clone()),
-            description: ctx.var(&format!("ANTHROPIC_DEFAULT_{up}_MODEL_DESCRIPTION")).unwrap_or_default(),
+            label: ctx.var(&format!("ANTHROPIC_DEFAULT_{up}_MODEL_NAME")).or(native).unwrap_or_else(|| cap(f)),
+            description: ctx.var(&format!("ANTHROPIC_DEFAULT_{up}_MODEL_DESCRIPTION")).unwrap_or_else(|| target.clone()),
             section: "main",
             model: target,
             efforts: like.map(efforts_of).unwrap_or_default(),
             default_effort: None,
         });
+    }
+    // 指定了默认模型（ANTHROPIC_MODEL，第三方接口常用）：默认那一项就是它
+    if let Some(m) = ctx.var("ANTHROPIC_MODEL") {
+        if let Some(d) = out.iter_mut().find(|o| o.value == "default") {
+            d.description = m.clone();
+            d.model = m;
+        }
     }
     if let Some(id) = ctx.var("ANTHROPIC_CUSTOM_MODEL_OPTION") {
         if !out.iter().any(|o| o.value == id) {
@@ -818,7 +827,7 @@ pub async fn provider_models(url: &str, token: &str) -> Vec<String> {
     list
 }
 
-async fn fetch_models(url: &str, token: &str) -> Option<Vec<String>> {
+pub async fn fetch_models(url: &str, token: &str) -> Option<Vec<String>> {
     let c = reqwest::Client::builder().timeout(Duration::from_secs(6)).redirect(reqwest::redirect::Policy::none()).build().ok()?;
     let r = c
         .get(url)
@@ -1014,6 +1023,15 @@ mod tests {
         assert!(!o.iter().any(|x| x.value == "claude-sonnet-5-5"));
         let s = o.iter().find(|x| x.value == "sonnet").unwrap();
         assert_eq!((s.label.as_str(), s.model.as_str()), ("GLM 4.6", "glm-4.6"));
+        // 没给名字：显示原来的名字，说明里是实际发的模型；指定了默认模型时默认那一项就是它
+        ctx.env.insert("ANTHROPIC_DEFAULT_OPUS_MODEL".into(), "claude-opus-5-5-live".into());
+        ctx.env.insert("ANTHROPIC_MODEL".into(), "glm-4.6".into());
+        let o = options(&ctx);
+        let op = o.iter().find(|x| x.value == "opus").unwrap();
+        assert_eq!((op.label.as_str(), op.description.as_str(), op.model.as_str()), ("Opus 5.5", "claude-opus-5-5-live", "claude-opus-5-5-live"));
+        assert_eq!((o[0].description.as_str(), o[0].model.as_str()), ("glm-4.6", "glm-4.6"));
+        ctx.env.remove("ANTHROPIC_DEFAULT_OPUS_MODEL");
+        ctx.env.remove("ANTHROPIC_MODEL");
 
         // 名单
         write(&tmp.path().join(".claude/settings.local.json"), &json!({ "availableModels": ["opus"] }));

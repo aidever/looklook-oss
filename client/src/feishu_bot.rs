@@ -546,10 +546,16 @@ pub async fn on_other(app: &App, f: &Feishu, ev: &Value, sender: &str) {
     let who = Who { id: sender.to_string(), name: name.clone() };
     let mut cands = assistant::waits_for(&assistant::waits(&app.store), &chat, sender);
     cands.sort_by_key(|(_, sure)| !*sure);
-    if let Some((w, sure)) = cands.into_iter().next() {
+    let mut cands = cands.into_iter();
+    if let Some((w, sure)) = cands.next() {
         tracing::info!(wait = %w.id, sure, "飞书：别人 @ 机器人，对上了在等的事");
         let unsure = if sure { String::new() } else { tr(en, &format!("（看看认不出是不是{}本人）", w.who.as_ref().map(|x| x.name.as_str()).unwrap_or("")), " (Looklook can't tell whether it's really them)") };
-        let source = format!("{label}在飞书群里 @ 了你{unsure}：\n{}", quote_lines(&text));
+        let mut source = format!("{label}在飞书群里 @ 了你{unsure}：\n{}", quote_lines(&text));
+        // 同一个人在这个群里不止一件在等：只叫醒一次，其余的一起列给大脑，由它判断这条说的是哪件
+        let others: Vec<String> = cands.map(|(o, _)| format!("- [{}] {}（好了以后：{}）", o.id, o.label(), if o.then.is_empty() { "告诉用户" } else { &o.then })).collect();
+        if !others.is_empty() {
+            source.push_str(&format!("\n\n同一个人还有这些在等的事。这条说的如果是其中一件，就按那件办、wait_done 那件的 id（下面“在等”的那件没好就不用 wait_done）：\n{}", others.join("\n")));
+        }
         let head = tr(en, &format!("「{}」有动静了：{label}说「{}」", w.label(), text.chars().take(200).collect::<String>()), &format!("“{}” has news: {label} said “{}”", w.label(), text.chars().take(200).collect::<String>()));
         let woke = if w.go {
             let notice = format!("{head}\n{}", tr(en, "助理在处理，会在群里回他。", "The assistant is on it and will reply in the group."));
