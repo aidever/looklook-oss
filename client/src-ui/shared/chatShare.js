@@ -160,7 +160,7 @@ details>summary{cursor:pointer;list-style:none}details>summary::-webkit-details-
 .md p{margin:.5em 0}.md pre{background:var(--code);border-radius:10px;padding:12px 14px;overflow-x:auto;font-size:13px;line-height:1.55}
 .md code{font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;background:var(--code);border-radius:5px;padding:1px 5px}
 .md pre code{background:none;padding:0}
-.md table{border-collapse:collapse;display:block;overflow-x:auto;max-width:100%}.md th,.md td{border:1px solid var(--line);padding:6px 10px;vertical-align:top;overflow-wrap:break-word}
+.md table{border-collapse:collapse;display:block;overflow-x:auto;max-width:100%;font-size:14px;line-height:1.6}.md th,.md td{border:1px solid var(--line);padding:8px 12px;vertical-align:top;overflow-wrap:break-word;word-break:normal}.md th{white-space:nowrap;background:var(--code)}.md td code,.md th code,.md td a,.md th a{word-break:normal;overflow-wrap:break-word}
 .md blockquote{margin:.6em 0;padding:0 0 0 12px;border-left:3px solid var(--line);color:var(--muted)}
 .md img{max-width:100%}.md a{color:var(--accent)}
 .tools{margin:8px 0;font-size:13px;color:var(--muted)}

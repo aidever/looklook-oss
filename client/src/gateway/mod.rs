@@ -101,6 +101,8 @@ pub struct Inner {
     pub plugins: Arc<crate::plugins::Plugins>,
     /// 公网 HTTPS 直连（src/direct_tls.rs）
     pub direct: Arc<crate::direct_tls::Direct>,
+    /// 共享电脑：按地址加进来的其他看看（src/shared_pcs.rs）
+    pub shared: Arc<crate::shared_pcs::SharedPcs>,
 }
 
 impl Inner {
@@ -121,9 +123,11 @@ impl Inner {
     /// 管理台的访问情况，界面据此显示端口、局域网地址与安全提醒。
     pub fn console_info(&self) -> serde_json::Value {
         let c = self.access();
+        let lan_ips = access::own_lan_ips();
         serde_json::json!({
             "port": self.ui_addr.port(),
-            "lan_ips": self.lan_ips.iter().map(|ip| ip.to_string()).collect::<Vec<_>>(),
+            "lan_ips": lan_ips.iter().map(|ip| ip.to_string()).collect::<Vec<_>>(),
+            "in_container": access::in_container(),
             "allow_lan": c.allow_lan,
             "allowed_ips": c.allowed_ips.len(),
             "code_enabled": c.code_enabled,
@@ -235,22 +239,23 @@ pub async fn local_guard(State(app): State<App>, mut req: Request, next: Next) -
     let proxied = has_proxy_headers(req.headers());
     let custom_match = req_host.and_then(|h| app.direct.match_custom_host(h));
     let is_custom_host = custom_match.is_some();
-    let is_https_custom = custom_match.is_some_and(|m| !m.explicit_http);
+    let is_custom_public = custom_match.as_ref().is_some_and(|m| m.kind != looklook_protocol::direct::EndpointKind::Lan);
+    let is_https_custom = custom_match.as_ref().is_some_and(|m| !m.explicit_http);
 
     // 真正的本机直连（免密）：不能是 TLS 端口转发，不能带反代头，也不能是穿透域名；
     // 回环来源还要求 Host 本身是 localhost / 127.0.0.1 / ::1（或用户设的本机 open_host），防止 frpc/cloudflared 转到 127.0.0.1 时绕过认证。
     let open_host = cfg.open_host();
     let loopback_host_ok = req_host.is_some_and(|h| is_loopback_host(h) || open_host.as_ref().is_some_and(|oh| oh.matches(&h.trim_end_matches('.').to_ascii_lowercase())));
-    let genuine_loopback = peer_ip.is_loopback() && !tls && !proxied && !is_custom_host && loopback_host_ok;
+    let genuine_loopback = peer_ip.is_loopback() && !tls && !proxied && !is_custom_public && loopback_host_ok;
     let same_host = !tls
         && !proxied
-        && !is_custom_host
+        && !is_custom_public
         && (conn.and_then(|c| c.local).is_some_and(|l| !peer_ip.is_loopback() && l.ip().to_canonical() == peer_ip) || access::local_from(peer_ip));
 
     let mut peer = if genuine_loopback || same_host {
         access::Peer::Local
-    } else if is_custom_host || proxied {
-        // 凡是匹配穿透/自定义公网域名，或带反代转发头的请求，一律按公网入口强制要求认证，绝不当成免密本机或免密局域网
+    } else if is_custom_public || proxied {
+        // 凡是匹配外部穿透/公网域名，或带反代转发头的请求，一律按公网入口强制要求认证，绝不当成免密本机或免密局域网
         if (tls && app.direct.accepts_public()) || is_custom_host {
             access::Peer::Public
         } else {
@@ -280,6 +285,10 @@ pub async fn local_guard(State(app): State<App>, mut req: Request, next: Next) -
             return assets::denied_page(&peer_ip.to_string());
         }
         return (StatusCode::FORBIDDEN, "forbidden host").into_response();
+    }
+    // 连通性探活：Host 已通过校验且来源不是 Denied（支持反代明文 HTTP 转发与局域网测试；反代漏传 Host 会在上面直接 403）
+    if req.method() == Method::GET && path == dp::PING_PATH && peer != access::Peer::Denied {
+        return ([(header::CACHE_CONTROL, "no-store")], dp::PING_BODY).into_response();
     }
     // 浏览器经本机回环、局域网/公网 TLS，或用户配置的 HTTPS 穿透/反代连 `/__looklook/mux`（凭平台签发的 DirectGrant 认证）
     if (tls || genuine_loopback || is_https_custom) && req.method() == Method::GET && req.uri().path() == dp::MUX_PATH {
@@ -631,12 +640,16 @@ async fn to_peer(State(app): State<App>, req: Request, next: Next) -> Response {
     if uri_path.starts_with("/api/desktop/") || uri_path.starts_with("/api/rtc/") || uri_path.starts_with(looklook_protocol::plugin::HOST_PREFIX) {
         return next.run(req).await;
     }
-    let Some(session) = app.account.session() else { return next.run(req).await };
     // 只看本机：一律在本机处理（页面也不会再指定别的电脑）
     if api::local_only(&app) {
         return next.run(req).await;
     }
-    let own = session.device_id;
+    // 没登录也能用共享电脑（crate::shared_pcs），这时本机在页面上是 `self`
+    let session = app.account.session();
+    if session.is_none() && !app.shared.any() {
+        return next.run(req).await;
+    }
+    let own = session.as_ref().map(|s| s.device_id.clone()).unwrap_or_else(|| "self".into());
     let pq = req.uri().path_and_query().map(|p| p.as_str()).unwrap_or("/").to_string();
     let (path, hint) = outbound::take_device_hint(&pq);
     let terminal = outbound::terminal_of(req.uri().path()).map(str::to_owned);
@@ -655,13 +668,19 @@ async fn to_peer(State(app): State<App>, req: Request, next: Next) -> Response {
     }
     let header_dev = req.headers().get(looklook_protocol::DEVICE_HEADER).and_then(|v| v.to_str().ok()).map(str::to_owned);
     let target = header_dev.or(hint).or_else(|| route_key.as_deref().and_then(|k| app.outbound.owner(k)));
-    let Some(dev) = target.filter(|d| *d != own) else { return next.run(req).await };
+    let Some(dev) = target.filter(|d| *d != own && d != "self") else { return next.run(req).await };
     let ws = req.headers().get(header::UPGRADE).and_then(|v| v.to_str().ok()).is_some_and(|v| v.eq_ignore_ascii_case("websocket"));
     if ws || !matches!(*req.method(), Method::GET | Method::HEAD) {
         let marked = ws || req.headers().get(CLIENT_HEADER).and_then(|v| v.to_str().ok()) == Some("1");
         if !marked || !origin_matches(req.headers(), &Access::Local) {
             return LocalError::new("CSRF_FAILED").into_response();
         }
+    }
+    if crate::shared_pcs::is_shared(&dev) {
+        return app.shared.proxy(&dev, req, path).await;
+    }
+    if session.is_none() {
+        return next.run(req).await;
     }
     let link = match app.outbound.link(&app.account, &dev).await {
         Ok(l) => l,

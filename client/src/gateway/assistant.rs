@@ -62,6 +62,9 @@ struct Queued {
     /// 大脑按用户的话指定的那一档（没指定 None）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     asked: Option<core::Level>,
+    /// 排队期间显式指定的引擎权限模式（例如 `fullAccess`），优先于 `asked`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mode: Option<String>,
     #[serde(default)]
     attended: bool,
     /// 用户指定的模型（没指定 None：开的时候用设置里的默认）
@@ -527,9 +530,18 @@ struct Pick {
 /// - 不超过用户设的上限（默认权限比上限高时上限跟着到默认那一档）：照给；
 /// - 超过上限：Claude 大脑在闸门那里已经问过用户、用户点了头，照给；Codex 大脑的助理工具不经过闸门、没人在时没人能点头，按上限开，
 ///   用户可以在活动面板上点那一档自己调高
+/// 某种引擎的一档对应的权限模式：如果用户给这种引擎设的默认权限就在这一档（例如 Codex 设了 `fullAccess`），
+/// 原样用用户选的模式，不退回这一档的通用模式（`fullGuarded`）
+fn dispatch_mode_for_level(settings: &core::Settings, engine: &str, level: core::Level) -> String {
+    if let Some(m) = settings.defaults(engine).mode.as_deref().filter(|m| core::level_of(engine, m) == Some(level)) {
+        return m.to_string();
+    }
+    core::native_mode(engine, level).to_string()
+}
+
 fn dispatch_level(settings: &core::Settings, engine: &str, asked: Option<core::Level>, attended: bool) -> Pick {
     let def = core::default_level(settings, engine);
-    let level = |l: core::Level| Pick { mode: core::native_mode(engine, l).to_string(), level: l, capped: None };
+    let level = |l: core::Level| Pick { mode: dispatch_mode_for_level(settings, engine, l), level: l, capped: None };
     let Some(want) = asked else {
         return match (settings.defaults(engine).mode.clone(), def) {
             (Some(mode), Some(level)) => Pick { mode, level, capped: None },
@@ -668,6 +680,7 @@ async fn session_start(app: &App, a: &Value) -> Result<Value, String> {
             first,
             perm: Some(pick.level),
             asked: asked.map(|_| pick.level),
+            mode: None,
             attended,
             model: asked_model,
             effort: asked_effort,
@@ -762,17 +775,22 @@ async fn errand_start(app: &App, a: &Value) -> Result<Value, String> {
         p if p.is_empty() => core::scratch(&app.paths).display().to_string(),
         p => resolve_project(app, &p).await?,
     };
-    let engine = core::settings(&app.store).engine;
+    let settings = core::settings(&app.store);
+    let engine = settings.engine;
+    let launch = engine.launch();
+    let mode = settings.defaults(launch).mode.clone().filter(|m| core::level_of(launch, m).is_some());
+    let model = dispatch_model(&settings, launch, None);
+    let effort = dispatch_effort(&settings, launch, None);
     let input = Input {
         name: Some(title.chars().take(40).collect()),
         name_custom: Some(true),
         workdir: Some(project.clone()),
-        launch: Some(engine.launch().into()),
+        launch: Some(launch.into()),
         chat_ui: Some(true),
-        full_access: Some(false),
+        full_access: Some(matches!(mode.as_deref(), Some("bypassPermissions" | "fullAccess"))),
         ..Default::default()
     };
-    // 先建好、记成跑腿，再送话：起进程时要按跑腿带规矩、过闸门
+    // 先建好、记成跑腿，再套默认设置和送话：起进程时要按跑腿带规矩；用户没设默认权限时过助理闸门
     let v = super::create_session(app, input, false).await.map_err(|e| format!("could not start the errand: {}", e.code))?;
     let id = v.row.id.clone();
     if engine == core::Engine::Claude && !app.instances.claude_sdk_mode(&v.row) {
@@ -780,17 +798,38 @@ async fn errand_start(app: &App, a: &Value) -> Result<Value, String> {
         return Err("errands are not available on this computer; do it yourself".into());
     }
     core::errand_update(&app.store, |m| {
-        m.insert(id.clone(), core::Errand { title: title.clone(), project: project.clone(), started_at: crate::util::system_ms() });
+        m.insert(id.clone(), core::Errand { title: title.clone(), project: project.clone(), started_at: crate::util::system_ms(), mode: mode.clone() });
     });
-    // 跑腿也接着用大脑的账号
-    if let Some(brain) = core::brain_id(&app.store) {
+    // 账号：设置里给这种引擎指定了默认账号就用它（跟模型、强度配套），否则接着用大脑的账号
+    let acct = dispatch_account(app, launch).or_else(|| {
+        core::brain_id(&app.store).and_then(|brain| match engine {
+            core::Engine::Claude => crate::claude_profiles::pinned(&app.store, &brain),
+            core::Engine::Codex => crate::codex_profiles::pinned(&app.store, &brain),
+        })
+    });
+    if let Some(acct) = acct.as_deref() {
         match engine {
             core::Engine::Claude => {
-                let _ = crate::claude_profiles::pin(&app.store, &id, crate::claude_profiles::pinned(&app.store, &brain).as_deref());
+                let _ = crate::claude_profiles::pin(&app.store, &id, Some(acct));
             }
             core::Engine::Codex => {
-                let _ = crate::codex_profiles::pin(&app.store, &id, crate::codex_profiles::pinned(&app.store, &brain).as_deref());
+                let _ = crate::codex_profiles::pin(&app.store, &id, Some(acct));
             }
+        }
+    }
+    if let Some(m) = mode.as_deref() {
+        if let Err(e) = app.chat.apply_mode(&id, m).await {
+            tracing::warn!(error = ?e, id = %id, mode = m, "助理：跑腿没能换权限");
+        }
+    }
+    if let Some(m) = model.as_deref() {
+        if let Err(e) = app.chat.apply_model(&id, m).await {
+            tracing::warn!(error = ?e, id = %id, model = m, "助理：跑腿没能换模型");
+        }
+    }
+    if let Some(e) = effort.as_deref() {
+        if let Err(err) = app.chat.apply_effort(&id, e).await {
+            tracing::warn!(error = ?err, id = %id, effort = e, "助理：跑腿没能换思考强度");
         }
     }
     watch(app, &id, "", origin(app));
@@ -809,6 +848,163 @@ async fn errand_start(app: &App, a: &Value) -> Result<Value, String> {
     Ok(json!({ "errand": id, "project": project, "note": "Running in the background. You will get an event with kind=\"errand\" when it is done. Tell the user in one short line that you are on it, then end this turn." }))
 }
 
+/// 解析大脑对已有会话、跑腿或排队中派活修改权限 / 模型 / 思考强度的请求。
+/// 只能在用户自己发话开启的轮次里改（防事件叫醒时被提示注入提权）；超过上限时，Claude 大脑已在闸门问过用户，
+/// Codex 大脑的工具不经过闸门，直接拒绝并提示用户自行调整或提高上限。
+#[derive(Debug, PartialEq)]
+struct SessionPatch {
+    mode: Option<(String, core::Level)>,
+    model: Option<String>,
+    effort: Option<String>,
+}
+
+fn resolve_session_patch(
+    settings: &core::Settings,
+    engine: &str,
+    mode: Option<&str>,
+    permission: Option<&str>,
+    model: Option<&str>,
+    effort: Option<&str>,
+    user_turn: bool,
+) -> Result<SessionPatch, String> {
+    if !user_turn {
+        return Err("not changed: only the user can change a session's settings, and this turn was not started by the user. Ask the user first.".into());
+    }
+    let mode_change = match (mode.filter(|m| !m.is_empty()), permission.filter(|p| !p.is_empty())) {
+        (Some(m), _) => {
+            let level = core::level_of(engine, m).ok_or_else(|| format!("unknown mode {m} for {engine}; use one of: {}", core::engine_modes(engine).join(", ")))?;
+            Some((m.to_string(), level))
+        }
+        (None, Some(p)) => {
+            let level = core::Level::parse(p).ok_or_else(|| format!("unknown permission {p}; use read_only, ask, project or full"))?;
+            Some((dispatch_mode_for_level(settings, engine, level), level))
+        }
+        (None, None) => None,
+    };
+    if let Some((_, target_level)) = &mode_change {
+        let cap = core::start_ceiling(settings, Some(engine));
+        if target_level.rank() > cap.rank() && settings.engine != core::Engine::Claude {
+            return Err(format!(
+                "not changed: {} is above the limit ({}) the user set for dispatched sessions. Tell the user they can switch it directly in the session or raise the limit in the assistant panel.",
+                target_level.id(),
+                cap.id()
+            ));
+        }
+    }
+    let model = match model.filter(|m| !m.is_empty()) {
+        None => None,
+        Some(m) if core::model_ok(m) => Some(m.to_string()),
+        Some(m) => return Err(format!("invalid model {m}; use the model id the user named, e.g. opus, sonnet, gpt-5.1-codex")),
+    };
+    let effort = match effort.filter(|e| !e.is_empty()) {
+        None => None,
+        Some(e) if core::effort_ok(engine, e) => Some(e.to_string()),
+        Some(e) => return Err(format!("invalid effort {e} for {engine}; use one of: {}", core::efforts(engine).join(", "))),
+    };
+    if mode_change.is_none() && model.is_none() && effort.is_none() {
+        return Err("at least one of permission, mode, model or effort is required".into());
+    }
+    Ok(SessionPatch { mode: mode_change, model, effort })
+}
+
+/// 修改已有会话、跑腿或排队中派活的权限模式、模型与思考强度。Codex 正在等确认且新模式允许的审批会立刻放行
+async fn session_permission(app: &App, a: &Value) -> Result<Value, String> {
+    let s = |k: &str| a[k].as_str().unwrap_or("").trim().to_string();
+    let target = s("session");
+    if target.is_empty() {
+        return Err("session (or queued dispatch id) is required".into());
+    }
+    let settings = core::settings(&app.store);
+    let user_turn = core::user_turn(&app.store);
+    let (mode_s, perm_s, model_s, effort_s) = (s("mode"), s("permission"), s("model"), s("effort"));
+
+    // 先看是不是还在排队的派活（session_start 返回的 dispatch id）
+    if let Some(q_engine) = queue(app).into_iter().find(|q| q.dispatch == target).map(|q| q.engine) {
+        let patch = resolve_session_patch(&settings, &q_engine, Some(&mode_s), Some(&perm_s), Some(&model_s), Some(&effort_s), user_turn)?;
+        let updated = queue_update(app, |q| {
+            let Some(item) = q.iter_mut().find(|x| x.dispatch == target) else { return None };
+            if let Some((m, l)) = &patch.mode {
+                item.mode = Some(m.clone());
+                item.asked = Some(*l);
+                item.perm = Some(*l);
+            }
+            if let Some(m) = &patch.model {
+                item.model = Some(m.clone());
+            }
+            if let Some(e) = &patch.effort {
+                item.effort = Some(e.clone());
+            }
+            Some(item.title.clone())
+        });
+        if let Some(title) = updated {
+            let mut changed = vec![];
+            if let Some((m, _)) = &patch.mode {
+                changed.push(format!("权限={m}"));
+            }
+            if let Some(m) = &patch.model {
+                changed.push(format!("模型={m}"));
+            }
+            if let Some(e) = &patch.effort {
+                changed.push(format!("思考强度={e}"));
+            }
+            crate::assistant_memory::journal(&app.paths, &format!("助理修改了排队中的派活 [{target}] {title}：{}", changed.join("、")));
+            return Ok(json!({
+                "queued": true,
+                "dispatch": target,
+                "engine": q_engine,
+                "permission": patch.mode.as_ref().map(|(_, l)| l.id()),
+                "mode": patch.mode.as_ref().map(|(m, _)| m.as_str()),
+                "model": patch.model,
+                "effort": patch.effort,
+                "note": "Updated the queued dispatch. It will start with these settings when its turn comes.",
+            }));
+        }
+    }
+
+    let row = session_row(app, &target)?;
+    let patch = resolve_session_patch(&settings, &row.launch, Some(&mode_s), Some(&perm_s), Some(&model_s), Some(&effort_s), user_turn)?;
+    let mut used_mode: Option<&'static str> = None;
+    let mut used_level: Option<core::Level> = None;
+    if let Some((m, target_level)) = &patch.mode {
+        let used = app.chat.apply_mode(&row.id, m).await.map_err(|e| format!("could not change permission: {}", e.code))?;
+        let level = core::level_of(&row.launch, used).unwrap_or(*target_level);
+        set_level(app, &row.id, level);
+        used_mode = Some(used);
+        used_level = Some(level);
+    }
+    if let Some(m) = patch.model.as_deref() {
+        app.chat.apply_model(&row.id, m).await.map_err(|e| format!("could not change model: {}", e.code))?;
+    }
+    if let Some(e) = patch.effort.as_deref() {
+        app.chat.apply_effort(&row.id, e).await.map_err(|e| format!("could not change effort: {}", e.code))?;
+    }
+    let mut changed = vec![];
+    if let Some(m) = used_mode {
+        changed.push(format!("权限={m}"));
+    }
+    if let Some(m) = &patch.model {
+        changed.push(format!("模型={m}"));
+    }
+    if let Some(e) = &patch.effort {
+        changed.push(format!("思考强度={e}"));
+    }
+    crate::assistant_memory::journal(&app.paths, &format!("助理调整了 [{}] {}：{}", row.id, title_by_id(app, &row.id), changed.join("、")));
+    let note = if used_mode.is_some() && core::tool(&row.launch).is_some_and(|t| t.mode_next_turn) {
+        "Updated. Any pending approval allowed by the new mode is accepted right away, and future turns will use the new settings."
+    } else {
+        "Updated. The session now uses the new settings."
+    };
+    Ok(json!({
+        "session": row.id,
+        "engine": row.launch,
+        "permission": used_level.map(core::Level::id),
+        "mode": used_mode,
+        "model": patch.model,
+        "effort": patch.effort,
+        "note": note,
+    }))
+}
+
 async fn call_tool(app: &App, name: &str, a: &Value) -> Option<Result<Value, String>> {
     Some(match name {
         "projects_list" => Ok(json!({ "projects": projects(app).await, "scratch": core::scratch(&app.paths), "note": "For work that belongs to no project, use project=\"scratch\"." })),
@@ -816,6 +1012,7 @@ async fn call_tool(app: &App, name: &str, a: &Value) -> Option<Result<Value, Str
         "session_start" => session_start(app, a).await,
         "session_send" => session_send(app, a).await,
         "session_get" => session_get(app, a).await,
+        "session_permission" => session_permission(app, a).await,
         "errand_start" => errand_start(app, a).await,
         "session_stop" => match session_row(app, a["session"].as_str().unwrap_or("")) {
             // 只有用户说了才停（设计稿 §7.3）：被事件叫醒的一轮（会话结果、群里的话、网页内容）里不能自己叫停
@@ -970,7 +1167,7 @@ fn tool_defs() -> Value {
               "engine": { "type": "string", "enum": core::dispatch_tools(), "description": "Only when the user named one for this job (agy = Antigravity). Omitted = the tool the user picked in settings for sessions you start (Claude Code when unset and installed). An agy session cannot call assistant_note; you hear from it when its turn ends." },
               "now": { "type": "boolean", "description": "Start right away even though another session is working in the same project. Only when the user asked for that." },
               "quote": { "type": "string", "description": "Only when the user's latest message also talks about other things: the sentences of it that are about THIS job, copied word for word (Looklook checks). Empty string = attach none of it. Omit when the whole message is about this job." },
-              "permission": { "type": "string", "enum": ["read_only", "ask", "project", "full"], "description": "How much this session may do without asking. Omit unless the user said something about it for this job or the job is clearly read-only: omitted = the default permission the user set in settings (project when unset). read_only = only read and investigate (reviews, finding causes, answering questions about the code). ask = edits inside the project go ahead, every command asks the user (the user said \"ask me first\"). project = edits and commands inside the project go ahead; leaving the project, network, pushing and deploying ask. full = nothing asks; only when the user said so (\"let it do whatever it needs\"). Dangerous commands still ask at full. Above the user's limit needs the user's approval; while the user is away it never goes above project." },
+              "permission": { "type": "string", "enum": ["read_only", "ask", "project", "full"], "description": "How much this session may do without asking. If the user fixed a default permission for this engine in settings (shown in <looklook-context>), omit unless the user explicitly asked for a different permission in this message. Otherwise (unset = assistant picks per job), omit for code changes (project) or pass read_only for read-only / investigation jobs. read_only = only read and investigate (reviews, finding causes, answering questions about the code). ask = edits inside the project go ahead, every command asks the user (the user said \"ask me first\"). project = edits and commands inside the project go ahead; leaving the project, network, pushing and deploying ask. full = nothing asks; only when the user said so (\"let it do whatever it needs\"). Dangerous commands still ask at full. Above the user's limit needs the user's approval; while the user is away it never goes above project." },
               "effort": { "type": "string", "enum": ALL_EFFORTS, "description": "Thinking effort. Only when the user said how hard this job should think (\"想深一点\", \"用 high\", \"快速过一下\"). Claude Code: low, medium, high, xhigh, max. Codex: none, minimal, low, medium, high, xhigh, max, ultra. Antigravity: low, medium, high. Omitted = the default effort the user set in settings for this engine, else the tool's own configured default." },
               "model": { "type": "string", "description": "Only when the user named a model for this job (\"用 opus\", \"use gpt-5.1-codex\"): the model id or alias as the tool accepts it. Omitted = the default model the user set in settings for this engine, else the tool's own configured default." },
           }), &["project", "title", "reason"]) },
@@ -984,6 +1181,14 @@ fn tool_defs() -> Value {
         { "name": "session_get", "description": "The current state of one session and the end of its last reply (at most 1500 characters). Use this before answering \"how is it going\". There is no way to fetch a whole transcript; give the user the session instead.",
           "inputSchema": obj(json!({ "session": { "type": "string" } }), &["session"]) },
         { "name": "session_stop", "description": "Interrupt a session's current turn. Only when the user just asked for it.", "inputSchema": obj(json!({ "session": { "type": "string" } }), &["session"]) },
+        { "name": "session_permission", "description": "Change the permission mode, model, or thinking effort of an EXISTING session, background errand, or queued dispatch. Only when the user asked to change them. On Codex, any pending approval allowed by the new mode is accepted right away.",
+          "inputSchema": obj(json!({
+              "session": { "type": "string", "description": "Session id, errand id, or queued dispatch id from sessions_list / <looklook-context> / session_start." },
+              "permission": { "type": "string", "enum": ["read_only", "ask", "project", "full"], "description": "Target permission level (read_only, ask, project, full). Uses the engine's corresponding mode (or the user's configured default mode if it matches this level)." },
+              "mode": { "type": "string", "description": "Optional engine-specific permission mode when the user named one (Claude/agy: plan, default, acceptEdits, auto, bypassPermissions; Codex: readOnly, askCommands, workspaceWrite, fullGuarded, fullAccess). Takes precedence over permission." },
+              "model": { "type": "string", "description": "Optional model id or alias to switch this session to." },
+              "effort": { "type": "string", "enum": ALL_EFFORTS, "description": "Optional thinking effort to switch this session to." },
+          }), &["session"]) },
         { "name": "errand_start", "description": "Hand something that takes more than a few steps to a background helper so this turn can end and the user does not have to wait: investigating, searching several repos, running tests or builds to see the result, web research, comparing, summarising. Not for changing code (use session_start). It runs as a hidden session with the same permissions as you, cannot ask the user anything, and reports back with an event (kind=\"errand\"). Several errands can run at once.",
           "inputSchema": obj(json!({
               "title": { "type": "string", "description": "A few words, in the user's language, shown in the activity list." },
@@ -1965,9 +2170,10 @@ async fn start_queued(app: &App) {
         opened.push(item.project.clone());
         // 大脑指定了的派活时已经定好（超过上限的那时已经问过用户）；没指定的按现在的设置（用户这期间可能改了默认）
         let settings = core::settings(&app.store);
-        let pick = match item.asked {
-            Some(l) => Pick { mode: core::native_mode(&item.engine, l).to_string(), level: l, capped: None },
-            None => dispatch_level(&settings, &item.engine, None, item.attended),
+        let pick = match (item.mode.as_deref().and_then(|m| core::level_of(&item.engine, m).map(|l| (m, l))), item.asked) {
+            (Some((m, l)), _) => Pick { mode: m.to_string(), level: l, capped: None },
+            (None, Some(l)) => Pick { mode: dispatch_mode_for_level(&settings, &item.engine, l), level: l, capped: None },
+            (None, None) => dispatch_level(&settings, &item.engine, None, item.attended),
         };
         let model = dispatch_model(&settings, &item.engine, item.model.as_deref());
         let effort = dispatch_effort(&settings, &item.engine, item.effort.as_deref());
@@ -2705,7 +2911,7 @@ pub struct LevelReq {
 /// 可以是四档之一，也可以是这种引擎的任何一种权限模式。Claude Code 马上生效；Codex 的审批策略下一轮才换，
 /// 这一轮里来问的（包括正在等的）看看照新模式替用户放
 pub async fn set_session_level(State(app): State<App>, Path(session): Path<String>, Json(req): Json<LevelReq>) -> R<Json<Value>> {
-    if !core::watches(&app.store).contains_key(&session) || core::is_gated(&app.store, &session) {
+    if !core::watches(&app.store).contains_key(&session) || core::is_brain(&app.store, &session) || core::is_ask(&app.store, &session) {
         return Err(LocalError::not_found());
     }
     let engine = app.store.instance(&session)?.ok_or_else(LocalError::not_found)?.launch;
@@ -2904,15 +3110,51 @@ mod tests {
         assert_eq!(pick(&s, "codex", None, true), ("fullAccess".into(), Full, None));
         s.claude.mode = Some("default".into());
         assert_eq!(pick(&s, "claude", None, true), ("default".into(), Ask, None));
-        // 大脑指定了的按档；上限至少到用户设的默认那一档
+        // 大脑指定了的按档；上限至少到用户设的默认那一档；同一档优先保留用户选的具体模式（如 fullAccess 不退回 fullGuarded）
         s.engine = crate::assistant::Engine::Codex;
         s.ceiling = Some(Project);
-        assert_eq!(pick(&s, "codex", Some(Full), true), ("fullGuarded".into(), Full, None), "默认全权 → 上限也到全权");
+        assert_eq!(pick(&s, "codex", Some(Full), true), ("fullAccess".into(), Full, None), "默认全权 fullAccess → 上限也到全权且保留 fullAccess");
+        s.codex.mode = Some("fullGuarded".into());
+        assert_eq!(pick(&s, "codex", Some(Full), true), ("fullGuarded".into(), Full, None), "默认 fullGuarded → 保持 fullGuarded");
         assert_eq!(pick(&s, "claude", Some(Full), true), ("auto".into(), Project, Some(Full)), "Claude 默认只到动手前问，上限还是项目内放手");
         assert_eq!(pick(&s, "claude", Some(ReadOnly), false), ("plan".into(), ReadOnly, None));
         // 设的模式不认得（比如换了引擎写法）：当没设
         s.codex.mode = Some("plan".into());
         assert_eq!(pick(&s, "codex", None, true), ("workspaceWrite".into(), Project, None));
+    }
+
+    #[test]
+    fn resolve_session_patch_checks_turn_mode_model_effort_and_ceiling() {
+        use crate::assistant::Level::*;
+        let mut s = crate::assistant::Settings::default();
+        s.engine = crate::assistant::Engine::Codex;
+        s.ceiling = Some(Project);
+        // 事件叫醒的轮次不允许改已有会话设置
+        assert!(resolve_session_patch(&s, "codex", None, Some("project"), None, None, false).is_err());
+        assert!(resolve_session_patch(&s, "codex", None, None, None, None, true).is_err());
+        assert!(resolve_session_patch(&s, "codex", Some("plan"), None, None, None, true).is_err());
+        assert!(resolve_session_patch(&s, "claude", None, None, None, Some("minimal"), true).is_err());
+        // 未超上限：正常解析权限 / 模型 / 思考强度
+        let p = resolve_session_patch(&s, "codex", None, Some("read_only"), Some("gpt-6.2-sol"), Some("high"), true).unwrap();
+        assert_eq!(p, SessionPatch { mode: Some(("readOnly".into(), ReadOnly)), model: Some("gpt-6.2-sol".into()), effort: Some("high".into()) });
+        // 只改模型或强度也可以（不要求必填权限）
+        let p2 = resolve_session_patch(&s, "codex", None, None, None, Some("xhigh"), true).unwrap();
+        assert_eq!(p2, SessionPatch { mode: None, model: None, effort: Some("xhigh".into()) });
+        // Codex 大脑（不经过闸门）超过上限时拒绝
+        assert!(resolve_session_patch(&s, "codex", None, Some("full"), None, None, true).is_err());
+        assert!(resolve_session_patch(&s, "codex", Some("fullAccess"), None, None, None, true).is_err());
+        // 用户给 Codex 设了默认 fullAccess → 上限到全权且 permission=full 保留 fullAccess
+        s.codex.mode = Some("fullAccess".into());
+        assert_eq!(resolve_session_patch(&s, "codex", None, Some("full"), None, None, true).unwrap().mode, Some(("fullAccess".into(), Full)));
+        assert_eq!(resolve_session_patch(&s, "codex", Some("fullGuarded"), Some("read_only"), None, None, true).unwrap().mode, Some(("fullGuarded".into(), Full)), "显式 mode 优先于 permission");
+        // Claude 大脑在闸门已经问过用户，超过上限时允许继续执行
+        s.engine = crate::assistant::Engine::Claude;
+        s.claude.mode = None;
+        assert_eq!(resolve_session_patch(&s, "claude", Some("bypassPermissions"), None, Some("opus"), Some("max"), true).unwrap(), SessionPatch {
+            mode: Some(("bypassPermissions".into(), Full)),
+            model: Some("opus".into()),
+            effort: Some("max".into()),
+        });
     }
 
     #[test]

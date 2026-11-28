@@ -37,6 +37,8 @@ pub fn routes(app: App) -> Router<App> {
         .route("/account", get(account))
         .route("/rtc/devices", get(rtc_devices))
         .route("/rtc/local-only", put(put_local_only))
+        .route("/rtc/shared", get(shared_list).post(shared_add))
+        .route("/rtc/shared/{id}", put(shared_edit).delete(shared_remove))
         .route("/rtc/paths", get(rtc_paths))
         .route("/rtc/direct-only", get(get_direct_only).put(put_direct_only))
         .route("/rtc/net", get(crate::rtc::net::get_net).put(crate::rtc::net::put_net))
@@ -131,7 +133,7 @@ pub fn routes(app: App) -> Router<App> {
         .route("/instances/{id}/chat/edit", post(super::chat::edit))
         .route("/instances/{id}/chat/rename", post(super::chat::rename))
         .route("/instances/{id}/chat/later/take", post(super::chat::later_take))
-        .route("/instances/{id}/chat/btw", post(super::chat::btw))
+        .route("/instances/{id}/chat/btw", post(super::chat::btw).delete(super::chat::btw_close))
         .route("/instances/{id}/chat/background", post(super::chat::background))
         .route("/instances/{id}/chat/interrupt", post(super::chat::interrupt))
         .route("/instances/{id}/chat/permission", post(super::chat::permission))
@@ -301,6 +303,7 @@ pub fn routes(app: App) -> Router<App> {
         .route("/access", get(get_access).put(put_access))
         .route("/public-https", get(get_public_https).put(put_public_https))
         .route("/connection", get(get_connection).put(put_connection))
+        .route("/connection/test", post(post_connection_test))
         .route("/mcp", get(get_mcp).put(put_mcp))
         .route("/mcp/install", post(mcp_install))
         .route("/mcp/uninstall", post(mcp_uninstall))
@@ -327,6 +330,8 @@ pub fn routes(app: App) -> Router<App> {
         .route("/codex-profiles", get(get_codex_profiles).post(add_codex_profile))
         .route("/codex-profiles/default", put(set_default_codex_profile))
         .route("/codex-profiles/{id}", put(update_codex_profile).delete(delete_codex_profile))
+        .route("/codex-profiles/{id}/status", get(codex_profile_status))
+        .route("/codex-profiles/{id}/logout", post(logout_codex_profile))
         .route("/codex-profiles/{id}/usage", post(codex_profile_usage))
         .route("/codex-profiles/test", post(test_codex_profile))
         .route("/codex-profiles/provider-models", post(codex_provider_models))
@@ -340,6 +345,7 @@ pub fn routes(app: App) -> Router<App> {
         .route("/claude-profiles/default", put(set_default_claude_profile))
         .route("/claude-profiles/{id}", put(update_claude_profile).delete(delete_claude_profile))
         .route("/claude-profiles/{id}/status", get(claude_profile_status))
+        .route("/claude-profiles/{id}/logout", post(logout_claude_profile))
         .route("/claude-profiles/test", post(test_claude_profile))
         .route("/claude-profiles/provider-models", post(claude_provider_models))
         .route("/claude-profiles/{id}/usage", post(claude_profile_usage))
@@ -353,6 +359,7 @@ pub fn routes(app: App) -> Router<App> {
         .route("/agy-profiles/auto-switch", put(set_agy_auto_switch))
         .route("/agy-profiles/{id}", put(update_agy_profile).delete(delete_agy_profile))
         .route("/agy-profiles/{id}/status", get(agy_profile_status))
+        .route("/agy-profiles/{id}/logout", post(logout_agy_profile))
         .route("/agy-profiles/{id}/usage", post(agy_profile_usage))
         .route("/agy-profiles/{id}/tuning", put(set_agy_tuning))
         .route("/agy-profiles/{id}/tuning/current", get(agy_tuning_current))
@@ -406,10 +413,16 @@ fn require_local(access: &Access) -> R<()> {
 
 // ---------------- 状态与账户 ----------------
 
-async fn status(State(app): State<App>, Extension(access): Extension<Access>) -> Json<Value> {
+async fn status(State(app): State<App>, Extension(access): Extension<Access>, peer: Option<Extension<Peer>>) -> Json<Value> {
     Json(json!({
         "version": VERSION,
         "target": crate::paths::target(),
+        // 电脑名（别的看看把这台加成共享电脑时显示）
+        "device_name": Settings::load(&app.store).device_name(),
+        // 本机加了共享电脑：没登录也按多台电脑显示
+        "shared_pcs": peer.is_some_and(|p| p.0 == Peer::Local) && app.shared.any(),
+        // 插件开着的功能（多人协作的操作人署名等）：界面按它显示署名、“只看我的”
+        "features": app.plugins.features().await,
         "access": if access.is_local() { "local" } else { "remote" },
         "account": app.account.status(access.is_local()),
         "relay": crate::relay::status(),
@@ -512,12 +525,26 @@ async fn account(State(app): State<App>) -> R<Json<Value>> {
 /// 其他方式打开时返回空列表，界面就按单台电脑显示。
 /// “只看本机”时也返回空列表（`local_only: true`），不向平台取，也就不会连其他电脑。
 async fn rtc_devices(State(app): State<App>, req: Request) -> R<Json<Value>> {
-    let Some(session) = (req.extensions().get::<Peer>() == Some(&Peer::Local)).then(|| app.account.session()).flatten() else {
+    if req.extensions().get::<Peer>() != Some(&Peer::Local) {
         return Ok(Json(json!({ "items": [], "default": null, "max": 0 })));
-    };
+    }
     if local_only(&app) {
         return Ok(Json(json!({ "items": [], "default": null, "max": 0, "local_only": true })));
     }
+    let session = app.account.session();
+    // 共享电脑（crate::shared_pcs）：排在自己的电脑后面；没登录时也有，本机用 `self`
+    let shared = if app.shared.any() { app.shared.devices().await } else { Vec::new() };
+    let Some(session) = session else {
+        if shared.is_empty() {
+            return Ok(Json(json!({ "items": [], "default": null, "max": 0 })));
+        }
+        let me = json!({
+            "id": "self", "name": Settings::load(&app.store).device_name(), "os": crate::paths::os_name(),
+            "online": true, "terminals": app.instances.ids(), "last_seen_ms": null,
+        });
+        let items: Vec<Value> = std::iter::once(me).chain(shared).collect();
+        return Ok(Json(json!({ "items": items, "default": "self", "max": 0, "local_only": false })));
+    };
     let own = session.device_id;
     let local_ids = app.instances.ids();
     for id in &local_ids {
@@ -536,8 +563,58 @@ async fn rtc_devices(State(app): State<App>, req: Request) -> R<Json<Value>> {
     let mut v = serde_json::to_value(d).unwrap_or_default();
     if let Some(o) = v.as_object_mut() {
         o.insert("local_only".into(), false.into());
+        if let Some(items) = o.get_mut("items").and_then(Value::as_array_mut) {
+            items.extend(shared);
+        }
     }
     Ok(Json(v))
+}
+
+fn only_here(peer: &Option<Extension<Peer>>) -> R<()> {
+    if peer.as_ref().map(|p| p.0) != Some(Peer::Local) {
+        return Err(LocalError::new("REMOTE_FORBIDDEN"));
+    }
+    Ok(())
+}
+
+/// 共享电脑列表（账户 → 电脑页）：访问码只说有没有填。只给这台电脑自己打开的管理台。
+async fn shared_list(State(app): State<App>, peer: Option<Extension<Peer>>) -> R<Json<Value>> {
+    only_here(&peer)?;
+    Ok(Json(json!({ "items": app.shared.view().await })))
+}
+
+#[derive(Deserialize)]
+struct SharedAdd {
+    url: String,
+    #[serde(default)]
+    code: String,
+    #[serde(default)]
+    remark: String,
+}
+
+async fn shared_add(State(app): State<App>, peer: Option<Extension<Peer>>, Json(r): Json<SharedAdd>) -> R<Json<Value>> {
+    only_here(&peer)?;
+    Ok(Json(app.shared.add(&r.url, &r.code, &r.remark, app.ui_addr.port()).await?))
+}
+
+#[derive(Deserialize)]
+struct SharedEdit {
+    #[serde(default)]
+    remark: Option<String>,
+    /// 新的访问码；空字符串表示清掉
+    #[serde(default)]
+    code: Option<String>,
+}
+
+async fn shared_edit(State(app): State<App>, peer: Option<Extension<Peer>>, Path(id): Path<String>, Json(r): Json<SharedEdit>) -> R<Json<Value>> {
+    only_here(&peer)?;
+    Ok(Json(app.shared.update(&id, r.remark.as_deref(), r.code.as_deref()).await?))
+}
+
+async fn shared_remove(State(app): State<App>, peer: Option<Extension<Peer>>, Path(id): Path<String>) -> R<StatusCode> {
+    only_here(&peer)?;
+    app.shared.remove(&id)?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// 本机 App 连着的其他电脑走的路与往返时间（电脑菜单里的色点，`rtc::outbound`）。
@@ -722,7 +799,11 @@ struct CreateReq {
     start: bool,
 }
 
-async fn create_instance(State(app): State<App>, Json(req): Json<CreateReq>) -> R<impl IntoResponse> {
+async fn create_instance(State(app): State<App>, Json(mut req): Json<CreateReq>) -> R<impl IntoResponse> {
+    // 操作人署名只在插件开了这个功能时记（多人协作插件，见 looklook_protocol::plugin::FEATURE_OPERATOR）
+    if req.input.created_by.is_some() && !app.plugins.has_feature(looklook_protocol::plugin::FEATURE_OPERATOR).await {
+        req.input.created_by = None;
+    }
     let v = create_session(&app, req.input, req.start).await?;
     Ok((StatusCode::CREATED, Json(v)))
 }
@@ -2518,7 +2599,7 @@ fn access_view(app: &App, peer: Option<Peer>) -> Value {
         "code": c.code,
         "open_host": c.open_host,
         "port": app.ui_addr.port(),
-        "lan_ips": app.lan_ips.iter().map(|ip| ip.to_string()).collect::<Vec<_>>(),
+        "lan_ips": crate::gateway::access::own_lan_ips().into_iter().map(|ip| ip.to_string()).collect::<Vec<_>>(),
         "peer": peer,
         // Windows 防火墙放行说明里要用到程序的完整路径
         "exe": std::env::current_exe().ok().map(|p| p.display().to_string()),
@@ -2640,11 +2721,13 @@ fn connection_view(app: &App, peer: Option<Peer>) -> Value {
         "custom_port": crate::listen::custom_port(&app.store),
         "listen_override": crate::listen::is_explicit(),
         "allow_lan": acc.allow_lan,
+        "in_container": crate::gateway::access::in_container(),
         "lan_ips": crate::gateway::access::own_lan_ips().into_iter().map(|ip| ip.to_string()).collect::<Vec<_>>(),
         "public_direct": dir.enabled,
         "custom_urls": dir.custom_urls,
         "tls_cert_path": dir.tls_cert_path,
         "tls_key_path": dir.tls_key_path,
+        "tls_certs": app.direct.custom_cert_views(),
         "direct_status": app.direct.status(),
         "endpoints": app.direct.endpoints(&acc),
         "logins": app.direct.logins(),
@@ -2678,6 +2761,7 @@ struct ConnectionReq {
     custom_urls: Option<Vec<String>>,
     tls_cert_path: Option<String>,
     tls_key_path: Option<String>,
+    tls_certs: Option<Vec<crate::direct_tls::TlsCertPair>>,
     /// 自定义监听端口：`null` 或 `0` 恢复自动分配，`1..=65535` 固定端口（重启客户端后生效）
     #[serde(default, deserialize_with = "deser_opt_opt_i64")]
     custom_port: Option<Option<i64>>,
@@ -2713,7 +2797,9 @@ async fn put_connection(State(app): State<App>, peer: Option<Extension<Peer>>, J
             if val.is_empty() { e } else { e.with("value", val) }
         })?;
     }
-    if req.tls_cert_path.is_some() || req.tls_key_path.is_some() {
+    if let Some(certs) = req.tls_certs {
+        app.direct.set_custom_tls_list(&certs).map_err(|rule| LocalError::invalid("tls_cert", rule))?;
+    } else if req.tls_cert_path.is_some() || req.tls_key_path.is_some() {
         let cur = app.direct.config();
         let cp = req.tls_cert_path.as_deref().unwrap_or(&cur.tls_cert_path);
         let kp = req.tls_key_path.as_deref().unwrap_or(&cur.tls_key_path);
@@ -2724,6 +2810,16 @@ async fn put_connection(State(app): State<App>, peer: Option<Extension<Peer>>, J
     }
     app.account.wake();
     Ok(Json(connection_view(&app, peer.map(|p| p.0))))
+}
+
+#[derive(Deserialize)]
+struct ConnectionTestReq {
+    url: String,
+}
+
+async fn post_connection_test(State(app): State<App>, Json(req): Json<ConnectionTestReq>) -> R<Json<Value>> {
+    let res = app.direct.probe_url(&req.url).await;
+    Ok(Json(serde_json::to_value(res).unwrap_or_default()))
 }
 
 // ---------------- AI 助手接入（MCP） ----------------
@@ -3288,6 +3384,24 @@ async fn codex_profile_usage(State(app): State<App>, Path(id): Path<String>) -> 
     Ok(Json(crate::provider_quota::usage_view(p.base_url.as_deref(), &crate::codex_profiles::key_path(&app.paths.home, &p.id)).await))
 }
 
+async fn codex_profile_status(State(app): State<App>, Path(id): Path<String>) -> R<Json<Value>> {
+    let p = crate::codex_profiles::get(&app.store, &id).ok_or_else(LocalError::not_found)?;
+    if p.is_api() {
+        return Ok(Json(json!({ "key_set": crate::codex_profiles::key_set(&app.paths.home, &p.id) })));
+    }
+    Ok(Json(crate::codex_profiles::status(app.instances.shell()).await))
+}
+
+async fn logout_codex_profile(State(app): State<App>, Path(id): Path<String>) -> R<Json<Value>> {
+    let p = crate::codex_profiles::get(&app.store, &id).ok_or_else(LocalError::not_found)?;
+    if p.is_api() {
+        return Err(LocalError::invalid("id", "not_official"));
+    }
+    app.chat.codex_logout_server().await;
+    crate::codex_profiles::logout(app.instances.shell()).await?;
+    Ok(Json(codex_profiles_view(&app)))
+}
+
 // ---------------- 用量统计（见 usage_stats.rs） ----------------
 
 #[derive(Deserialize)]
@@ -3470,6 +3584,12 @@ async fn cancel_claude_login(Path(id): Path<String>) -> StatusCode {
     StatusCode::NO_CONTENT
 }
 
+async fn logout_claude_profile(State(app): State<App>, Path(id): Path<String>) -> R<Json<Value>> {
+    let p = crate::claude_profiles::get(&app.store, &id).ok_or_else(LocalError::not_found)?;
+    crate::claude_profiles::logout(app.instances.shell(), &app.paths.home, &p).await?;
+    Ok(Json(claude_profiles_view(&app)))
+}
+
 // ---------------- Antigravity（agy）账号切换（见 agy_profiles.rs） ----------------
 
 fn agy_profiles_view(app: &App) -> Value {
@@ -3528,6 +3648,13 @@ async fn update_agy_profile(State(app): State<App>, Path(id): Path<String>, Json
 
 async fn delete_agy_profile(State(app): State<App>, Path(id): Path<String>) -> R<Json<Value>> {
     crate::agy_profiles::remove(&app.store, &app.paths.home, &id)?;
+    app.chat.agy_drop_profile(&id).await;
+    Ok(Json(agy_profiles_view(&app)))
+}
+
+async fn logout_agy_profile(State(app): State<App>, Path(id): Path<String>) -> R<Json<Value>> {
+    crate::agy_profiles::logout(&app.store, &app.paths.home, &id)?;
+    app.chat.agy_drop_profile(&id).await;
     Ok(Json(agy_profiles_view(&app)))
 }
 

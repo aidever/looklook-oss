@@ -403,7 +403,7 @@ test('AGY_COMMANDS and slashAction for agy', async () => {
   assert.equal(slashAction('/share', 'agy'), 'share');
   assert.equal(slashAction('/export', 'agy'), 'outline');
   // Native agy prompt/workflow commands pass through
-  for (const pass of ['/clear', '/new', '/compact', '/fast', '/goal', '/planning', '/grill-me', '/schedule', '/btw', '/model gemini', '/rename foo']) {
+  for (const pass of ['/clear', '/new', '/compact', '/fast', '/goal', '/planning', '/grill-me', '/schedule', '/btw what', '/model gemini', '/rename foo']) {
     assert.equal(slashAction(pass, 'agy'), null, `${pass} should pass through`);
   }
   // AGY-only commands are not intercepted for Claude

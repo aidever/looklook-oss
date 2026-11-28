@@ -33,7 +33,9 @@ import { hasSnapshot, rememberStatus, snapStatus } from './shared/snapshot.js';
 import { opensInPage, SessionHome, SessionList, SessionStage, SessionTabs, SessionUiProvider, useSessionUi } from './pages/Sessions.jsx';
 import { DraftPane } from './pages/Draft.jsx';
 import TerminalView from './pages/TerminalView.jsx';
-import { api, rtcMode, selectedDevice } from './shared/api.js';
+import ViewPage from './files/ViewPage.jsx';
+import { api, localApi, rtcMode, selectedDevice } from './shared/api.js';
+import { setCloudOperator } from './shared/operator.js';
 import { useAwayTracker } from './shared/board.js';
 import { DeviceSwitcher, DevicesProvider, deviceName, useDevices, useDeviceState } from './shared/devices.jsx';
 import ErrorBoundary from './shared/ErrorBoundary.jsx';
@@ -112,6 +114,8 @@ const TOOLS = [
 // 按电脑的页面：多台电脑时顶栏显示电脑切换（会话合并显示所有电脑，账户页不分电脑）
 const isDevicePage = (p) => p === '/assistant' || PLUGIN_ROUTE.test(p);
 const TERM = /^\/t\/([a-z2-7]{8})$/;
+// 新标签页里看一个文件（files/ViewPage.jsx）
+const VIEW = '/view';
 const SESS = /^\/s\/([a-z2-7]{8})$/;
 // 用户菜单里的账户页面
 const ACCOUNT_PAGES = ['/devices', '/membership', '/account'];
@@ -127,7 +131,7 @@ const DRAWER_PAGES = {
 };
 const isDrawer = (p) => Object.hasOwn(DRAWER_PAGES, p);
 const PAGES = ['/', '/new', '/assistant', '/tasks', '/history', '/project', ...ACCOUNT_PAGES, ...TOOLS.map((x) => x.to)];
-const isKnown = (p) => PAGES.includes(p) || TERM.test(p) || SESS.test(p) || PLUGIN_ROUTE.test(p);
+const isKnown = (p) => PAGES.includes(p) || p === VIEW || TERM.test(p) || SESS.test(p) || PLUGIN_ROUTE.test(p);
 // 会话相关的页面铺满主区域（不限宽度）
 const isWide = (p) => p === '/' || p === '/new' || p === '/assistant' || p === '/tasks' || p === '/history' || SESS.test(p) || PLUGIN_ROUTE.test(p);
 const RAIL_KEY = 'looklook.rail';
@@ -339,7 +343,7 @@ function useUserMenu(grid) {
     { card },
     ...(grid ? [{ grid }] : []),
     'sep',
-    !grid && !guest && { icon: Laptop, label: t('acct.computers'), onClick: () => navigate('/devices') },
+    !grid && (!guest || !rtcMode) && { icon: Laptop, label: t('acct.computers'), onClick: () => navigate('/devices') },
     !guest && { icon: CalendarClock, label: t('acct.membership'), onClick: () => navigate('/membership') },
     !guest && { icon: ShieldCheck, label: t('acct.account'), onClick: () => navigate('/account') },
     { icon: SettingsIcon, label: t('nav.settings'), hint: shouldRemind(status.update) ? t('update.badge') : undefined, onClick: () => navigate('/settings') },
@@ -566,7 +570,7 @@ function useMeMenu({ tasks = true } = {}) {
     { icon: History, label: t('nav.short.history'), onClick: () => navigate('/history') },
     ...TOOLS.filter((x) => !x.config).map(item),
     item(TOOLS.find((x) => x.to === '/ai')),
-    status.account.logged_in && { icon: Laptop, label: t('acct.computers'), onClick: () => navigate('/devices') },
+    (status.account.logged_in || !rtcMode) && { icon: Laptop, label: t('acct.computers'), onClick: () => navigate('/devices') },
   ]);
 }
 
@@ -836,7 +840,7 @@ function PageDrawer({ path, behind, onClose, stale, children }) {
     if (id) setTimeout(() => sessions.requestFocus(id), 0);
   };
   return (
-    <Drawer open={Boolean(path)} onClose={close} title={!path ? '' : !status.account.logged_in && ACCOUNT_PAGES.includes(path) ? t('upsell.menu') : t(DRAWER_PAGES[path])} wide={TOOL_DRAWERS.includes(path) ? 'xl' : path === '/settings'} head={perDevice && <DeviceSwitcher perDevice helpUrl={webUrl(status, '/docs/remote')} />}>
+    <Drawer open={Boolean(path)} onClose={close} title={!path ? '' : !status.account.logged_in && ACCOUNT_PAGES.includes(path) && path !== '/devices' ? t('upsell.menu') : t(DRAWER_PAGES[path])} wide={TOOL_DRAWERS.includes(path) ? 'xl' : path === '/settings'} head={perDevice && <DeviceSwitcher perDevice helpUrl={webUrl(status, '/docs/remote')} />}>
       <Fragment key={byDevice ? devices.selected : 'all'}>
         {byDevice && stale ? (
           <div className="stack">
@@ -939,12 +943,17 @@ function Shell() {
   const reload = useCallback(() => {
     const device = selectedDevice();
     const n = ++reqSeq.current;
-    return api
-      .get('/status')
+    // 共享电脑上是别人的客户端：账户、访问方式还是看这台电脑自己的（不显示、不操作对方的账户）
+    const shared = device && devRef.current?.byId?.(device)?.shared;
+    const get = shared
+      ? Promise.all([api.get('/status'), localApi.get('/status')]).then(([s, h]) => ({ ...s, account: h.account, access: h.access, shared_pcs: h.shared_pcs }))
+      : api.get('/status');
+    return get
       .then((s) => {
         if (n !== reqSeq.current) return;
         failedDevs.current.clear();
         setStatus(s);
+        setCloudOperator(s?.account?.session?.user?.nickname || s?.account?.session?.user?.username || '');
         setStatusDevice(device);
         setDown(false);
         rememberStatus(s);
@@ -980,7 +989,7 @@ function Shell() {
     ownDevRef.current = status.account.session.device_id;
   }
   // 远程打开（启动页给的列表）和本机 App（本机客户端连其他电脑，服务端 docs/06 §14）都能切换电脑
-  const devices = useDeviceState(Boolean(status?.account?.logged_in), ownDevRef.current);
+  const devices = useDeviceState(Boolean(status?.account?.logged_in || status?.shared_pcs), ownDevRef.current);
   if (devices.def) ownDevRef.current = devices.def;
   devRef.current = devices;
   // 设备列表加载后、切换电脑后，取选中那台电脑的状态
@@ -1041,6 +1050,8 @@ function Shell() {
         <Login />
       </PublicLayout>
     );
+  } else if (path === VIEW) {
+    body = <ViewPage />;
   } else if (TERM.test(path)) {
     // 按会话 key：换会话时整页重来，不然标签、输入框里的字（草稿）会从上一个会话带过来
     body = <TerminalView key={path.match(TERM)[1]} id={path.match(TERM)[1]} />;
@@ -1054,7 +1065,7 @@ function Shell() {
     const pluginName = parsePluginRoute(path);
     const page = SESS.test(path) ? null : pluginName ? <PluginView name={pluginName} /> : { '/': home, '/new': <DraftPane key={`start:${login}`} />, '/assistant': <Assistant />, '/tasks': <Board />, '/history': <HistoryPage />, '/project': <ProjectPage /> }[path];
     const guest = !status.account.logged_in;
-    const drawerPage = route.drawer && { '/settings': <Settings />, '/account': guest ? <Login drawer /> : <Account />, '/devices': guest ? <Login drawer /> : <Computers />, '/membership': guest ? <Login drawer /> : <Membership />, '/files': <Files />, '/ssh': <SshHosts />, '/pages': <Pages />, '/plugins': <Plugins />, '/ai': <AiPage />, '/system': <System /> }[route.drawer];
+    const drawerPage = route.drawer && { '/settings': <Settings />, '/account': guest ? <Login drawer /> : <Account />, '/devices': <Computers />, '/membership': guest ? <Login drawer /> : <Membership />, '/files': <Files />, '/ssh': <SshHosts />, '/pages': <Pages />, '/plugins': <Plugins />, '/ai': <AiPage />, '/system': <System /> }[route.drawer];
     body = (
       <SessionsProvider key={login} enabled>
         <SessionUiProvider>

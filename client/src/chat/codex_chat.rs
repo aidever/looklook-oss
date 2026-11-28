@@ -76,6 +76,8 @@ pub struct Hub {
     pub(super) stale: std::sync::atomic::AtomicBool,
     /// 自动起名（见 [`Chat::codex_auto_title`]）：起名用的临时 thread → 收到的回答、答完时通知谁
     titling: Mutex<HashMap<String, (String, Option<oneshot::Sender<String>>)>>,
+    /// 开着的旁聊（见 [`Chat::codex_side`]）：终端 id → (分叉自哪个对话, 临时对话, 在哪个 app-server 里)
+    sides: Mutex<HashMap<String, (String, String, std::sync::Weak<AppServer>)>>,
     /// 这些对话起过名或正在起（没拿到名字的会拿掉，下一轮再试）；还有每个对话等着起名用的那句话
     titled: Mutex<HashSet<String>>,
     title_prompts: Mutex<HashMap<String, String>>,
@@ -361,6 +363,11 @@ fn perm_of(approval: &Value, sandbox: &Value) -> Option<String> {
         (Some("untrusted"), "dangerFullAccess" | "danger-full-access") => FULL_GUARDED.into(),
         (a, k) => format!("{}/{k}", a.unwrap_or("custom")),
     })
+}
+
+/// 界面或助理切换过的权限模式（客户端重启后重新 `thread/resume` 照旧沿用，不回退到建会话时的 `full_access`）
+pub(super) fn perm_key(id: &str) -> String {
+    format!("codex.perm.{id}")
 }
 
 /// 在托管工作树里开的对话：记下它的目录，之后加载（`thread/resume`）时用它，不用终端的工作目录
@@ -723,6 +730,10 @@ impl Chat {
         self.inst(id).agent.launch() == "codex"
     }
 
+    fn codex_saved_perm(&self, id: &str) -> Option<String> {
+        self.store.get::<String>(&perm_key(id)).ok().flatten().filter(|m| PERMS.contains(&m.as_str()))
+    }
+
     /// 界面上选过权限就用选的；否则全部权限的终端不询问、不用沙箱（和 `codex --yolo` 一样）。
     /// 助理的大脑：规矩、助理工具、按助理权限模式定的沙箱（见 `assistant::codex_thread`），不看界面选的
     fn codex_policy(&self, id: &str) -> Value {
@@ -731,10 +742,20 @@ impl Chat {
                 return crate::assistant::codex_thread(&self.store, &self.paths, addr);
             }
         }
-        if crate::assistant::is_errand(&self.store, id) {
-            return crate::assistant::codex_errand_thread();
+        if crate::assistant::is_ask(&self.store, id) {
+            return crate::assistant::codex_ask_thread();
         }
-        let mut v = if let Some(perm) = lock(&self.inst(id).st).codex.perm.clone() {
+        if crate::assistant::is_errand(&self.store, id) {
+            let perm = lock(&self.inst(id).st).codex.perm.clone().or_else(|| crate::assistant::errand_mode(&self.store, id));
+            return match perm {
+                Some(p) => {
+                    let (approval, sandbox, _) = perm_params(&p);
+                    json!({ "developerInstructions": crate::assistant::ERRAND_RULES, "approvalPolicy": approval, "sandbox": sandbox })
+                }
+                None => crate::assistant::codex_errand_thread(),
+            };
+        }
+        let mut v = if let Some(perm) = lock(&self.inst(id).st).codex.perm.clone().or_else(|| self.codex_saved_perm(id)) {
             let (approval, sandbox, _) = perm_params(&perm);
             json!({ "approvalPolicy": approval, "sandbox": sandbox })
         } else if self.instances.opts(id).full_access {
@@ -763,6 +784,21 @@ impl Chat {
             }
         }
         merge(&mut v, p);
+        // 会话起之前已经选过模型或思考强度（助理派活 / 跑腿默认、草稿页预选）：建 thread 时就带上，不等第一轮 turn/start
+        let (chosen_model, chosen_effort) = {
+            let inst = self.inst(id);
+            let st = lock(&inst.st);
+            if st.model_set_at.is_some() { (st.model.clone(), st.effort.clone()) } else { (None, None) }
+        };
+        if let Some(m) = chosen_model {
+            v["model"] = json!(profile.remote(&m));
+        }
+        if let Some(e) = chosen_effort {
+            if !v["config"].is_object() {
+                v["config"] = json!({});
+            }
+            v["config"]["model_reasoning_effort"] = json!(e);
+        }
         v
     }
 
@@ -808,6 +844,16 @@ impl Chat {
     /// 终端标签是普通 shell，和对话没有关系：里面跑着什么都不管
     pub(super) async fn codex_ready(&self, _id: &str) -> Result<Arc<AppServer>, LocalError> {
         self.codex_server().await
+    }
+
+    /// 如果 Codex app-server 正在运行，顺便通知它退出登录（让对话页里的状态立即更新）
+    pub async fn codex_logout_server(&self) {
+        let server = self.codex.server.lock().await.as_ref().filter(|s| s.alive()).cloned();
+        if let Some(s) = server {
+            if let Err(e) = s.call("account/logout", json!({})).await {
+                tracing::debug!(error = ?e, "codex app-server account/logout 失败");
+            }
+        }
     }
 
     /// 让这个终端的 thread 在当前 app-server 里加载着（打开对话、发消息、回答之前调用）。
@@ -941,6 +987,9 @@ impl Chat {
         st.title = t["name"].as_str().filter(|s| !s.is_empty()).map(String::from).or(st.title.take());
         st.version = t["cliVersion"].as_str().map(String::from).or(st.version.take());
         st.codex.cwd = t["cwd"].as_str().map(String::from).or(st.codex.cwd.take());
+        if st.codex.perm.is_none() {
+            st.codex.perm = crate::assistant::errand_mode(&self.store, &inst.id).or_else(|| self.codex_saved_perm(&inst.id));
+        }
         st.mode = st.codex.perm.clone().or_else(|| perm_of(&r["approvalPolicy"], &r["sandbox"]));
         st.error = None;
         // 后台 resume 在路上时，如果这段对话已经收到了更新的实时状态（比如刚跑完发了 turn/completed），不再拿旧快照盖回去
@@ -1443,6 +1492,17 @@ impl Chat {
                 Verdict::Ask | Verdict::Pass => {}
             }
         }
+        // 群里提问：闸门以外的（提问、填表、多给权限）一律不给，从不让用户审批
+        if crate::assistant::is_ask(&self.store, &inst.id) {
+            let none = match (kind, tool) {
+                ("question", _) => json!({ "answers": {} }),
+                ("elicitation", _) => json!({ "action": "decline" }),
+                (_, "permissions") => json!({ "permissions": {} }),
+                _ => json!({ "decision": "decline" }),
+            };
+            let _ = server.respond(rid, none).await;
+            return;
+        }
         // 命令规则（docs/PLAN_2026-10-27.md §3.2）：Codex 只在它自己来问时能用上。拒绝的替用户拒绝，并告诉它为什么
         let cmd = p["command"].as_str().filter(|_| tool == "Bash").unwrap_or_default();
         let guard = match Some(cmd).filter(|c| !c.is_empty()).and_then(|c| crate::guard::check(&crate::guard::load(&self.store), c)) {
@@ -1455,7 +1515,7 @@ impl Chat {
         };
         // 照会话现在的权限模式替用户放（助理派出去的会话那几档；一轮里换了模式也按新的，见 auto_accept）。命令规则要确认的不放
         if (kind == "permission" || what == MCP_CALL) && guard.is_none() {
-            let perm = lock(&inst.st).codex.perm.clone().unwrap_or_default();
+            let perm = lock(&inst.st).codex.perm.clone().or_else(|| crate::assistant::errand_mode(&self.store, &inst.id)).unwrap_or_default();
             let root = self.codex_current_cwd(&inst.id).map(PathBuf::from).unwrap_or_default();
             if auto_accept(&perm, what, &input, &root) {
                 let _ = server.respond(rid, accept_result(what, &input)).await;
@@ -1781,6 +1841,7 @@ impl Chat {
         // 刚开的对话（上面才 thread/start）这时才知道模型，再取一次——以前只有大脑再取，普通对话的第一轮就没带这段说明，
         // 模型照 Codex 自带的说法把问题写成文字，对话页不弹提问框
         let mut current = current.or_else(|| lock(&inst.st).actual_model.clone());
+        let effort = effort.or_else(|| lock(&inst.st).effort.clone());
         // 还是不知道（终端里的 TUI 开的对话、没 resume 过）：问一下 app-server
         if model.is_none() && current.is_none() {
             if let Ok(r) = server.call("thread/read", json!({ "threadId": thread })).await {
@@ -1812,11 +1873,21 @@ impl Chat {
             // 权限只由助理的权限模式定（沙箱挡下来的来问时过闸门）
             params["approvalPolicy"] = json!("on-request");
             params["sandboxPolicy"] = crate::assistant::codex_sandbox(crate::assistant::settings(&self.store).mode).1;
-        } else if crate::assistant::is_errand(&self.store, id) {
-            // 跑腿：只读沙箱，要写、要联网的来问时过闸门（见 assistant::codex_errand_thread）
+        } else if crate::assistant::is_ask(&self.store, id) {
+            // 群里提问：只读沙箱，要写、要联网的来问时过闸门
             params["approvalPolicy"] = json!("on-request");
             params["sandboxPolicy"] = crate::assistant::codex_sandbox(crate::assistant::Mode::ReadOnly).1;
-        } else if let Some(perm) = lock(&inst.st).codex.perm.clone() {
+        } else if crate::assistant::is_errand(&self.store, id) {
+            // 跑腿：用户在设置里给这种引擎选了默认权限（或手动切过）就按选的，没选时固定只读沙箱、来问时过闸门
+            if let Some(perm) = lock(&inst.st).codex.perm.clone().or_else(|| crate::assistant::errand_mode(&self.store, id)) {
+                let (approval, _, sandbox) = perm_params(&perm);
+                params["approvalPolicy"] = approval;
+                params["sandboxPolicy"] = sandbox;
+            } else {
+                params["approvalPolicy"] = json!("on-request");
+                params["sandboxPolicy"] = crate::assistant::codex_sandbox(crate::assistant::Mode::ReadOnly).1;
+            }
+        } else if let Some(perm) = lock(&inst.st).codex.perm.clone().or_else(|| self.codex_saved_perm(id)) {
             let (approval, _, sandbox) = perm_params(&perm);
             params["approvalPolicy"] = approval;
             params["sandboxPolicy"] = sandbox;
@@ -2094,9 +2165,14 @@ impl Chat {
                 if !PERMS.contains(&value) {
                     return Err(LocalError::invalid("value", "invalid"));
                 }
-                // 助理的大脑：权限由助理的权限模式定（助理页上换）
-                if inst.brain.load(Ordering::Relaxed) || crate::assistant::is_gated(&self.store, id) {
+                // 助理的大脑、群里提问：权限由助理固定；跑腿允许用户在会话里手动切换
+                if inst.brain.load(Ordering::Relaxed) || crate::assistant::is_brain(&self.store, id) || crate::assistant::is_ask(&self.store, id) {
                     return Err(LocalError::new("CHAT_MODE_UNAVAILABLE"));
+                }
+                if crate::assistant::is_errand(&self.store, id) {
+                    crate::assistant::set_errand_mode(&self.store, id, value);
+                } else {
+                    let _ = self.store.set(&perm_key(id), &value.to_string());
                 }
                 st.codex.perm = Some(value.to_string());
                 st.mode = Some(value.to_string());
@@ -2486,6 +2562,12 @@ impl Chat {
         match method {
             "item/completed" if p["item"]["type"] == "agentMessage" => *text = p["item"]["text"].as_str().unwrap_or_default().to_string(),
             "turn/completed" => {
+                // 这一轮出错了、没有回答：带上原因（开头 \u{1} 标出是错误，旁聊显示出来；起名时解析不出标题就当没起）
+                if text.is_empty() {
+                    if let Some(e) = p["turn"]["error"]["message"].as_str().filter(|e| !e.is_empty()) {
+                        *text = format!("\u{1}{e}");
+                    }
+                }
                 if let Some(tx) = done.take() {
                     let _ = tx.send(std::mem::take(text));
                 }
@@ -2495,28 +2577,58 @@ impl Chat {
         true
     }
 
-    /// 旁问（TUI 的 /side）：把这段对话复制成一个临时对话（ephemeral、只读、不审批），问一句，拿到回答就丢掉，
-    /// 原对话不受影响、正在跑也不打断。事件借用起名的通道（[`Chat::codex_title_note`]）收
+    /// 旁聊（TUI / 桌面端的 /side）：第一次问时把这段对话复制成一个临时对话（ephemeral、只读、不审批），之后的问题
+    /// 接着在这个临时对话里问（能追问），原对话不受影响、正在跑也不打断；关掉旁聊（[`Chat::codex_side_close`]）才丢掉。
+    /// 事件借用起名的通道（[`Chat::codex_title_note`]）收
     pub(super) async fn codex_side(&self, id: &str, question: &str) -> Result<Value, LocalError> {
         let server = self.codex_ready(id).await?;
         let thread = lock(&self.inst(id).st).binding.as_ref().map(|b| b.session_id.clone()).ok_or_else(|| LocalError::new("CHAT_NOTHING_TO_FORK"))?;
-        let r = server.call("thread/fork", json!({ "threadId": thread, "ephemeral": true, "sandbox": "read-only", "approvalPolicy": "never" })).await?;
-        let tmp = r["thread"]["id"].as_str().filter(|s| !s.is_empty()).ok_or_else(|| LocalError::new("CODEX_REQUEST_FAILED"))?.to_string();
+        // 还开着、分叉自同一个对话、还是这个 app-server 的：接着问
+        let kept = lock(&self.codex.sides)
+            .get(id)
+            .filter(|(parent, _, srv)| *parent == thread && srv.upgrade().is_some_and(|s| Arc::ptr_eq(&s, &server)))
+            .map(|(_, tmp, _)| tmp.clone());
+        let (tmp, first) = match kept {
+            Some(t) => (t, false),
+            None => {
+                self.codex_side_close(id).await;
+                let r = server.call("thread/fork", json!({ "threadId": thread, "ephemeral": true, "excludeTurns": true, "sandbox": "read-only", "approvalPolicy": "never" })).await?;
+                let tmp = r["thread"]["id"].as_str().filter(|s| !s.is_empty()).ok_or_else(|| LocalError::new("CODEX_REQUEST_FAILED"))?.to_string();
+                lock(&self.codex.sides).insert(id.to_string(), (thread.clone(), tmp.clone(), Arc::downgrade(&server)));
+                (tmp, true)
+            }
+        };
         let (tx, rx) = oneshot::channel();
         lock(&self.codex.titling).insert(tmp.clone(), (String::new(), Some(tx)));
-        let prompt = format!("<side_question>\nThis is a quick side question; answer it briefly from the conversation so far. Do not run tools or change files.\n\n{question}\n</side_question>");
+        let prompt = if first {
+            format!("<side_question>\nThis is a side chat branched from the conversation above. Answer from the conversation so far; keep it focused. Do not change files.\n\n{question}\n</side_question>")
+        } else {
+            question.to_string()
+        };
         let started = server.call("turn/start", json!({ "threadId": tmp, "input": text_input(&prompt, &[]) })).await;
         let answer = match started {
             Ok(_) => tokio::time::timeout(Duration::from_secs(600), rx).await.ok().and_then(|r| r.ok()),
             Err(e) => {
                 lock(&self.codex.titling).remove(&tmp);
-                let _ = server.call("thread/unsubscribe", json!({ "threadId": tmp })).await;
+                self.codex_side_close(id).await;
                 return Err(e.into());
             }
         };
         lock(&self.codex.titling).remove(&tmp);
-        let _ = server.call("thread/unsubscribe", json!({ "threadId": tmp })).await;
-        Ok(json!({ "response": answer.unwrap_or_default(), "synthetic": false }))
+        match answer {
+            Some(a) if a.starts_with('\u{1}') => Err(LocalError::new("CODEX_REQUEST_FAILED").with("detail", a[1..].chars().take(500).collect::<String>())),
+            Some(a) => Ok(json!({ "response": a, "synthetic": false })),
+            None => Err(LocalError::new("CODEX_REQUEST_FAILED").with("detail", "timed out")),
+        }
+    }
+
+    /// 关掉旁聊：放掉临时对话
+    pub(super) async fn codex_side_close(&self, id: &str) {
+        let Some((_, tmp, srv)) = lock(&self.codex.sides).remove(id) else { return };
+        lock(&self.codex.titling).remove(&tmp);
+        if let Some(server) = srv.upgrade().filter(|s| s.alive()) {
+            let _ = server.call("thread/unsubscribe", json!({ "threadId": tmp })).await;
+        }
     }
 
     /// 对话界面发的消息没经过 TUI，Codex 不会给对话起名（起名是 TUI 做的：看到第一句话就开一个临时对话让模型起，
@@ -3417,6 +3529,112 @@ mod tests {
         assert!(side_thread(&json!({ "ephemeral": true })));
         assert!(side_thread(&json!({ "threadSource": "thread_title" })));
         assert!(!side_thread(&json!({ "threadSource": "user", "source": "vscode" })));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn codex_errand_and_preselected_defaults_apply_to_thread_opts() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let workdir = dir.path().display().to_string();
+        let paths = crate::paths::Paths::discover(Some(home.path().to_path_buf())).unwrap();
+        let store = Arc::new(crate::store::Store::memory().unwrap());
+        let instances = crate::instances::Instances::new(store.clone(), paths.clone());
+        let mk = |name: &str| crate::instances::Input { name: Some(name.into()), workdir: Some(workdir.clone()), launch: Some("codex".into()), chat_ui: Some(true), ..Default::default() };
+        let id_brain = instances.create(mk("brain")).await.unwrap().row.id;
+        let id_ro = instances.create(mk("e-ro")).await.unwrap().row.id;
+        let id_full = instances.create(mk("e-full")).await.unwrap().row.id;
+        crate::assistant::set_brain(&store, crate::assistant::Engine::Codex, &id_brain).unwrap();
+        crate::assistant::errand_update(&store, |m| {
+            m.insert(id_ro.clone(), crate::assistant::Errand { title: "查".into(), project: workdir.clone(), started_at: 1, mode: None });
+            m.insert(id_full.clone(), crate::assistant::Errand { title: "查告警".into(), project: workdir.clone(), started_at: 2, mode: Some("fullAccess".into()) });
+        });
+        let chat = Chat::new(store.clone(), paths.clone(), instances.clone());
+
+        // 大脑依然不允许在会话里切换权限
+        assert!(chat.setting(&id_brain, "mode", "fullAccess").await.is_err());
+
+        // 未固定权限的跑腿启动时保持只读沙箱 + 助理闸门，但允许用户在会话里手动切换（且立刻放行等着的审批）
+        let ro_opts = chat.codex_thread_opts(&id_ro);
+        assert_eq!(ro_opts["sandbox"], "read-only");
+        assert_eq!(ro_opts["approvalPolicy"], "on-request");
+        assert_eq!(ro_opts["developerInstructions"], crate::assistant::ERRAND_RULES);
+        assert!(crate::assistant::is_gated(&store, &id_ro));
+        let (tx, rx) = oneshot::channel();
+        {
+            let inst = chat.inst(&id_ro);
+            let mut st = lock(&inst.st);
+            st.phase = Phase::Approval;
+            st.pending = Some(Pending {
+                id: 1,
+                at: Instant::now(),
+                tool: "Bash".into(),
+                kind: "permission",
+                input: json!({ "command": "lark-cli im +messages-search" }),
+                suggestions: Value::Null,
+                guard: None,
+                tx: Some(tx),
+            });
+        }
+        chat.setting(&id_ro, "mode", "fullAccess").await.unwrap();
+        assert!(!crate::assistant::is_gated(&store, &id_ro));
+        assert_eq!(crate::assistant::errand_mode(&store, &id_ro).as_deref(), Some("fullAccess"));
+        assert_eq!(rx.await.unwrap(), json!({ "decision": "accept" }).to_string());
+        let ro_after = chat.codex_thread_opts(&id_ro);
+        assert_eq!(ro_after["approvalPolicy"], "never");
+        assert_eq!(ro_after["sandbox"], "danger-full-access");
+        assert_eq!(ro_after["developerInstructions"], crate::assistant::ERRAND_RULES);
+
+        // 固定了权限、模型、思考强度的跑腿：建 thread 时就带上，且不会被 thread/start 默认的 medium 盖掉
+        assert_eq!(chat.apply_mode(&id_full, "fullAccess").await.unwrap(), "fullAccess");
+        chat.apply_model(&id_full, "gpt-6.2-sol").await.unwrap();
+        chat.apply_effort(&id_full, "high").await.unwrap();
+        let opts = chat.codex_thread_opts(&id_full);
+        assert_eq!(opts["developerInstructions"], crate::assistant::ERRAND_RULES);
+        assert_eq!(opts["approvalPolicy"], "never");
+        assert_eq!(opts["sandbox"], "danger-full-access");
+        assert_eq!(opts["model"], "gpt-6.2-sol");
+        assert_eq!(opts["config"]["model_reasoning_effort"], "high");
+
+        let inst = chat.inst(&id_full);
+        chat.codex_loaded(
+            &inst,
+            &json!({
+                "thread": { "id": "t-full", "cwd": workdir, "status": { "type": "idle" } },
+                "model": "gpt-6.2-sol",
+                "reasoningEffort": "medium",
+                "approvalPolicy": "never",
+                "sandbox": { "type": "dangerFullAccess" }
+            }),
+            1,
+            None,
+        );
+        let st = lock(&inst.st);
+        assert_eq!(st.mode.as_deref(), Some("fullAccess"));
+        assert_eq!(st.model.as_deref(), Some("gpt-6.2-sol"));
+        assert_eq!(st.effort.as_deref(), Some("high"));
+        drop(st);
+
+        // 普通会话从 full_access=true 降成 readOnly 后，重启（新建 Chat 实例）仍保持 readOnly，不回退到 full_access；forget 时清理
+        let id_norm = instances
+            .create(crate::instances::Input {
+                name: Some("norm".into()),
+                workdir: Some(workdir.clone()),
+                launch: Some("codex".into()),
+                chat_ui: Some(true),
+                full_access: Some(true),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .row
+            .id;
+        chat.setting(&id_norm, "mode", "readOnly").await.unwrap();
+        let chat2 = Chat::new(store.clone(), paths, instances);
+        let opts2 = chat2.codex_thread_opts(&id_norm);
+        assert_eq!(opts2["approvalPolicy"], "on-request");
+        assert_eq!(opts2["sandbox"], "read-only");
+        chat2.forget(&id_norm);
+        assert!(store.get::<String>(&perm_key(&id_norm)).unwrap().is_none());
     }
 
     /// 回放真录的 Codex app-server 通知（testdata/replay/codex_*.json）：喂进真的 Chat → 看板 → 助理的看守判断 → 送进大脑的事件。

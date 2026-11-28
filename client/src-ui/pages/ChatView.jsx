@@ -71,6 +71,7 @@ import {
   Paperclip,
   MessageSquarePlus,
   MessageCircle,
+  MessagesSquare,
   UserRound,
   FolderSearch,
   CircleCheck,
@@ -90,6 +91,7 @@ import { isTouch } from '../shared/KeyBar.jsx';
 import { chatEventsMode, onChatEventsMode, subscribeChat } from '../shared/chatEvents.js';
 import { spinnerText } from '../shared/spinner.js';
 import { pathResolver } from '../files/pathLinks.js';
+import { openViewTab, sizeable, SizeButtons, sizeKey, useFullHost } from '../files/viewSize.jsx';
 import {
   CODEX_ACTIONS,
   CODEX_COMMANDS,
@@ -1138,7 +1140,7 @@ function Rows({ id, items, live, limit = 0, trace = false, attention = false }) 
         // 这一轮用了多久跟在复制按钮后面（不再单独占一行）
         // 有处理过程的：用时已经在处理过程的标题上
         const turn = next?.item?.k === 'turn' && !traced.has(n + 1) ? next.item : null;
-        return <ReplyEnd key={r.key} id={id} text={r.block.text} all={all} turn={turn} />;
+        return <ReplyEnd key={r.key} text={r.block.text} all={all} turn={turn} />;
       }
       case 'thinking':
         return <Thinking key={r.key} text={r.block.text} />;
@@ -1182,26 +1184,23 @@ function Rows({ id, items, live, limit = 0, trace = false, attention = false }) 
   ];
 }
 
-/** 一段回复的最后一段文字，下面是复制和用时；手机上长按这一段弹出复制菜单 */
-function ReplyEnd({ id, text, all, turn }) {
+/** 一段回复的最后一段文字，下面是复制和用时；手机上长按就是系统自己的选字（拖手柄），选好了底部出操作条（SelectionActions） */
+function ReplyEnd({ text, all, turn }) {
   const { t } = useT();
   const { links, fileUrl, paths } = useContext(ArtifactCtx);
-  const [sheet, setSheet] = useState(false);
-  const press = useLongPress(() => setSheet(true));
   const toast = useToast();
   // 电脑上右键：复制整段回复 / 引用
   const rc = useContextMenu(() => [
     { icon: Copy, label: t('chat.copy_all'), onClick: () => copyText(all).then((ok) => ok && toast(t('action.copied'))) },
   ]);
   return (
-    <div className="chat-reply-end" {...press} {...rc.bind}>
+    <div className="chat-reply-end" {...rc.bind}>
       {rc.menu}
       <Markdown text={text} links={links} fileUrl={fileUrl} paths={paths} />
       <div className="chat-reply-acts">
         <CopyButton text={all} label={false} variant="plain" />
         {turn && <span className="chat-turn">{t('chat.turn', { s: Math.max(1, Math.round(turn.ms / 1000)) })}</span>}
       </div>
-      {sheet && <MessageSheet text={all} onQuote={id ? (q) => window.dispatchEvent(new CustomEvent(`ll-chat-quote:${id}`, { detail: { quote: q, note: '' } })) : null} onClose={() => setSheet(false)} />}
     </div>
   );
 }
@@ -1515,7 +1514,7 @@ function previewTarget(href) {
   const focus = line ? { from: line, to: Math.max(line, Number(u.searchParams.get('to')) || line) } : undefined;
   if (m[2] !== 'chat/artifact') return { ep: fileEndpoints(id), path, focus };
   const art = (p, dl) => `/instances/${id}/chat/artifact?path=${encodeURIComponent(p)}${dl ? '&download=1' : ''}`;
-  return { ep: { preview: (p) => art(p), download: (p) => art(p, true), plain: plainLinksWork() }, path };
+  return { ep: { preview: (p) => art(p), download: (p) => art(p, true), plain: plainLinksWork() }, path, artifact: id };
 }
 
 /** 路径用的分隔符、文件名（Windows 路径里只有反斜杠） */
@@ -1553,16 +1552,37 @@ function conversationFiles(items, cwd) {
 const FILE_TOOLS = new Set(['Read', 'Edit', 'MultiEdit', 'Write', 'NotebookEdit']);
 
 /**
- * 对话里点开的文件：手机上整屏（返回键关）；电脑上（够宽时）停靠在对话右边，可以一边看一边聊，最多开 8 个标签。
+ * 对话里点开的文件：手机上整屏（返回键关）；电脑上停靠在对话右边，可以一边看一边聊，最多开 8 个标签。
+ * 电脑上三档大小（docs/FILE_VIEWER_LAYOUT_2026-11-27.md）：停靠（左边能拖宽）/ 放大（对话缩成 360 px 的窄栏）/
+ * 全屏（盖住整个页面）；还能在新标签页打开（/view）。Esc 一档一档退：全屏 → 原来那档 → 停靠 → 关掉。
  * 文字带行号，`focus` 那几行标出来并滚过去（读的那段、改的地方）；能复制路径、在“文件”标签里显示；
  * `list`（同一组文件：改动列表，或者对话里读过、改过的文件）里有它时，标题栏和 ← → 前后翻。
  */
-function FileViewer({ tabs, cur, docked, onTarget, onPick, onCloseTab, onClose }) {
+function FileViewer({ tabs, cur, docked, size, roomy, onSize, dockW, onDockW, onTarget, onPick, onCloseTab, onClose }) {
   const { t } = useT();
   const confirm = useConfirm();
   const { files } = useContext(PreviewCtx);
   const box = useRef(null);
   const tab = tabs.find((x) => x.key === cur) ?? tabs[tabs.length - 1];
+  const full = docked && size === 'full';
+  const fh = useFullHost(full);
+  const prevSize = useRef('dock');
+  const setSize = useCallback(
+    (next) => {
+      if (next === 'full' && size !== 'full') prevSize.current = size;
+      onSize(next);
+    },
+    [size, onSize],
+  );
+  const toggle = useCallback((which) => setSize(size === which ? (which === 'full' ? prevSize.current : 'dock') : which), [size, setSize]);
+  // 换了大小（全屏挪进挪出会丢焦点）：焦点放回查看器，Esc、← → 接着能用
+  const sizeSeen = useRef(size);
+  useEffect(() => {
+    if (sizeSeen.current === size) return;
+    sizeSeen.current = size;
+    const el = box.current;
+    if (docked && el && !el.contains(document.activeElement)) el.focus({ preventScroll: true });
+  }, [size, docked]);
   // 返回键关掉文件查看器（docs/REMOTE_UX_2026-11-07.md §7.2）：只有整屏的时候
   useLayer(!docked, onClose);
   const dirty = useRef(new Map());
@@ -1583,13 +1603,23 @@ function FileViewer({ tabs, cur, docked, onTarget, onPick, onCloseTab, onClose }
   };
   useEffect(() => {
     const key = (e) => {
-      // 停靠时只管焦点在查看器里的按键（对话输入框里的 ← → Esc 照常）
-      if (docked && !box.current?.contains(e.target)) return;
+      // 停靠时只管焦点在查看器里的按键（对话输入框里的 ← → Esc 照常）；全屏时盖住了整个页面，焦点在哪都算
+      if (docked && !full && !box.current?.contains(e.target)) return;
       if (e.key === 'Escape') {
-        if (e.target.closest?.('.cm-panels, .fv-goto')) return;
+        if (e.target.closest?.('.cm-panels, .fv-goto, .menu-pop-list, .modal-backdrop')) return;
         e.preventDefault();
         e.stopPropagation();
-        onClose();
+        // 一档一档退
+        if (full) setSize(prevSize.current);
+        else if (docked && size === 'wide' && roomy) setSize('dock');
+        else onClose();
+        return;
+      }
+      const k = docked && sizeKey(e);
+      if (k && (k === 'full' || roomy)) {
+        e.preventDefault();
+        e.stopPropagation();
+        toggle(k);
         return;
       }
       // ← →：前后翻（在输入框里、编辑器里、按着修饰键时不管）
@@ -1601,7 +1631,7 @@ function FileViewer({ tabs, cur, docked, onTarget, onPick, onCloseTab, onClose }
     };
     window.addEventListener('keydown', key, true);
     return () => window.removeEventListener('keydown', key, true);
-  }, [onClose, go, list, docked]);
+  }, [onClose, go, list, docked, full, size, roomy, setSize, toggle]);
   const extra = (
     <>
       {list && list.length > 1 && (
@@ -1633,6 +1663,15 @@ function FileViewer({ tabs, cur, docked, onTarget, onPick, onCloseTab, onClose }
           <FolderSearch size={16} />
         </button>
       )}
+      {docked && (
+        <SizeButtons
+          wide={size === 'wide'}
+          onWide={roomy ? () => toggle('wide') : undefined}
+          full={full}
+          onFull={() => toggle('full')}
+          onNewTab={() => openViewTab({ id: tab.target.artifact ?? ep.id, artifact: Boolean(tab.target.artifact), path, focus: tab.target.focus, diff: tab.target.diff })}
+        />
+      )}
     </>
   );
   const strip = tabs.length > 1 && (
@@ -1651,7 +1690,16 @@ function FileViewer({ tabs, cur, docked, onTarget, onPick, onCloseTab, onClose }
   );
   // 每个标签的预览都留着（编辑到一半切走再切回来还在），看不见的不动
   const body = (
-    <div className={docked ? 'chat-file-dock' : 'chat-fv-modal'} ref={box} role={docked ? 'complementary' : undefined} aria-label={fileName(path)} tabIndex={docked ? -1 : undefined}>
+    <div
+      className={docked ? `chat-file-dock ${full ? 'chat-file-full' : ''}` : 'chat-fv-modal'}
+      ref={box}
+      role={docked ? (full ? 'dialog' : 'complementary') : undefined}
+      aria-modal={full || undefined}
+      aria-label={fileName(path)}
+      tabIndex={docked ? -1 : undefined}
+      style={docked && size === 'dock' && dockW ? { '--fv-w': `${dockW}px` } : undefined}
+    >
+      {docked && size === 'dock' && <DockResizer box={box} width={dockW} onWidth={onDockW} onWide={() => setSize('wide')} />}
       {strip}
       {tabs.map((x) => {
         const on = x.key === tab.key;
@@ -1675,7 +1723,13 @@ function FileViewer({ tabs, cur, docked, onTarget, onPick, onCloseTab, onClose }
       })}
     </div>
   );
-  if (docked) return body;
+  if (docked)
+    return (
+      <>
+        {fh.slot}
+        {fh.portal(body)}
+      </>
+    );
   return createPortal(
     <div className="chat-file-viewer" role="dialog" aria-modal="true" aria-label={fileName(path)} onClick={(e) => e.target === e.currentTarget && onClose()}>
       {body}
@@ -1684,8 +1738,8 @@ function FileViewer({ tabs, cur, docked, onTarget, onPick, onCloseTab, onClose }
   );
 }
 
-/** 电脑上够宽（停靠查看器放得下）：不是触屏、窗口至少 1000 px */
-function useDockable() {
+/** 电脑上够宽（停靠查看器旁边还放得下对话）：不是触屏、窗口至少 1000 px；不够宽时停靠当放大用 */
+function useRoomy() {
   const q = '(min-width: 1000px)';
   const [ok, setOk] = useState(() => !touchUiDevice && window.matchMedia?.(q).matches);
   useEffect(() => {
@@ -1701,6 +1755,63 @@ function useDockable() {
 const touchUiDevice = typeof window !== 'undefined' && Boolean(window.matchMedia?.('(hover: none) and (pointer: coarse)').matches);
 const TABS_MAX = 8;
 let tabSeq = 0;
+const DOCK_W_KEY = 'll-chat-fv-w';
+const readDockW = () => {
+  try {
+    return Number(localStorage.getItem(DOCK_W_KEY)) || null;
+  } catch {
+    return null;
+  }
+};
+
+/** 停靠的查看器左边那条分隔线：拖宽、拖窄（记住宽度），双击放大。最窄 360 px，最宽给对话留 360 px（CSS 里再夹一次） */
+function DockResizer({ box, width, onWidth, onWide }) {
+  const { t } = useT();
+  const view = () => box.current?.parentElement?.closest('.chat-view') ?? box.current?.parentElement;
+  const clamp = (w) => {
+    const total = view()?.getBoundingClientRect().width ?? window.innerWidth;
+    return Math.round(Math.min(Math.max(360, w), Math.max(360, total - 360)));
+  };
+  const start = (e) => {
+    if (e.button !== 0) return;
+    e.preventDefault();
+    const el = box.current;
+    if (!el) return;
+    const right = el.getBoundingClientRect().right;
+    let last = null;
+    const move = (ev) => {
+      last = clamp(right - ev.clientX);
+      el.style.setProperty('--fv-w', `${last}px`);
+    };
+    const up = () => {
+      window.removeEventListener('pointermove', move);
+      window.removeEventListener('pointerup', up);
+      document.body.classList.remove('fv-resizing');
+      if (last) onWidth(last);
+    };
+    document.body.classList.add('fv-resizing');
+    window.addEventListener('pointermove', move);
+    window.addEventListener('pointerup', up);
+  };
+  const cur = () => width ?? Math.round(box.current?.getBoundingClientRect().width ?? 480);
+  return (
+    <div
+      className="fv-resize"
+      role="separator"
+      aria-orientation="vertical"
+      aria-label={t('fv.resize')}
+      title={t('fv.resize_hint')}
+      aria-valuenow={width ?? undefined}
+      tabIndex={0}
+      onPointerDown={start}
+      onDoubleClick={onWide}
+      onKeyDown={(e) => {
+        if (e.key === 'ArrowLeft') onWidth(clamp(cur() + 32));
+        else if (e.key === 'ArrowRight') onWidth(clamp(cur() - 32));
+      }}
+    />
+  );
+}
 
 /** 复制文件的完整路径（图标按钮，复制好了打个勾） */
 function CopyPath({ path }) {
@@ -1728,7 +1839,18 @@ function usePreviewLinks() {
   const [tabs, setTabs] = useState([]);
   const [cur, setCur] = useState(null);
   const [image, setImage] = useState(null);
-  const docked = useDockable();
+  // 电脑上总是停靠（窗口不够宽时按放大排）；手机上整屏
+  const docked = !touchUiDevice;
+  const roomy = useRoomy();
+  const [size0, setSize] = useState('dock');
+  const size = size0 === 'dock' && !roomy ? 'wide' : size0;
+  const [dockW, setDockW0] = useState(readDockW);
+  const setDockW = useCallback((w) => {
+    setDockW0(w);
+    try {
+      localStorage.setItem(DOCK_W_KEY, String(w));
+    } catch {}
+  }, []);
   // 打开一个文件：已经开着就切过去（要标的行变了就重新打开那个标签），没开就加一个标签（电脑上最多 8 个，手机上只有一个）
   const open = useCallback(
     (target) => {
@@ -1759,8 +1881,21 @@ function usePreviewLinks() {
       }),
     [cur],
   );
+  // 电脑上 Ctrl / ⌘ 点、中键点：在新标签页的查看页（/view）打开，不是打开裸文件
+  const newTab = useCallback((e) => {
+    if (!sizeable || e.defaultPrevented || e.shiftKey || e.altKey) return false;
+    if (!(e.button === 1 || (e.button === 0 && (e.metaKey || e.ctrlKey)))) return false;
+    const a = e.target.closest?.('a[href]');
+    const tgt = a && previewTarget(a.getAttribute('href'));
+    if (!tgt) return false;
+    e.preventDefault();
+    openViewTab({ id: tgt.artifact ?? tgt.ep.id, artifact: Boolean(tgt.artifact), path: tgt.path, focus: tgt.focus });
+    return true;
+  }, []);
+  const onAuxClick = useCallback((e) => void newTab(e), [newTab]);
   const onClick = useCallback(
     (e) => {
+      if (newTab(e)) return;
       if (e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
       // 停靠的查看器里的点击不管（预览里的 Markdown 有自己的链接）
       if (e.target.closest?.('.chat-file-dock')) return;
@@ -1780,11 +1915,13 @@ function usePreviewLinks() {
       if (VIEW_IMAGE.test(tgt.path)) setImage({ url: tgt.ep.download(tgt.path), name: fileName(tgt.path) });
       else open(tgt);
     },
-    [open],
+    [open, newTab],
   );
   const close = useCallback(() => {
     setTabs([]);
     setCur(null);
+    // 下次打开从停靠开始（全屏 / 放大是这一次看的时候选的）
+    setSize('dock');
   }, []);
   const closeTab = useCallback((key) => {
     setTabs((list) => {
@@ -1794,14 +1931,17 @@ function usePreviewLinks() {
     });
   }, []);
   const closeImage = useCallback(() => setImage(null), []);
-  const shown = tabs.length > 0 && <FileViewer tabs={tabs} cur={cur} docked={docked} onTarget={onTarget} onPick={setCur} onCloseTab={closeTab} onClose={close} />;
+  const shown = tabs.length > 0 && (
+    <FileViewer tabs={tabs} cur={cur} docked={docked} size={size} roomy={roomy} onSize={setSize} dockW={dockW} onDockW={setDockW} onTarget={onTarget} onPick={setCur} onCloseTab={closeTab} onClose={close} />
+  );
   const viewer = (
     <>
       {!docked && shown}
       {image && <ImageViewer images={[image]} onClose={closeImage} />}
     </>
   );
-  return { onClick, open, viewer, dock: docked ? shown : null };
+  // 查看器开着时对话怎么排：放大 = 对话缩成窄栏（chat-view 的 data-fv）
+  return { onClick, onAuxClick, open, viewer, dock: docked ? shown : null, size: docked && tabs.length > 0 ? size : null };
 }
 const VIEW_IMAGE = /\.(png|jpe?g|gif|webp|bmp|ico|avif)$/i;
 
@@ -1959,7 +2099,9 @@ function QuoteMarks({ id, list, inner }) {
 }
 
 /**
- * 在 AI 的回复里选中文字：选区上方弹一个气泡“评论 / 问这段 / 复制”，箭头指着选区；上方放不下才放到下方。
+ * 在 AI 的回复里选中文字：选区上方弹一个气泡“评论 / 问这段 / 旁聊 / 复制”，箭头指着选区；上方放不下才放到下方。
+ * 手机上：长按用系统的选字（拖手柄改范围），操作条贴在对话区底部（不和系统自己的复制菜单抢位置），按钮大一些。
+ * 旁聊：选的这段挂到右边旁聊的输入框上方，在旁边问，不进主对话。
  * 评论：引用挂到输入框上方（可以挂几条，带序号，原文里那段一直高亮），评论就写在那条里，随时改、删；
  * 和下一句一起发出去（Composer 收 `ll-chat-quote:{id}`）。
  */
@@ -1968,13 +2110,18 @@ function SelectionActions({ id, list, disabled }) {
   const toast = useToast();
   const [sel, setSel] = useState(null);
   const down = useRef(false);
+  // 手机上点操作条的按钮，系统会先把选区清掉；刚按过就别跟着把操作条收了
+  const pressing = useRef(0);
+  const touch = touchUiDevice;
   useEffect(() => {
     const root = list.current;
     if (!root || disabled) return undefined;
     let timer = null;
     const update = () => {
       if (down.current) return;
-      setSel(quotableRange(list.current));
+      const next = quotableRange(list.current);
+      if (!next && Date.now() - pressing.current < 800) return;
+      setSel(next);
     };
     const later = () => {
       clearTimeout(timer);
@@ -2005,6 +2152,11 @@ function SelectionActions({ id, list, disabled }) {
     document.getSelection()?.removeAllRanges();
     setSel(null);
   };
+  const side = () => {
+    window.dispatchEvent(new CustomEvent(`ll-side-quote:${id}`, { detail: sel.text }));
+    document.getSelection()?.removeAllRanges();
+    setSel(null);
+  };
   const keep = (e) => e.preventDefault(); // 点按钮时不让选区消失
   const bar = useRef(null);
   const [pos, setPos] = useState(null);
@@ -2020,6 +2172,11 @@ function SelectionActions({ id, list, disabled }) {
       const box = root.getBoundingClientRect();
       const w = el.offsetWidth;
       const h = el.offsetHeight;
+      if (touch) {
+        // 贴在对话区底部，左右撑满
+        setPos({ left: box.left + 8, top: box.bottom - h - 8, width: box.width - 16, dock: true });
+        return;
+      }
       const gap = 10;
       const vw = document.documentElement.clientWidth;
       const minX = Math.max(8, box.left + 8);
@@ -2041,19 +2198,23 @@ function SelectionActions({ id, list, disabled }) {
       root?.removeEventListener('scroll', place);
       window.removeEventListener('resize', place);
     };
-  }, [sel, list]);
+  }, [sel, list, touch]);
   if (!sel) return null;
   return (
     <div
       ref={bar}
       className="chat-sel-bar"
-      data-side={pos?.above === false ? 'below' : 'above'}
-      style={pos ? { left: pos.left, top: pos.top, '--arrow-x': `${pos.arrow}px` } : { visibility: 'hidden', left: 0, top: 0 }}
+      data-side={pos?.dock ? 'dock' : pos?.above === false ? 'below' : 'above'}
+      data-touch={touch ? '' : undefined}
+      style={pos ? { left: pos.left, top: pos.top, width: pos.width, '--arrow-x': `${pos.arrow}px` } : { visibility: 'hidden', left: 0, top: 0 }}
       role="toolbar"
       aria-label={t('chat.sel_actions')}
       onMouseDown={keep}
+      onPointerDown={() => {
+        pressing.current = Date.now();
+      }}
     >
-      <span className="chat-sel-count">{t('chat.sel_count', { count: [...sel.text].length })}</span>
+      {!touch && <span className="chat-sel-count">{t('chat.sel_count', { count: [...sel.text].length })}</span>}
       <button type="button" onMouseDown={keep} onClick={() => add('note')}>
         <MessageSquarePlus size={15} aria-hidden="true" />
         {t('chat.sel_comment')}
@@ -2061,6 +2222,10 @@ function SelectionActions({ id, list, disabled }) {
       <button type="button" onMouseDown={keep} onClick={() => add('input')}>
         <MessageCircle size={15} aria-hidden="true" />
         {t('chat.sel_ask')}
+      </button>
+      <button type="button" onMouseDown={keep} onClick={side} title={t('chat.sel_side_hint')}>
+        <MessagesSquare size={15} aria-hidden="true" />
+        {t('chat.sel_side')}
       </button>
       <button
         type="button"
@@ -3389,7 +3554,8 @@ function ModeMenu({ id, status, onClose }) {
   // Codex：界面三档 + 助理派活用的两档（任何 Codex 会话都能用，Shift+Tab 只在三档里轮换）
   const choices = agentId === 'codex' ? [...CODEX_MODE_CHOICES, ...CODEX_DISPATCH_MODES] : MODE_CHOICES;
   const [busy, setBusy] = useState(null);
-  const ready = status?.phase === 'idle' || status?.phase === 'running';
+  // Codex 等待确认时也允许切权限：新模式允许的话后端会立刻放行当前卡着的审批
+  const ready = status?.phase === 'idle' || status?.phase === 'running' || (agentId === 'codex' && status?.phase === 'approval');
   const set = async (m) => {
     setBusy(m);
     try {
@@ -3943,20 +4109,6 @@ function Composer({ id, active, status, phase, touch, offline, models, usage, it
   // 立即发送：同步锁（连点两下只发一次，状态还没渲染出来时也挡得住）+ 转圈
   const nowLock = useRef(false);
   const [nowBusy, setNowBusy] = useState(false);
-  // /btw 旁问：不进对话、不打断这一轮，答完显示在输入框上面，关掉就没了（和终端里一样）
-  const [btw, setBtw] = useState(null);
-  const btwSeq = useRef(0);
-  const askBtw = async (question) => {
-    const n = ++btwSeq.current;
-    setBtw({ q: question, a: null });
-    try {
-      const r = await api.post(`/instances/${id}/chat/btw`, { question });
-      if (btwSeq.current === n) setBtw({ q: question, a: r?.response ?? '' });
-    } catch (e) {
-      if (btwSeq.current === n) setBtw(null);
-      toast(errorText(t, e), 'error');
-    }
-  };
   // 停手 0.3 秒存一次；页面要被收起、关掉时马上存
   // 正在发送的那段：输入框已经清空，但确认送到之前存着的仍是它（发送途中页面被回收也不丢）
   const inflight = useRef('');
@@ -4130,12 +4282,13 @@ function Composer({ id, active, status, phase, touch, offline, models, usage, it
       menuFor(action);
       return;
     }
-    // /btw：只有 stream-json 的 Claude 有（side_question），别的照原样送
-    const btwQ = ((agentId === 'claude' && caps?.sdk) || agentId === 'codex') && !images.length && !extra && typed.match(/^\/(?:btw|side)\s+([\s\S]+)/i)?.[1]?.trim();
+    // /btw、/side 问题：在右边的旁聊里问（不进对话、不打断这一轮）；只打命令不带问题的在上面 slashAction 里打开旁聊
+    const btwQ = !images.length && !extra && typed.match(/^\/(?:btw|side)\s+([\s\S]+)/i)?.[1]?.trim();
     if (btwQ) {
       setText('');
-      if (typed) rememberInput(typed);
-      askBtw(btwQ);
+      rememberInput(typed);
+      askSide(id, btwQ, t, toast, sideOf(id).quote);
+      onSide('btw');
       return;
     }
     // Codex 的 /review（不带参数）：先选审查什么
@@ -4501,6 +4654,7 @@ function Composer({ id, active, status, phase, touch, offline, models, usage, it
   const modeKnown = modeChoices.includes(status?.mode) || (agentId !== 'codex' && status?.mode === 'dontAsk') || (agentId === 'codex' && CODEX_DISPATCH_MODES.includes(status?.mode));
   const modeText = status?.mode ? t(`chat.mode_${modeKnown ? status.mode : 'other'}`, { mode: status.mode }) : t('chat.mode');
   const ready = phase === 'idle' || phase === 'running';
+  const modeReady = ready || (agentId === 'codex' && phase === 'approval');
   const showStop = running && !text.trim() && !files.length;
   const canSend = !!text.trim() || files.some((f) => f.path) || quotes.length > 0;
   // Codex 这段对话在另一个 Git 工作树里跑（/worktree、/new 选了新建）：输入框上标出来，点开换
@@ -4553,19 +4707,6 @@ function Composer({ id, active, status, phase, touch, offline, models, usage, it
       }}
     >
       {agentId === 'codex' && status?.goal && <GoalBar id={id} goal={status.goal} />}
-      {btw && (
-        <section className="chat-btw" aria-live="polite">
-          <header>
-            <MessageCircleQuestion size={14} aria-hidden="true" />
-            <b className="ellipsis">{btw.q}</b>
-            <button type="button" className="chat-more" onClick={() => { btwSeq.current++; setBtw(null); }} aria-label={t('action.close')}>
-              <X size={14} aria-hidden="true" />
-            </button>
-          </header>
-          {btw.a == null ? <Spinner size={14} /> : <Markdown text={btw.a} />}
-          <p className="chat-note">{t('chat.btw_note')}</p>
-        </section>
-      )}
       {/^![^!]/.test(text) && agentId !== 'agy' && <p className="chat-bang-hint">{t('chat.bang_hint')}</p>}
       {slash.length > 0 && (
         <ul className="chat-slash" role="listbox">
@@ -4863,7 +5004,7 @@ function Composer({ id, active, status, phase, touch, offline, models, usage, it
             <Sparkles size={17} />
           </button>
           {caps.mode !== false && (
-          <button type="button" className={`btn btn-plain chat-chip chat-chip-mode`} data-mode={status?.mode ?? ''} data-pop-anchor="" aria-expanded={menu === 'mode'} disabled={!ready} onClick={() => setMenu(menu === 'mode' ? null : 'mode')} title={t('chat.mode_pick')}>
+          <button type="button" className={`btn btn-plain chat-chip chat-chip-mode`} data-mode={status?.mode ?? ''} data-pop-anchor="" aria-expanded={menu === 'mode'} disabled={!modeReady} onClick={() => setMenu(menu === 'mode' ? null : 'mode')} title={t('chat.mode_pick')}>
             <ShieldCheck size={14} aria-hidden="true" />
             <span className="ellipsis">{modeText}</span>
             <ChevronDown size={13} aria-hidden="true" />
@@ -6500,9 +6641,175 @@ function AgyConfigTab({ id }) {
   );
 }
 
-const SIDE_TABS = ['changes', 'outline', 'tasks', 'usage', 'config'];
-const CODEX_TABS = ['changes', 'outline', 'agents', 'resources', 'usage', 'config'];
-const AGY_TABS = ['changes', 'outline', 'agents', 'usage', 'config'];
+/**
+ * 旁聊（/btw、/side，官方桌面端的 side chat）：在右边栏里，能看到主对话到现在的内容，可以接着追问；
+ * 不进对话记录，也不打断正在跑的这一轮。每个会话一份，收起边栏还留着，“新旁聊”或刷新页面才清掉。
+ * Claude：side_question 带上前面的问答；Codex：留着的临时分叉；agy：一个只读的旁聊会话（后端，见 Chat::btw）
+ */
+const sideChats = new Map();
+const sideSubs = new Set();
+const sideOf = (id) => sideChats.get(id) ?? { turns: [], busy: false, quote: '' };
+const putSide = (id, v) => {
+  sideChats.set(id, v);
+  for (const f of sideSubs) f(id);
+};
+function useSideChat(id) {
+  const [, bump] = useReducer((n) => n + 1, 0);
+  useEffect(() => {
+    const f = (x) => x === id && bump();
+    sideSubs.add(f);
+    return () => sideSubs.delete(f);
+  }, [id]);
+  return sideOf(id);
+}
+/** 划词“旁聊”挂上来的那段：发出去时拼成引用块放在问题前面 */
+const sideAsk = (quote, q) => (quote ? `${quote.split('\n').map((l) => `> ${l}`).join('\n')}\n\n${q}` : q);
+/** quote：划词挂上来的原文（没写问题就问“这段是什么意思”） */
+async function askSide(id, question, t, toast, quote = '') {
+  const cur = sideOf(id);
+  if (cur.busy) {
+    toast(t('chat.side_busy'));
+    return false;
+  }
+  const history = cur.turns.filter((x) => x.a).map((x) => ({ question: x.full ?? x.q, response: x.a }));
+  const q = question || (quote ? t('chat.side_quote_default') : '');
+  const full = sideAsk(quote, q);
+  const turn = { key: `${Date.now()}`, q, quote, full, a: null };
+  putSide(id, { ...cur, turns: [...cur.turns, turn], busy: true, quote: quote ? '' : cur.quote });
+  try {
+    const r = await api.post(`/instances/${id}/chat/btw`, { question: full, history, fresh: cur.turns.length === 0 });
+    const now = sideOf(id);
+    if (!now.turns.includes(turn)) return;
+    putSide(id, { ...now, turns: now.turns.map((x) => (x === turn ? { ...x, a: r?.response || t('chat.side_empty') } : x)), busy: false });
+  } catch (e) {
+    const now = sideOf(id);
+    if (!now.turns.includes(turn)) return;
+    putSide(id, { ...now, turns: now.turns.map((x) => (x === turn ? { ...x, a: '', err: errorText(t, e) } : x)), busy: false });
+  }
+  return true;
+}
+function resetSide(id) {
+  if (!sideOf(id).turns.length) return;
+  putSide(id, { turns: [], busy: false, quote: sideOf(id).quote });
+  api.del(`/instances/${id}/chat/btw`).catch(() => {});
+}
+
+function SideChatTab({ id }) {
+  const { t } = useT();
+  const toast = useToast();
+  const { turns, busy, quote } = useSideChat(id);
+  const [text, setText] = useState('');
+  const area = useRef(null);
+  const end = useRef(null);
+  const touch = touchUiDevice;
+  useEffect(() => {
+    if (!touch) area.current?.focus();
+    const f = () => area.current?.focus();
+    window.addEventListener(`ll-side-focus:${id}`, f);
+    return () => window.removeEventListener(`ll-side-focus:${id}`, f);
+  }, [id, touch]);
+  useEffect(() => {
+    end.current?.scrollIntoView({ block: 'end' });
+  }, [turns.length, busy]);
+  const send = () => {
+    const q = text.trim();
+    if ((!q && !quote) || busy) return;
+    setText('');
+    askSide(id, q, t, toast, quote);
+  };
+  const toMain = (a) => window.dispatchEvent(new CustomEvent(`ll-chat-fill:${id}`, { detail: a }));
+  return (
+    <div className="chat-sidechat">
+      <div className="chat-sidechat-head">
+        <p className="chat-note">{t('chat.btw_note')}</p>
+        {turns.length > 0 && (
+          <button type="button" className="btn btn-plain btn-sm" onClick={() => resetSide(id)} title={t('chat.side_new_hint')}>
+            <Plus size={14} aria-hidden="true" /> {t('chat.side_new')}
+          </button>
+        )}
+      </div>
+      <div className="chat-sidechat-list" aria-live="polite">
+        {turns.length === 0 && <p className="chat-note chat-sidechat-empty">{t(touch ? 'chat.side_empty_hint_touch' : 'chat.side_empty_hint')}</p>}
+        {turns.map((x) => (
+          <div key={x.key} className="chat-sidechat-turn">
+            {x.quote && <p className="chat-sidechat-quote">{x.quote}</p>}
+            <p className="chat-sidechat-q">{x.q}</p>
+            {x.a == null ? (
+              <Spinner size={14} />
+            ) : x.err ? (
+              <p className="chat-sidechat-err">
+                <TriangleAlert size={13} aria-hidden="true" /> {x.err}
+              </p>
+            ) : (
+              <>
+                <Markdown text={x.a} />
+                <div className="chat-sidechat-acts">
+                  <SideCopy text={x.a} />
+                  <button type="button" className="btn btn-plain btn-icon" onClick={() => toMain(x.a)} aria-label={t('chat.side_to_main')} title={t('chat.side_to_main')}>
+                    <CornerDownLeft size={14} />
+                  </button>
+                </div>
+              </>
+            )}
+          </div>
+        ))}
+        <div ref={end} />
+      </div>
+      {quote && (
+        <div className="chat-sidechat-pin">
+          <p>{quote}</p>
+          <button type="button" className="btn btn-plain btn-icon" onClick={() => putSide(id, { ...sideOf(id), quote: '' })} aria-label={t('chat.side_quote_drop')} title={t('chat.side_quote_drop')}>
+            <X size={14} />
+          </button>
+        </div>
+      )}
+      <form
+        className="chat-sidechat-input"
+        onSubmit={(e) => {
+          e.preventDefault();
+          send();
+        }}
+      >
+        <textarea
+          ref={area}
+          rows={2}
+          value={text}
+          placeholder={t(quote ? 'chat.side_quote_placeholder' : 'chat.side_placeholder')}
+          aria-label={t('chat.side_placeholder')}
+          onChange={(e) => setText(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter' && !e.shiftKey && !touch && !imeComposing(e)) {
+              e.preventDefault();
+              send();
+            }
+          }}
+        />
+        <button type="submit" className="btn btn-primary btn-icon" disabled={(!text.trim() && !quote) || busy} aria-label={t('chat.send')} title={t('chat.send')}>
+          {busy ? <Spinner size={14} /> : <ArrowUp size={16} />}
+        </button>
+      </form>
+    </div>
+  );
+}
+
+function SideCopy({ text }) {
+  const { t } = useT();
+  const [done, setDone] = useState(false);
+  useEffect(() => {
+    if (!done) return undefined;
+    const timer = setTimeout(() => setDone(false), 1500);
+    return () => clearTimeout(timer);
+  }, [done]);
+  return (
+    <button type="button" className="btn btn-plain btn-icon" onClick={async () => (await copyText(text)) && setDone(true)} aria-label={t('action.copy')} title={t('action.copy')}>
+      {done ? <Check size={14} /> : <Copy size={14} />}
+    </button>
+  );
+}
+
+const SIDE_TABS = ['btw', 'changes', 'outline', 'tasks', 'usage', 'config'];
+const CODEX_TABS = ['btw', 'changes', 'outline', 'agents', 'resources', 'usage', 'config'];
+const AGY_TABS = ['btw', 'changes', 'outline', 'agents', 'usage', 'config'];
 
 const RES_ICONS = { link: Globe, search: Search, image: ImageIcon };
 const ART_ICONS = { image: ImageIcon, pdf: FileText, video: FileText, audio: FileText, text: FileText, file: FileText };
@@ -6653,6 +6960,7 @@ function SidePanel({ id, tab, onTab, onClose, status, items, onTermTab, onCompac
       </header>
       <div className="chat-side-body">
         <ErrorBoundary resetKey={tab}>
+          {tab === 'btw' && <SideChatTab id={id} />}
           {tab === 'changes' && <ChangesTab id={id} items={items} onTab={onTermTab} />}
           {tab === 'tasks' && <TasksTab id={id} sel={agentSel} onSel={onAgentSel} />}
           {tab === 'agents' && <AgentsTab id={id} items={items} live={live} sel={agentSel} onSel={onAgentSel} />}
@@ -7179,8 +7487,37 @@ export default function ChatView({ id, launch, workdir = null, active, touch, of
     else if (a === 'subagents' || a === 'plugins') {
       setSide(a === 'subagents' && agentId === 'codex' ? 'agents' : 'config');
       setTimeout(() => document.getElementById(`${a}-${id}`)?.scrollIntoView({ block: 'start', behavior: 'smooth' }), 120);
-    } else if (SIDE_TABS.includes(a) || CODEX_TABS.includes(a)) setSide(a);
+    } else if (SIDE_TABS.includes(a) || CODEX_TABS.includes(a)) {
+      setSide(a);
+      // 只打 /btw：打开旁聊、光标放到旁聊的输入框
+      if (a === 'btw') setTimeout(() => window.dispatchEvent(new CustomEvent(`ll-side-focus:${id}`)), 60);
+    }
   };
+  // 划词“旁聊”：那段挂到旁聊输入框上方，打开旁聊
+  useEffect(() => {
+    const on = (e) => {
+      putSide(id, { ...sideOf(id), quote: String(e.detail || '') });
+      setSide('btw');
+      setTimeout(() => window.dispatchEvent(new CustomEvent(`ll-side-focus:${id}`)), 60);
+    };
+    window.addEventListener(`ll-side-quote:${id}`, on);
+    return () => window.removeEventListener(`ll-side-quote:${id}`, on);
+  }, [id, setSide]);
+  // Ctrl / ⌘ + ;：开关旁聊（和 Claude Code 桌面端一样）
+  useEffect(() => {
+    if (!active || touch) return undefined;
+    const key = (e) => {
+      if (e.key !== ';' || !(e.ctrlKey || e.metaKey) || e.altKey || e.shiftKey) return;
+      e.preventDefault();
+      if (side === 'btw') setSide(null);
+      else {
+        setSide('btw');
+        setTimeout(() => window.dispatchEvent(new CustomEvent(`ll-side-focus:${id}`)), 60);
+      }
+    };
+    window.addEventListener('keydown', key);
+    return () => window.removeEventListener('keydown', key);
+  }, [active, touch, side, setSide, id]);
   const compact = () => api.post(`/instances/${id}/chat/input`, { text: '/compact', images: [] }).catch((e) => toast(errorText(t, e), 'error'));
   const loading = useRef(false);
   // 往上翻到顶：加载更早的，保持看着的位置不动
@@ -7237,7 +7574,7 @@ export default function ChatView({ id, launch, workdir = null, active, touch, of
       <ArtifactCtx.Provider value={artifactCtx}>
       <PreviewCtx.Provider value={previewCtx}>
       <SideCtx.Provider value={sideCtx}>
-    <div className="chat-view" data-side={side ? '' : undefined} data-agent={agentId} onClickCapture={links.onClickCapture} onClick={files.onClick}>
+    <div className="chat-view" data-side={side ? '' : undefined} data-agent={agentId} data-fv={files.size ?? undefined} onClickCapture={links.onClickCapture} onClick={files.onClick} onAuxClick={files.onAuxClick}>
       {files.viewer}
       {links.menu}
       <div className="chat-col">

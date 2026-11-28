@@ -1076,6 +1076,32 @@ pub fn login_cancel(id: &str) {
     }
 }
 
+/// 退出登录（包括本机默认账号和额外官方账号）：调用 Claude Code 自己的 `claude auth logout`
+/// 吊销令牌并清除本地凭据 / 钥匙串条目，不删除账号配置或共用文件。
+pub async fn logout(shell: &str, home: &Path, p: &Profile) -> Result<(), LocalError> {
+    if p.kind != Kind::Official {
+        return Err(LocalError::invalid("id", "not_official"));
+    }
+    login_cancel(&p.id);
+    let cli = crate::agents::claude_cli(shell).await.ok_or_else(|| LocalError::new("AGENT_NOT_FOUND").with("agent", "claude"))?;
+    let dir = account_dir(home, &p.id);
+    let mut env: Vec<(&str, Option<&std::ffi::OsStr>)> = vec![];
+    if p.id != OFFICIAL {
+        env.push(("CLAUDE_CONFIG_DIR", Some(dir.as_os_str())));
+    }
+    let out = crate::agents::cli_output(shell, &cli, &["auth", "logout"], &env, Duration::from_secs(30))
+        .await
+        .map_err(|e| LocalError::new("CLI_FAILED").with("detail", e))?;
+    if !out.status.success() {
+        let mut msg = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        if msg.is_empty() {
+            msg = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        }
+        return Err(LocalError::new("CLI_FAILED").with("detail", msg.chars().take(300).collect::<String>()));
+    }
+    Ok(())
+}
+
 /// 输出里的授权页地址：`https://…/oauth/authorize?…`，可能包在终端超链接（OSC 8）里
 fn auth_url(out: &str) -> Option<String> {
     let mut rest = out;

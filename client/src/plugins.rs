@@ -10,6 +10,9 @@
 //!   只认带口令（[`proto::HDR_TOKEN`]）的请求。崩了下次用到时再起。
 //! - **授权**：插件自己验凭证；看看只在插件调宿主接口 `/_host/license` 时，用这台设备的身份代它向服务端申请
 //!   （[`Plugins::license`]），不碰凭证内容。
+//! - **离线授权**：插件页显示本机机器指纹（[`proto::machine_fingerprint`]，插件按同一个算法自己算），管理后台按它签离线授权码；
+//!   用户粘贴进来存在 `<数据目录>/plugin-licenses.json`，插件来要凭证时先给它（不用登录、不用联网，到期为止）。
+//! - **从文件安装**：管理后台或插件页下载的离线安装包（`.llplugin`），照样验签名和包的 SHA-256。
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -29,6 +32,20 @@ use crate::paths::Paths;
 const PACKAGE_MAX: u64 = 1 << 30;
 /// 起插件最多等多久（等它的 Socket 能连上）
 const START_WAIT: Duration = Duration::from_secs(20);
+/// 插件开着的功能缓存多久
+const FEATURES_TTL: Duration = Duration::from_secs(60);
+/// 钩子的回答最大多少
+const HOOK_BODY_MAX: usize = 256 * 1024;
+/// 离线授权码存在这里：`{ 插件名: 凭证 }`
+const OFFLINE_FILE: &str = "plugin-licenses.json";
+
+fn now_secs() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
+}
+
+fn rfc3339(secs: i64) -> String {
+    time::OffsetDateTime::from_unix_timestamp(secs).ok().and_then(|t| t.format(&time::format_description::well_known::Rfc3339).ok()).unwrap_or_default()
+}
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -90,6 +107,10 @@ pub struct Plugins {
     host_url: Mutex<Option<String>>,
     running: tokio::sync::Mutex<HashMap<String, Arc<Proc>>>,
     jobs: Mutex<HashMap<String, Job>>,
+    /// 本机机器指纹（算一次）
+    machine: std::sync::OnceLock<Result<String, String>>,
+    /// 插件开着的功能（[`proto::HOOK_FEATURES`]），缓存一会儿：状态接口、新建会话都要看
+    features: Mutex<Option<(Instant, Vec<String>)>>,
 }
 
 impl Plugins {
@@ -102,6 +123,8 @@ impl Plugins {
             host_url: Mutex::new(None),
             running: Default::default(),
             jobs: Mutex::new(HashMap::new()),
+            machine: std::sync::OnceLock::new(),
+            features: Mutex::new(None),
         })
     }
 
@@ -183,6 +206,9 @@ impl Plugins {
             }
         }
         let jobs = lock(&self.jobs).clone();
+        let offline = self.offline_valid();
+        let incoming = self.incoming_dir();
+        let _ = std::fs::create_dir_all(&incoming);
         let items: Vec<Value> = names
             .iter()
             .map(|n| {
@@ -207,8 +233,11 @@ impl Plugins {
                     "size": remote.map(|r| r.size),
                     "open_url": m.as_ref().is_some_and(|m| m.open_url),
                     "incompatible": m.as_ref().and_then(|m| Self::compatible(m).err()).map(|e| json!({ "code": e.code, "params": e.params })),
-                    "licensed": true,
-                    "expires_at": Value::Null,
+                    // 有离线授权码就算；没有时看服务端目录（没登录、没问服务端时不知道：null）
+                    "licensed": if offline.iter().any(|(p, _)| p == n) { json!(true) } else { json!(remote.map(|r| r.licensed)) },
+                    "expires_at": remote.and_then(|r| r.expires_at.clone()),
+                    // 离线授权码到什么时候（RFC 3339）
+                    "offline_until": offline.iter().find(|(p, _)| p == n).map(|(_, e)| rfc3339(*e)),
                     "running": running.get(n).is_some_and(|p| p.alive()),
                     "job": jobs.get(n),
                 })
@@ -220,6 +249,9 @@ impl Plugins {
             "signed_in": self.account.session().is_some(),
             "catalog_error": catalog.err().map(|e| json!({ "code": e.code, "params": e.params })),
             "keys": !self.keys.is_empty(),
+            "machine": self.machine().ok(),
+            "offline": self.offline_view(),
+            "incoming_dir": incoming.display().to_string(),
         })
     }
 
@@ -259,7 +291,10 @@ impl Plugins {
         let (me, name) = (self.clone(), name.to_string());
         tokio::spawn(async move {
             match me.install(&name).await {
-                Ok(()) => me.set_job(&name, |j| j.step = "done"),
+                Ok(()) => {
+                    me.forget_features();
+                    me.set_job(&name, |j| j.step = "done");
+                }
                 Err(e) => {
                     tracing::warn!(plugin = name, error = ?e, "插件没装上");
                     me.set_job(&name, |j| {
@@ -312,16 +347,22 @@ impl Plugins {
             return Err(err("PLUGIN_INVALID", "package hash mismatch"));
         }
         self.set_job(name, |j| j.step = "install");
+        self.put_in_place(name, &raw, &signed.sig, &release, &tmp).await
+    }
+
+    /// 校验过的包（`tmp`）解开、写上签过名的 `release.json`，整个换进插件目录；`tmp` 用完删掉
+    async fn put_in_place(&self, name: &str, raw: &[u8], sig: &ReleaseSig, release: &Release, tmp: &Path) -> Result<(), LocalError> {
+        let root = self.root();
         let staging = root.join(format!(".{name}.new"));
-        let (t, s, rel) = (tmp.clone(), staging.clone(), release.clone());
+        let (t, s, rel) = (tmp.to_path_buf(), staging.clone(), release.clone());
         let unpacked = tokio::task::spawn_blocking(move || unpack(&t, &s, &rel)).await.map_err(|e| err("PLUGIN_INSTALL", e))?;
-        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(tmp);
         if let Err(e) = unpacked {
             let _ = std::fs::remove_dir_all(&staging);
             return Err(e);
         }
-        std::fs::write(staging.join("release.json"), &raw).map_err(|e| err("PLUGIN_INSTALL", e))?;
-        std::fs::write(staging.join("release.sig"), serde_json::to_vec(&signed.sig).unwrap_or_default()).map_err(|e| err("PLUGIN_INSTALL", e))?;
+        std::fs::write(staging.join("release.json"), raw).map_err(|e| err("PLUGIN_INSTALL", e))?;
+        std::fs::write(staging.join("release.sig"), serde_json::to_vec(sig).unwrap_or_default()).map_err(|e| err("PLUGIN_INSTALL", e))?;
         // 换之前停掉旧的（下次用到时起新的）
         self.stop(name).await;
         let dir = self.dir(name);
@@ -372,6 +413,51 @@ impl Plugins {
                 }
             }
         }
+    }
+
+    /// 接了这个钩子、能在这个看看上跑的插件
+    pub fn with_hook(&self, hook: &str) -> Vec<String> {
+        self.installed_names().into_iter().filter(|n| self.installed(n).is_ok_and(|i| i.manifest().has_hook(hook) && Self::compatible(i.manifest()).is_ok())).collect()
+    }
+
+    /// 调插件的钩子：`POST /_hooks/<钩子>`，JSON 进 JSON 出。插件没起就先起
+    pub async fn hook(&self, name: &str, hook: &str, body: &Value, wait: Duration) -> Result<Value, LocalError> {
+        let p = self.ensure(name).await?;
+        tokio::time::timeout(wait, hook_call(&p.socket, &p.token, hook, body)).await.map_err(|_| err("PLUGIN_HOOK", "timeout"))?
+    }
+
+    /// 插件开着的功能（所有接了 `features` 钩子的插件合起来），缓存 60 秒；问不到的插件算没有
+    pub async fn features(&self) -> Vec<String> {
+        if let Some((at, f)) = lock(&self.features).clone() {
+            if at.elapsed() < FEATURES_TTL {
+                return f;
+            }
+        }
+        let mut all = Vec::new();
+        for n in self.with_hook(proto::HOOK_FEATURES) {
+            match self.hook(&n, proto::HOOK_FEATURES, &json!({}), Duration::from_secs(5)).await {
+                Ok(v) => {
+                    let f: proto::Features = serde_json::from_value(v).unwrap_or_default();
+                    for x in f.features {
+                        if !all.contains(&x) {
+                            all.push(x);
+                        }
+                    }
+                }
+                Err(e) => tracing::debug!(plugin = n, error = ?e, "插件的功能没问到"),
+            }
+        }
+        *lock(&self.features) = Some((Instant::now(), all.clone()));
+        all
+    }
+
+    pub async fn has_feature(&self, feature: &str) -> bool {
+        self.features().await.iter().any(|f| f == feature)
+    }
+
+    /// 装、卸、换授权以后：下次重新问
+    pub fn forget_features(&self) {
+        *lock(&self.features) = None;
     }
 
     /// 插件在跑（没跑就起）：返回它的 Socket 和口令
@@ -439,7 +525,8 @@ impl Plugins {
             .env(proto::ENV_HOST_TOKEN, &self.host_token)
             .env(proto::ENV_CLIENT_VERSION, env!("CARGO_PKG_VERSION"))
             // 1.86 以前的内置浏览器数据在 `<数据目录>/browser/`：插件第一次起时自己搬过去
-            .env("LOOKLOOK_HOME", &self.paths.home)
+            // 插件按它找安装号算机器指纹（[`proto::machine_fingerprint`]），和插件页上显示的一样
+            .env(proto::ENV_HOME, &self.paths.home)
             .stdin(std::process::Stdio::null())
             .stdout(log.as_ref().and_then(|f| f.try_clone().ok()).map(std::process::Stdio::from).unwrap_or_else(std::process::Stdio::null))
             .stderr(log.map(std::process::Stdio::from).unwrap_or_else(std::process::Stdio::null))
@@ -480,6 +567,12 @@ impl Plugins {
     /// 宿主接口 `/_host/license`：代插件向服务端申请授权凭证
     pub async fn license(&self, name: &str, req: &proto::LicenseRequest) -> Result<proto::LicenseResponse, LocalError> {
         self.installed(name)?;
+        // 有离线授权码、对得上这台机器、没过期：直接给，不用登录、不用联网
+        if let Some(token) = self.offline_tokens().remove(name) {
+            if let Some(c) = proto::peek_license(&token).filter(|c| c.plugin == name && c.mach == req.machine && c.exp > now_secs()) {
+                return Ok(proto::LicenseResponse { token, exp: c.exp, expires_at: rfc3339(c.ent_exp) });
+            }
+        }
         if self.account.session().is_none() {
             return Err(LocalError::new("NOT_LOGGED_IN"));
         }
@@ -495,7 +588,185 @@ impl Plugins {
             "platform": proto::current_platform(),
             "signed_in": s.is_some(),
             "device_id": s.as_ref().map(|s| s.device_id.clone()),
+            "machine": self.machine().ok(),
         })
+    }
+
+    // ---------------- 机器指纹、离线授权 ----------------
+
+    /// 本机机器指纹（和插件自己算的一样：系统机器号 + 数据目录里的安装号）
+    pub fn machine(&self) -> Result<String, LocalError> {
+        self.machine.get_or_init(|| proto::machine_fingerprint(&self.paths.home).map_err(|e| e.to_string())).clone().map_err(|e| err("PLUGIN_MACHINE", e))
+    }
+
+    fn platform_keys(&self) -> Vec<(String, VerifyingKey)> {
+        let p = self.account.platform();
+        p.keys_b64().into_keys().filter_map(|k| Some((k.clone(), p.key(&k)?))).collect()
+    }
+
+    fn offline_tokens(&self) -> HashMap<String, String> {
+        std::fs::read(self.paths.home.join(OFFLINE_FILE)).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
+    }
+
+    fn save_offline(&self, m: &HashMap<String, String>) -> Result<(), LocalError> {
+        let path = self.paths.home.join(OFFLINE_FILE);
+        if m.is_empty() {
+            let _ = std::fs::remove_file(&path);
+            return Ok(());
+        }
+        crate::util::write_private(&path, &serde_json::to_vec_pretty(m).unwrap_or_default()).map_err(|e| err("PLUGIN_INSTALL", e))
+    }
+
+    /// 还能用的离线授权：（插件名，到期 Unix 秒）
+    fn offline_valid(&self) -> Vec<(String, i64)> {
+        let mach = self.machine().ok();
+        let now = now_secs();
+        self.offline_tokens()
+            .into_iter()
+            .filter_map(|(p, t)| proto::peek_license(&t).filter(|c| c.plugin == p && Some(&c.mach) == mach.as_ref() && c.exp > now).map(|c| (p, c.exp)))
+            .collect()
+    }
+
+    /// 界面上的离线授权列表（不回显凭证）
+    fn offline_view(&self) -> Vec<Value> {
+        let mach = self.machine().ok();
+        let now = now_secs();
+        let mut v: Vec<Value> = self
+            .offline_tokens()
+            .into_iter()
+            .map(|(p, t)| {
+                let c = proto::peek_license(&t);
+                let state = match &c {
+                    None => "invalid",
+                    Some(c) if Some(&c.mach) != mach.as_ref() => "other_machine",
+                    Some(c) if c.exp <= now => "expired",
+                    Some(_) => "valid",
+                };
+                json!({ "plugin": p, "expires_at": c.map(|c| rfc3339(c.exp)), "state": state })
+            })
+            .collect();
+        v.sort_by(|a, b| a["plugin"].as_str().cmp(&b["plugin"].as_str()));
+        v
+    }
+
+    /// 粘贴离线授权码：每个凭证验签（有平台公钥时）、核对这台机器和到期，都对才存（同一个插件新的换掉旧的）
+    pub fn add_offline(&self, code: &str) -> Result<Vec<String>, LocalError> {
+        let tokens = proto::split_offline_code(code);
+        if tokens.is_empty() || tokens.len() > 20 {
+            return Err(LocalError::new("LICENSE_CODE_INVALID"));
+        }
+        let mach = self.machine()?;
+        let keys = self.platform_keys();
+        let now = now_secs();
+        let mut store = self.offline_tokens();
+        let mut added = vec![];
+        for t in tokens {
+            let c = proto::peek_license(&t).filter(|c| proto::valid_name(&c.plugin)).ok_or_else(|| LocalError::new("LICENSE_CODE_INVALID"))?;
+            if c.mach != mach {
+                return Err(LocalError::new("LICENSE_CODE_MACHINE").with("plugin", c.plugin));
+            }
+            if c.exp <= now {
+                return Err(LocalError::new("LICENSE_CODE_EXPIRED").with("plugin", c.plugin));
+            }
+            // 没有平台公钥（没内置、也没登录过的开发构建）时只能交给插件自己验
+            if !keys.is_empty() {
+                proto::verify_license(&keys, &t, &c.plugin, &mach, now).map_err(|_| LocalError::new("LICENSE_CODE_INVALID"))?;
+            }
+            added.push(c.plugin.clone());
+            store.insert(c.plugin, t);
+        }
+        self.save_offline(&store)?;
+        Ok(added)
+    }
+
+    pub fn remove_offline(&self, plugin: &str) -> Result<(), LocalError> {
+        let mut store = self.offline_tokens();
+        store.remove(plugin);
+        self.save_offline(&store)
+    }
+
+    // ---------------- 从文件安装 ----------------
+
+    /// 离线安装包的下载地址（要登录、有授权；票据 10 分钟有效），给别的平台的电脑下也行
+    pub async fn offline_package_url(&self, name: &str, platform: &str) -> Result<String, LocalError> {
+        if !proto::valid_name(name) || !proto::valid_platform(platform) {
+            return Err(LocalError::new("PLUGIN_NOT_FOUND"));
+        }
+        if self.account.session().is_none() {
+            return Err(LocalError::new("NOT_LOGGED_IN"));
+        }
+        let r = self.account.plugin_release(name, platform).await?;
+        let path = r["download_path"].as_str().filter(|p| p.starts_with("/plugins/download/")).ok_or_else(|| err("PLUGIN_INVALID", "download_path"))?;
+        Ok(format!("{}{path}?offline=1", self.account.platform().base))
+    }
+
+    /// 离线安装包先传到这里（插件页用分块上传，远程打开也能传大文件）
+    pub fn incoming_dir(&self) -> PathBuf {
+        self.root().join(".incoming")
+    }
+
+    /// 从离线安装包（`.llplugin`）装：验 `release.json` 的签名、平台、协议版本，包的大小和 SHA-256，再和联网装一样换进去。
+    /// 传到 [`Plugins::incoming_dir`] 里的文件装完（不管成没成）就删掉
+    pub async fn install_file(&self, path: &Path) -> Result<String, LocalError> {
+        if self.keys.is_empty() {
+            return Err(LocalError::new("PLUGIN_NO_KEYS"));
+        }
+        let incoming = self.incoming_dir();
+        let cleanup = path.parent().is_some_and(|d| d == incoming);
+        let r = self.install_file_inner(path).await;
+        if cleanup {
+            let _ = std::fs::remove_file(path);
+        }
+        r
+    }
+
+    async fn install_file_inner(&self, path: &Path) -> Result<String, LocalError> {
+        let root = self.root();
+        std::fs::create_dir_all(&root).map_err(|e| err("PLUGIN_INSTALL", e))?;
+        let (src, keys, platform) = (path.to_path_buf(), self.keys.clone(), proto::current_platform());
+        let tmp_dir = root.clone();
+        // 读开头、验签名，把后面的包拷出来顺便算哈希
+        let (raw, sig, release, tmp) = tokio::task::spawn_blocking(move || -> Result<_, LocalError> {
+            use sha2::Digest;
+            let f = std::fs::File::open(&src).map_err(|e| err("PLUGIN_FILE", e))?;
+            let mut r = std::io::BufReader::new(f);
+            let (raw, sig) = proto::read_offline_package_head(&mut r).map_err(|e| err("PLUGIN_FILE", e))?;
+            let release = proto::verify_release(&keys, &raw, &sig).map_err(|e| err("PLUGIN_INVALID", e))?;
+            if release.platform != platform {
+                return Err(LocalError::new("PLUGIN_PLATFORM").with("plugin", release.name.clone()).with("platform", release.platform.clone()));
+            }
+            let tmp = tmp_dir.join(format!(".{}.download", release.name));
+            let mut out = std::fs::File::create(&tmp).map_err(|e| err("PLUGIN_INSTALL", e))?;
+            let mut h = sha2::Sha256::new();
+            let mut buf = vec![0u8; 1 << 16];
+            let mut size = 0u64;
+            loop {
+                let n = std::io::Read::read(&mut r, &mut buf).map_err(|e| err("PLUGIN_FILE", e))?;
+                if n == 0 {
+                    break;
+                }
+                size += n as u64;
+                if size > release.size.min(PACKAGE_MAX) {
+                    break;
+                }
+                h.update(&buf[..n]);
+                std::io::Write::write_all(&mut out, &buf[..n]).map_err(|e| err("PLUGIN_INSTALL", e))?;
+            }
+            if size != release.size || data_encoding::HEXLOWER.encode(&h.finalize()) != release.sha256 {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(err("PLUGIN_INVALID", "package hash mismatch"));
+            }
+            Ok((raw, sig, release, tmp))
+        })
+        .await
+        .map_err(|e| err("PLUGIN_INSTALL", e))??;
+        let name = release.name.clone();
+        if let Err(e) = Self::compatible(&release.manifest) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
+        self.put_in_place(&name, &raw, &sig, &release, &tmp).await?;
+        Ok(name)
     }
 
     /// 这个 Socket 是哪个插件的（宿主接口按口令认插件之外，再核对一下名字）
@@ -575,6 +846,39 @@ fn unpack(tgz: &Path, dest: &Path, release: &Release) -> Result<(), LocalError> 
     Ok(())
 }
 
+/// 经 Unix Socket 发一个钩子请求
+#[cfg(unix)]
+async fn hook_call(socket: &Path, token: &str, hook: &str, body: &Value) -> Result<Value, LocalError> {
+    use http_body_util::BodyExt;
+    let stream = tokio::net::UnixStream::connect(socket).await.map_err(|e| err("PLUGIN_HOOK", e))?;
+    let (mut sender, conn) = hyper::client::conn::http1::handshake::<_, axum::body::Body>(hyper_util::rt::TokioIo::new(stream)).await.map_err(|e| err("PLUGIN_HOOK", e))?;
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+    let req = axum::http::Request::post(proto::hook_path(hook))
+        .header(axum::http::header::HOST, "plugin")
+        .header(axum::http::header::CONTENT_TYPE, "application/json")
+        .header(proto::HDR_TOKEN, token)
+        .header(proto::HDR_LOCAL, "1")
+        .body(axum::body::Body::from(body.to_string()))
+        .map_err(|e| err("PLUGIN_HOOK", e))?;
+    let resp = sender.send_request(req).await.map_err(|e| err("PLUGIN_HOOK", e))?;
+    let status = resp.status();
+    let bytes = http_body_util::Limited::new(resp.into_body(), HOOK_BODY_MAX).collect().await.map_err(|e| err("PLUGIN_HOOK", e))?.to_bytes();
+    if !status.is_success() {
+        return Err(err("PLUGIN_HOOK", format!("status {status}")));
+    }
+    if bytes.is_empty() {
+        return Ok(json!({}));
+    }
+    serde_json::from_slice(&bytes).map_err(|e| err("PLUGIN_HOOK", e))
+}
+
+#[cfg(not(unix))]
+async fn hook_call(_socket: &Path, _token: &str, _hook: &str, _body: &Value) -> Result<Value, LocalError> {
+    Err(LocalError::new("PLUGIN_UNSUPPORTED"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -594,6 +898,7 @@ mod tests {
             exec: exec.into(),
             autostart_if_exists: Some("run.json".into()),
             open_url: false,
+            hooks: vec![],
         }
     }
 
@@ -715,5 +1020,117 @@ mod tests {
         p.stop("demo").await;
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert!(!proc.alive());
+    }
+
+    fn host(platform_sk: &SigningKey) -> (tempfile::TempDir, Arc<Plugins>, SigningKey) {
+        let home = tempfile::tempdir().unwrap();
+        let paths = Paths::discover(Some(home.path().to_path_buf())).unwrap();
+        let store = Arc::new(crate::store::Store::memory().unwrap());
+        let pk = format!("p1={}", looklook_protocol::signing::b64(platform_sk.verifying_key().as_bytes()));
+        let account = crate::account::Account::new(store, paths.clone(), "https://looklook.example", &pk).unwrap();
+        let sk = SigningKey::from_bytes(&[3; 32]);
+        let p = Plugins::new(paths, account, &format!("pk1={}", looklook_protocol::signing::b64(sk.verifying_key().as_bytes())));
+        (home, p, sk)
+    }
+
+    fn offline_token(sk: &SigningKey, plugin: &str, mach: &str, exp: i64) -> String {
+        let c = proto::LicenseClaims { v: 1, plugin: plugin.into(), uid: 0, did: proto::OFFLINE_DID.into(), mach: mach.into(), iat: 0, exp, ent_exp: exp, wm: "w".into() };
+        proto::issue_license(sk, "p1", &c)
+    }
+
+    /// 离线授权码：验签、核对本机指纹和到期；存下后插件来要凭证时直接给，不用登录
+    #[tokio::test]
+    async fn offline_license_code() {
+        let psk = SigningKey::from_bytes(&[9; 32]);
+        let (home, p, sk) = host(&psk);
+        let mach = p.machine().unwrap();
+        // 和插件按同一个算法自己算的一样
+        assert_eq!(proto::machine_fingerprint(home.path()).unwrap(), mach);
+        let far = now_secs() + 400 * 86400;
+        assert_eq!(p.add_offline("").unwrap_err().code, "LICENSE_CODE_INVALID");
+        assert_eq!(p.add_offline("hello").unwrap_err().code, "LICENSE_CODE_INVALID");
+        assert_eq!(p.add_offline(&offline_token(&psk, "demo", "ffffffffffffffffffffffffffffffff", far)).unwrap_err().code, "LICENSE_CODE_MACHINE");
+        assert_eq!(p.add_offline(&offline_token(&psk, "demo", &mach, now_secs() - 1)).unwrap_err().code, "LICENSE_CODE_EXPIRED");
+        // 不是平台私钥签的
+        let fake = SigningKey::from_bytes(&[1; 32]);
+        assert_eq!(p.add_offline(&offline_token(&fake, "demo", &mach, far)).unwrap_err().code, "LICENSE_CODE_INVALID");
+        // 一个码里两个插件
+        let code = format!("{}\n{}", offline_token(&psk, "demo", &mach, far), offline_token(&psk, "team", &mach, far));
+        assert_eq!(p.add_offline(&code).unwrap(), ["demo", "team"]);
+        let list = p.list(false).await;
+        assert_eq!(list["machine"], mach.as_str());
+        assert_eq!(list["offline"].as_array().unwrap().len(), 2);
+        assert_eq!(list["offline"][0]["state"], "valid");
+        assert!(list["offline"][0].get("token").is_none(), "不回显凭证");
+        // 插件要凭证：装着才给，机器对得上才给（不用登录）
+        let req = proto::LicenseRequest { machine: mach.clone(), version: "1".into() };
+        assert_eq!(p.license("demo", &req).await.unwrap_err().code, "PLUGIN_NOT_INSTALLED");
+        let dir = p.dir("demo");
+        std::fs::create_dir_all(&dir).unwrap();
+        let raw = serde_json::to_vec(&release(manifest("bin/demo"))).unwrap();
+        std::fs::write(dir.join("release.json"), &raw).unwrap();
+        std::fs::write(dir.join("release.sig"), serde_json::to_vec(&proto::sign_release(&sk, "pk1", &raw)).unwrap()).unwrap();
+        let r = p.license("demo", &req).await.unwrap();
+        assert_eq!(r.exp, far);
+        assert!(proto::verify_license(&[("p1".into(), psk.verifying_key())], &r.token, "demo", &mach, now_secs()).is_ok());
+        let other = proto::LicenseRequest { machine: "x".into(), version: "1".into() };
+        assert_eq!(p.license("demo", &other).await.unwrap_err().code, "NOT_LOGGED_IN");
+        let list = p.list(false).await;
+        let item = list["items"].as_array().unwrap().iter().find(|i| i["name"] == "demo").unwrap().clone();
+        assert_eq!(item["licensed"], true);
+        assert!(item["offline_until"].is_string());
+        // 删掉
+        p.remove_offline("demo").unwrap();
+        assert_eq!(p.license("demo", &req).await.unwrap_err().code, "NOT_LOGGED_IN");
+    }
+
+    /// 离线安装包：验签名、平台、哈希，装好；传进来的文件装完删掉
+    #[tokio::test]
+    async fn install_from_file() {
+        let psk = SigningKey::from_bytes(&[9; 32]);
+        let (_home, p, sk) = host(&psk);
+        let m = manifest("bin/demo");
+        let mj = serde_json::to_vec(&m).unwrap();
+        let pkg = tgz(&[("manifest.json", &mj, 0o644), ("bin/demo", b"#!/bin/sh\n", 0o755)]);
+        use sha2::Digest;
+        let rel = Release { sha256: data_encoding::HEXLOWER.encode(&sha2::Sha256::digest(&pkg)), size: pkg.len() as u64, ..release(m.clone()) };
+        let raw = serde_json::to_vec(&rel).unwrap();
+        let file = |raw: &[u8], sig: &ReleaseSig, body: &[u8]| {
+            let mut f = proto::offline_package_head(raw, sig);
+            f.extend_from_slice(body);
+            f
+        };
+        let incoming = p.incoming_dir();
+        std::fs::create_dir_all(&incoming).unwrap();
+        let put = |name: &str, bytes: Vec<u8>| {
+            let path = incoming.join(name);
+            std::fs::write(&path, bytes).unwrap();
+            path
+        };
+        // 不是安装包
+        let a = put("a.llplugin", b"PK\x03\x04".to_vec());
+        assert_eq!(p.install_file(&a).await.unwrap_err().code, "PLUGIN_FILE");
+        assert!(!a.exists(), "装完就删");
+        // 别人签的
+        let bad = SigningKey::from_bytes(&[4; 32]);
+        let b = put("b.llplugin", file(&raw, &proto::sign_release(&bad, "pk1", &raw), &pkg));
+        assert_eq!(p.install_file(&b).await.unwrap_err().code, "PLUGIN_INVALID");
+        // 包被改过
+        let mut tampered = pkg.clone();
+        let last = tampered.len() - 1;
+        tampered[last] ^= 1;
+        let c = put("c.llplugin", file(&raw, &proto::sign_release(&sk, "pk1", &raw), &tampered));
+        assert_eq!(p.install_file(&c).await.unwrap_err().code, "PLUGIN_INVALID");
+        // 别的平台
+        let other = Release { platform: "plan9-mips".into(), ..rel.clone() };
+        let oraw = serde_json::to_vec(&other).unwrap();
+        let d = put("d.llplugin", file(&oraw, &proto::sign_release(&sk, "pk1", &oraw), &pkg));
+        assert_eq!(p.install_file(&d).await.unwrap_err().code, "PLUGIN_PLATFORM");
+        // 对的
+        let e = put("e.llplugin", file(&raw, &proto::sign_release(&sk, "pk1", &raw), &pkg));
+        assert_eq!(p.install_file(&e).await.unwrap(), "demo");
+        assert_eq!(p.installed("demo").unwrap().release.version, "1.0.0");
+        assert!(p.dir("demo").join("bin/demo").is_file());
+        assert!(!e.exists());
     }
 }

@@ -1108,6 +1108,7 @@ pub(crate) mod e2e {
         let instances = crate::instances::Instances::new(store.clone(), paths.clone());
         Arc::new(Inner {
             direct: crate::direct_tls::Direct::new(store.clone(), 1),
+            shared: Arc::new(crate::shared_pcs::SharedPcs::new(store.clone())),
             account: account.clone(),
             instances: instances.clone(),
             updater: crate::updater::Updater::new(store.clone(), paths.clone(), account.clone(), CancellationToken::new()),

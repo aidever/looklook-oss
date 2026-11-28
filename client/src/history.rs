@@ -114,6 +114,32 @@ const OWN_MAX: usize = 5000;
 pub fn load_own(store: &crate::store::Store) {
     let v: Vec<String> = store.get(OWN_KEY).ok().flatten().unwrap_or_default();
     *OWN.lock().unwrap_or_else(|e| e.into_inner()) = Some(v.into_iter().collect());
+    let v: Vec<String> = store.get(HIDDEN_KEY).ok().flatten().unwrap_or_default();
+    *HIDDEN.lock().unwrap_or_else(|e| e.into_inner()) = Some(v.into_iter().collect());
+}
+
+/// 看看自己开来用的、不该列在历史里的对话（agy 的旁聊会话：agy 没有临时会话，会照样记进它的对话列表）
+static HIDDEN: Mutex<Option<std::collections::HashSet<String>>> = Mutex::new(None);
+const HIDDEN_KEY: &str = "history.hidden_convs";
+const HIDDEN_MAX: usize = 2000;
+
+/// 记下一段不列出来的对话
+pub fn hide(store: &crate::store::Store, id: &str) {
+    if !HIDDEN.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).insert(id.to_string()) {
+        return;
+    }
+    let mut v: Vec<String> = store.get(HIDDEN_KEY).ok().flatten().unwrap_or_default();
+    v.push(id.to_string());
+    if v.len() > HIDDEN_MAX {
+        v.drain(..v.len() - HIDDEN_MAX);
+    }
+    if let Err(e) = store.set(HIDDEN_KEY, &v) {
+        tracing::debug!(error = %e, "没记下不列出的对话");
+    }
+}
+
+fn is_hidden(id: &str) -> bool {
+    HIDDEN.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|s| s.contains(id))
 }
 
 /// 记下一段对话模式自己起的对话（历史里列出来、会话名取它的标题）
@@ -270,7 +296,7 @@ fn list_blocking(q: &Query) -> Vec<Conv> {
         }
     }
     if want("agy") {
-        out.extend(agy_apply_deep(agy_list(), workdir, deep, agy_transcript));
+        out.extend(agy_apply_deep(agy_list(), workdir, deep, agy_transcript).into_iter().filter(|c| !is_hidden(&c.id)));
     }
     if let Some(w) = workdir {
         out.retain(|c| same_dir(&c.workdir, w));

@@ -23,6 +23,7 @@ use crate::error::LocalError;
 use crate::feishu::card::{self, Act};
 use crate::feishu::{self, Api, Resource};
 use crate::gateway::App;
+use looklook_protocol::plugin as proto;
 use crate::notify::{self, load_feishu, load_rules, tr, Feishu};
 
 /// 卡片按钮：停止这一轮、飞书 CLI 的下一步
@@ -588,6 +589,20 @@ pub async fn on_other(app: &App, f: &Feishu, ev: &Value, sender: &str) {
         }
         return;
     }
+    // 多人协作插件开了“群成员提问”：问它要不要答（授权、开关、限流都归它），答的话开一次性的只读会话（看看管闸门）
+    if msg["chat_type"] == "group" {
+        let ev = looklook_protocol::plugin::GroupMessage {
+            chat_id: chat.clone(),
+            message_id: id.to_string(),
+            sender: sender.to_string(),
+            sender_name: name.clone(),
+            text: text.clone(),
+            attachments: !attachments(msg).is_empty(),
+        };
+        if group_ask(app, &api, ev, who.clone(), en).await {
+            return;
+        }
+    }
     // 没在等他：转给用户（同一个人 5 分钟最多一条），不进助理、不在群里回
     {
         let mut g = lock(&app.notify.bot.relayed);
@@ -604,6 +619,176 @@ pub async fn on_other(app: &App, f: &Feishu, ev: &Value, sender: &str) {
     );
     if let Err(e) = api.send_text(&me, &body).await {
         tracing::warn!(error = %e, "飞书：别人 @ 机器人，没能转给用户");
+    }
+}
+
+// ---------------- 群成员提问（只读，插件定要不要答） ----------------
+
+static ASK_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(assistant::ASK_PARALLEL);
+
+/// 问接了 `feishu-group` 钩子的插件要主意。插件说答或回一句就由这里办，返回 true；都不管（没装、没授权、关着、出错）返回 false
+async fn group_ask(app: &App, api: &Api, ev: proto::GroupMessage, who: Who, en: bool) -> bool {
+    let body = serde_json::to_value(&ev).unwrap_or_default();
+    for plugin in app.plugins.with_hook(proto::HOOK_FEISHU_GROUP) {
+        let d = match app.plugins.hook(&plugin, proto::HOOK_FEISHU_GROUP, &body, Duration::from_secs(10)).await {
+            Ok(v) => proto::GroupDecision::parse(&v),
+            Err(e) => {
+                tracing::debug!(plugin, error = ?e, "飞书：插件没给群里提问的主意");
+                continue;
+            }
+        };
+        match d {
+            proto::GroupDecision::Ignore => continue,
+            proto::GroupDecision::Reply { text } => {
+                let text: String = text.chars().take(1000).collect();
+                if !text.trim().is_empty() {
+                    if let Err(e) = api.reply(&ev.message_id, "post", &post_content(std::slice::from_ref(&who), &text), false).await {
+                        tracing::warn!(error = %e, "飞书：插件的回话没发出去");
+                    }
+                }
+                return true;
+            }
+            proto::GroupDecision::Ask { question, workdir, timeout_secs, ask_id } => {
+                let question: String = question.trim().chars().take(proto::ASK_QUESTION_MAX).collect();
+                if question.is_empty() {
+                    continue;
+                }
+                tracing::info!(plugin, "飞书：群成员提问，开只读会话回答");
+                tokio::spawn(answer(app.clone(), plugin, ev, who, question, workdir, timeout_secs, ask_id, en));
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// 一次性的只读会话回答群成员，答案回到那条消息下面并 @ 他，答完就删，结果告诉插件
+#[allow(clippy::too_many_arguments)]
+async fn answer(app: App, plugin: String, ev: proto::GroupMessage, who: Who, question: String, workdir: String, timeout_secs: u64, ask_id: String, en: bool) {
+    let Some(f) = load_feishu(&app.store) else { return };
+    let api = app.notify.api(&f);
+    let started = Instant::now();
+    sweep_asks(&app).await;
+    let (outcome, body) = match ASK_SLOTS.try_acquire() {
+        Err(_) => ("busy", tr(en, "现在同时在答的问题有点多，过一会儿再问吧。", "Too many questions are being answered right now; please ask again in a bit.")),
+        Ok(_slot) => {
+            let typing = api.add_reaction(&ev.message_id, TYPING).await.ok();
+            let wait = Duration::from_secs(match timeout_secs {
+                0 => proto::ASK_TIMEOUT_DEFAULT,
+                n => n.min(proto::ASK_TIMEOUT_MAX),
+            });
+            let r = ask_once(&app, &ev, &who, &question, &workdir, wait, en).await;
+            if let Some(r) = typing {
+                drop_typing(&api, &[(ev.message_id.clone(), r)]).await;
+            }
+            match r {
+                Ok(x) => x,
+                Err(e) => {
+                    tracing::warn!(error = ?e, "飞书：群成员提问没开成只读会话");
+                    ("unavailable", tr(en, "这台电脑现在没法回答提问。", "This computer can't answer questions right now."))
+                }
+            }
+        }
+    };
+    let answer_chars = body.chars().count() as u64;
+    match api.reply(&ev.message_id, "post", &post_content(std::slice::from_ref(&who), &body), false).await {
+        Ok(m) => note_reply(&app, &m, std::slice::from_ref(&who)),
+        Err(e) => tracing::warn!(error = %e, "飞书：群成员提问的回答没发出去"),
+    }
+    let done = proto::AskDone { ask_id, chat_id: ev.chat_id, sender: ev.sender, outcome: outcome.into(), secs: started.elapsed().as_secs(), answer_chars };
+    if app.plugins.installed(&plugin).is_ok_and(|i| i.manifest().has_hook(proto::HOOK_ASK_DONE)) {
+        let _ = app.plugins.hook(&plugin, proto::HOOK_ASK_DONE, &serde_json::to_value(&done).unwrap_or_default(), Duration::from_secs(10)).await;
+    }
+}
+
+/// 开会话、送问题、等这一轮答完（或超时）、取最后一段，删掉会话
+async fn ask_once(app: &App, ev: &proto::GroupMessage, who: &Who, question: &str, workdir: &str, wait: Duration, en: bool) -> Result<(&'static str, String), LocalError> {
+    let dir = assistant::ask_dir(&app.paths, workdir);
+    std::fs::create_dir_all(&dir).map_err(|e| LocalError::new("INTERNAL").with("error", e.to_string()))?;
+    let engine = assistant::settings(&app.store).engine;
+    let input = crate::instances::Input {
+        name: Some(tr(en, "群里提问", "Group question")),
+        name_custom: Some(true),
+        workdir: Some(dir.display().to_string()),
+        launch: Some(engine.launch().into()),
+        chat_ui: Some(true),
+        full_access: Some(false),
+        ..Default::default()
+    };
+    let v = crate::gateway::create_session(app, input, false).await?;
+    let id = v.row.id.clone();
+    // 先记成群里提问再送话：起进程时按它带规矩、只读、过只读闸门（assistant::ask_gate）
+    assistant::ask_update(&app.store, |m| {
+        m.insert(id.clone(), assistant::Ask { chat: ev.chat_id.clone(), asker: ev.sender.clone(), started_at: crate::util::system_ms() });
+    });
+    let r = async {
+        if engine == assistant::Engine::Claude && !app.instances.claude_sdk_mode(&v.row) {
+            return Err(LocalError::new("UNSUPPORTED"));
+        }
+        let base = app.chat.snapshot(&id).await?["total"].as_u64().unwrap_or(0) as usize;
+        let since = crate::util::system_ms();
+        let asker = if who.name.is_empty() { tr(en, "一位群成员", "A group member") } else { who.name.clone() };
+        let text = tr(en, &format!("{asker}在飞书群里问：\n{question}"), &format!("{asker} asked in a Feishu group:\n{question}"));
+        app.chat.input(&id, &text, &[]).await?;
+        let deadline = Instant::now() + wait;
+        let mut ran = false;
+        let mut settling: Option<Instant> = None;
+        let outcome = loop {
+            tokio::time::sleep(Duration::from_millis(800)).await;
+            if Instant::now() > deadline {
+                let _ = app.chat.interrupt(&id).await;
+                break "timeout";
+            }
+            let Some(b) = app.chat.brief(&id) else { break "failed" };
+            ran |= matches!(b["board"].as_str(), Some("working" | "attn"));
+            if let Some((o, _)) = turn_end(&b, since) {
+                if settling.get_or_insert_with(Instant::now).elapsed() >= END_SETTLE {
+                    break if o == "failed" { "failed" } else { "answered" };
+                }
+            } else {
+                settling = None;
+            }
+            if b["board"] == "stopped" && (ran || crate::util::system_ms() - since > START_WAIT_MS) {
+                break "failed";
+            }
+        };
+        let mut items: BTreeMap<usize, Value> = BTreeMap::new();
+        resnap(app, &id, base, &mut items).await;
+        let mut body = body_of(&items, POST_BYTES, true, en);
+        if body == "…" || body.trim().is_empty() {
+            body = match outcome {
+                "timeout" => tr(en, "想太久了，没答上来。换个更具体的问法再试试？", "That took too long; try a more specific question?"),
+                _ => tr(en, "没答上来。", "No answer."),
+            };
+        } else if outcome == "timeout" {
+            body.push_str(&tr(en, "\n\n（超时了，可能没说完）", "\n\n(Timed out; this may be incomplete)"));
+        }
+        Ok((outcome, body))
+    }
+    .await;
+    drop_ask(app, &id).await;
+    r
+}
+
+async fn drop_ask(app: &App, id: &str) {
+    if let Err(e) = app.instances.delete(id).await {
+        if e.code != "NOT_FOUND" {
+            tracing::warn!(error = ?e, id, "飞书：群里提问的会话没删掉");
+        }
+    }
+    assistant::ask_update(&app.store, |m| {
+        m.remove(id);
+    });
+}
+
+/// 上次看看退出时没答完的群里提问：会话删掉
+async fn sweep_asks(app: &App) {
+    let now = crate::util::system_ms();
+    let stale = (proto::ASK_TIMEOUT_MAX as i64 + 300) * 1000;
+    for (id, a) in assistant::asks(&app.store) {
+        if now - a.started_at > stale {
+            drop_ask(app, &id).await;
+        }
     }
 }
 
@@ -878,10 +1063,10 @@ fn source_line(group: bool, mentions: &[Who], lark: Option<bool>, en: bool) -> S
             let names: Vec<String> = mentions.iter().map(|w| if w.name.is_empty() { tr(en, "被引用的人", "the quoted person") } else { w.name.clone() }).collect();
             parts.push(tr(en, &format!("回答会自动 @ {}，你不用写 @", names.join("、")), &format!("your answer will @ {} automatically; don't write @ yourself", names.join(", "))));
         }
-        parts.push(tr(en, "回答像同事随手回：一两句人话，只说结论和要谁做什么，不讲过程", "reply like a colleague would: one or two plain sentences, just the result and who needs to do what, no process"));
+        parts.push(tr(en, "回答简明扼要：一到两句，只给结论和需要谁跟进什么，不描述过程", "keep the reply concise: one or two sentences with the conclusion and who needs to follow up on what, no process"));
     } else {
         parts.push(tr(en, "私聊", "direct message"));
-        parts.push(tr(en, "回答简短、说人话，不讲过程", "keep it short and plain, no process"));
+        parts.push(tr(en, "回答简明扼要，不描述过程", "keep the reply concise, no process"));
     }
     if lark == Some(false) {
         parts.push(tr(en, "飞书 CLI 还没装：要读写飞书（文档、日历、聊天记录）时请用户发“帮助”按卡片装好", "Feishu CLI isn't installed: to read or write Feishu, ask the user to send “help” and tap install on the card"));
@@ -1221,7 +1406,7 @@ async fn stream_turn(app: &App, inst: &str, reply_to: &str, base: usize, since: 
         if last_push.elapsed() >= PUSH_GAP {
             let steps = steps_of(&items);
             let tools = if steps.is_empty() { String::new() } else { card::steps_markdown(&steps, en) };
-            s.push(body_of(&items, BODY_BYTES, en), status_line(&b, en), tools).await;
+            s.push(body_of(&items, BODY_BYTES, false, en), status_line(&b, en), tools).await;
             last_push = Instant::now();
         }
         if let Some(end) = turn_end(&b, since) {
@@ -1236,7 +1421,7 @@ async fn stream_turn(app: &App, inst: &str, reply_to: &str, base: usize, since: 
         }
     };
     resnap(app, inst, base, &mut items).await;
-    let body = body_of(&items, BODY_BYTES, en);
+    let body = body_of(&items, BODY_BYTES, false, en);
     let done = card::stream_done(&info, outcome, if body == "…" { "" } else { &body }, &steps_of(&items), &process_of(&items), took);
     let r = s.finish(&done).await;
     send_outputs(app, &api, &msg, inst, &items, since).await;
@@ -1267,7 +1452,7 @@ async fn group_turn(app: &App, inst: &str, reply_to: &str, base: usize, since: i
     };
     let mut items: BTreeMap<usize, Value> = BTreeMap::new();
     resnap(app, inst, base, &mut items).await;
-    let mut body = body_of(&items, POST_BYTES, en);
+    let mut body = body_of(&items, POST_BYTES, true, en);
     if body == "…" {
         body = match outcome {
             "failed" => tr(en, "出错了，没答上来。", "Something went wrong; no answer."),
@@ -1386,12 +1571,13 @@ fn split_texts(items: &BTreeMap<usize, Value>) -> (Vec<&str>, Vec<&str>) {
     (process, last)
 }
 
-/// 这一轮给用户的回复（最后那段）；太长只留最后的
-fn body_of(items: &BTreeMap<usize, Value>, max: usize, en: bool) -> String {
+/// 这一轮给用户的回复（最后那段），按飞书的规矩收拾过（`group`：群里，拍平成一两句）；太长只留最后的
+fn body_of(items: &BTreeMap<usize, Value>, max: usize, group: bool, en: bool) -> String {
     let text = split_texts(items).1.join("\n\n");
     if text.is_empty() {
         return "…".into();
     }
+    let text = feishu::tidy::reply(&text, group, en);
     let text = if text.len() > max {
         let mut cut = text.len() - max;
         while !text.is_char_boundary(cut) {
@@ -1532,13 +1718,13 @@ mod tests {
         .into_iter()
         .enumerate()
         .collect();
-        assert_eq!(body_of(&items, 9999, false), "找到了：在 QA 分支上。\n\n可以联调。");
+        assert_eq!(body_of(&items, 9999, false, false), "找到了：在 QA 分支上。\n\n可以联调。");
         let p = process_of(&items);
         assert!(p.contains("找到了") && p.contains("我先查一下仓库。") && p.contains("需要 fetch") && !p.contains("可以联调"), "{p}");
         // 以调工具结束：用过程里最后一句
         let items: BTreeMap<usize, Value> = [it(json!([{ "t": "text", "text": "交给会话去做了。" }, { "t": "tool_use", "id": "3", "name": "session_start", "input": {} }]))].into_iter().enumerate().collect();
-        assert_eq!(body_of(&items, 9999, false), "交给会话去做了。");
-        assert_eq!(body_of(&BTreeMap::new(), 9999, false), "…");
+        assert_eq!(body_of(&items, 9999, false, false), "交给会话去做了。");
+        assert_eq!(body_of(&BTreeMap::new(), 9999, false, false), "…");
     }
 
     #[test]
@@ -1586,8 +1772,8 @@ mod tests {
         let at = vec![Who { id: "ou_zs".into(), name: "张三".into() }, Who { id: "ou_x".into(), name: String::new() }];
         let s = source_line(true, &at, Some(false), false);
         assert!(s.starts_with("[飞书 · 群聊") && s.contains("@ 张三、被引用的人") && s.contains("飞书 CLI 还没装"), "{s}");
-        assert!(s.contains("一两句人话"), "{s}");
-        assert_eq!(source_line(false, &[], Some(true), false), "[飞书 · 私聊 · 回答简短、说人话，不讲过程]");
+        assert!(s.contains("一到两句"), "{s}");
+        assert_eq!(source_line(false, &[], Some(true), false), "[飞书 · 私聊 · 回答简明扼要，不描述过程]");
         let p = post_content(&at, "**好了**");
         assert_eq!(p["zh_cn"]["content"][0][0], json!({ "tag": "at", "user_id": "ou_zs" }));
         assert_eq!(p["zh_cn"]["content"][1][0], json!({ "tag": "md", "text": "**好了**" }));
@@ -1646,6 +1832,7 @@ mod tests {
         let ui_addr = ui.local_addr().unwrap();
         let app: App = Arc::new(crate::gateway::Inner {
             direct: crate::direct_tls::Direct::new(store.clone(), ui_addr.port()),
+            shared: std::sync::Arc::new(crate::shared_pcs::SharedPcs::new(store.clone())),
             account: account.clone(),
             instances: instances.clone(),
             updater: crate::updater::Updater::new(store.clone(), paths.clone(), account.clone(), shutdown.clone()),

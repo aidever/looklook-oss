@@ -214,12 +214,24 @@ pub async fn rename(State(app): State<App>, Path(id): Path<String>, Json(req): J
 #[derive(Deserialize)]
 pub struct Btw {
     question: String,
+    /// 这次旁聊前面的问答 `[{question, response}]`
+    #[serde(default)]
+    history: Vec<Value>,
+    /// 界面上新开的旁聊（留着的上一次先丢掉）
+    #[serde(default)]
+    fresh: bool,
 }
 
-/// `/btw`：顺带问一句，答案不进对话
+/// `/btw`、`/side` 旁聊：答案不进对话，可以接着问
 pub async fn btw(State(app): State<App>, Path(id): Path<String>, Json(req): Json<Btw>) -> R<Json<Value>> {
     app.instances.note_input(&id);
-    Ok(Json(app.chat.btw(&id, &req.question).await?))
+    Ok(Json(app.chat.btw(&id, &req.question, &req.history, req.fresh).await?))
+}
+
+/// 关掉旁聊
+pub async fn btw_close(State(app): State<App>, Path(id): Path<String>) -> R<Json<Value>> {
+    app.chat.btw_close(&id).await;
+    Ok(Json(json!({ "ok": true })))
 }
 
 #[derive(Deserialize)]

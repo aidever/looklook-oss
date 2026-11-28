@@ -104,6 +104,41 @@ function addCopyButtons(root, label, zoomLabel) {
   }
 }
 
+/** 表格包一层横向滚动容器（避免 table display:block 撑不满或右侧留白），并按列内容长度给列设最小宽或防折行，防止窄屏或宽列把短列/中文列压成一字一行 */
+function wrapTables(root) {
+  for (const table of root.querySelectorAll('table')) {
+    if (table.parentElement?.classList.contains('md-table')) continue;
+    const head = table.tHead?.rows[0]?.cells ?? table.rows[0]?.cells;
+    if (head && head.length >= 3) {
+      const maxLen = new Array(head.length).fill(0);
+      for (const row of table.rows) {
+        if (row.cells.length !== head.length) continue;
+        for (let i = 0; i < row.cells.length; i++) {
+          const len = (row.cells[i].textContent ?? '').trim().length;
+          if (len > maxLen[i]) maxLen[i] = len;
+        }
+      }
+      for (let i = 0; i < head.length; i++) {
+        if (maxLen[i] >= 36) head[i].dataset.w = 'l';
+        else if (maxLen[i] >= 18) head[i].dataset.w = 'm';
+        else if (maxLen[i] >= 7) head[i].dataset.w = 's';
+        else if (maxLen[i] > 0) {
+          // 极短列（状态、端口、序号等）：单元格不折行，避免“已完成”被压成一字一行
+          for (const row of table.rows) {
+            if (row.cells.length === head.length && row.cells[i].tagName === 'TD') {
+              row.cells[i].dataset.w = 'xs';
+            }
+          }
+        }
+      }
+    }
+    const box = document.createElement('div');
+    box.className = 'md-table';
+    table.replaceWith(box);
+    box.append(table);
+  }
+}
+
 /** 点了代码块的复制：复制这个代码块的文字，按钮变成对勾 1.5 秒 */
 async function onCopyClick(e) {
   const toggle = e.target.closest?.('.md-src');
@@ -251,6 +286,7 @@ export default function Markdown({ text, imageUrl, links, fileUrl, paths }) {
           else el.remove();
         }
         if (links) linkify(doc, links);
+        wrapTables(doc);
         addCopyButtons(doc, t('action.copy'), t('mermaid.zoom'));
         const box = document.createElement('div');
         box.appendChild(doc);

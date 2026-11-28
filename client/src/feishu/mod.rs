@@ -6,6 +6,7 @@
 //! 什么时候发、发给谁、按钮点了怎么办在 `notify.rs`。
 
 pub mod card;
+pub mod tidy;
 #[cfg(test)]
 pub(crate) mod fake;
 pub mod register;

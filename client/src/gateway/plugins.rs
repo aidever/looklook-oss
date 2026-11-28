@@ -26,6 +26,10 @@ pub fn api_routes() -> Router<App> {
     Router::new()
         .route("/plugin-store", get(list))
         .route("/plugin-store/{name}", axum::routing::delete(uninstall))
+        .route("/plugin-store/install-file", post(install_file))
+        .route("/plugin-store/offline", post(offline_add))
+        .route("/plugin-store/offline/{name}", axum::routing::delete(offline_remove))
+        .route("/plugin-store/{name}/offline-package", get(offline_package))
         .route("/plugin-store/{name}/install", post(install))
         .route("/plugin-store/{name}/restart", post(restart))
         .route("/plugins/{name}/{*rest}", any(api_proxy))
@@ -57,13 +61,46 @@ async fn install(State(app): State<App>, Path(name): Path<String>) -> R<impl Int
     Ok((StatusCode::ACCEPTED, Json(app.plugins.list(false).await)))
 }
 
+/// 从离线安装包装：`{ path }`（插件页先把文件分块传到 `incoming_dir`）
+async fn install_file(State(app): State<App>, Json(b): Json<Value>) -> R<Json<Value>> {
+    let path = b["path"].as_str().filter(|p| !p.is_empty()).ok_or_else(|| LocalError::invalid("path", "required"))?;
+    let name = app.plugins.install_file(std::path::Path::new(path)).await?;
+    app.plugins.forget_features();
+    let mut v = app.plugins.list(false).await;
+    v["installed_name"] = Value::from(name);
+    Ok(Json(v))
+}
+
+/// 粘贴离线授权码：`{ code }`
+async fn offline_add(State(app): State<App>, Json(b): Json<Value>) -> R<Json<Value>> {
+    let added = app.plugins.add_offline(b["code"].as_str().unwrap_or(""))?;
+    app.plugins.forget_features();
+    let mut v = app.plugins.list(false).await;
+    v["added"] = serde_json::json!(added);
+    Ok(Json(v))
+}
+
+async fn offline_remove(State(app): State<App>, Path(name): Path<String>) -> R<Json<Value>> {
+    app.plugins.remove_offline(&name)?;
+    app.plugins.forget_features();
+    Ok(Json(app.plugins.list(false).await))
+}
+
+/// 离线安装包的下载地址：`?platform=`（默认本机平台）
+async fn offline_package(State(app): State<App>, Path(name): Path<String>, axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>) -> R<Json<Value>> {
+    let platform = q.get("platform").cloned().unwrap_or_else(proto::current_platform);
+    Ok(Json(serde_json::json!({ "url": app.plugins.offline_package_url(&name, &platform).await? })))
+}
+
 async fn uninstall(State(app): State<App>, Path(name): Path<String>) -> R<Json<Value>> {
     app.plugins.uninstall(&name).await?;
+    app.plugins.forget_features();
     Ok(Json(app.plugins.list(false).await))
 }
 
 async fn restart(State(app): State<App>, Path(name): Path<String>) -> R<Json<Value>> {
     app.plugins.stop(&name).await;
+    app.plugins.forget_features();
     app.plugins.ensure(&name).await?;
     Ok(Json(app.plugins.list(false).await))
 }

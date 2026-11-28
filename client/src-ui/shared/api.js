@@ -1,5 +1,7 @@
 // 本机接口：同源、JSON；写请求带 X-Looklook-Client（避开平台保留的 X-LL-*）。错误统一抛出 ApiError（code + params）。
 
+import { withOperator } from './operator.js';
+
 export class ApiError extends Error {
   constructor(status, code, params = {}) {
     super(code);
@@ -108,6 +110,13 @@ function locate(id) {
   return routing.locating.get(id);
 }
 
+/** 会话在哪台电脑（新标签页里直接打开 /view?id=… 时还不知道）：多台电脑时去问一圈；只有一台时为 null */
+export async function locateTerminal(id) {
+  if (!routing.multi || !id) return null;
+  if (!routing.owners.has(id)) await locate(id);
+  return terminalDevice(id);
+}
+
 async function deviceFor(path, options) {
   if (!routing.multi) return null;
   if (options.device !== undefined) return isLocalDevice(options.device) ? null : options.device;
@@ -199,7 +208,9 @@ export async function fetchDevices() {
         for (const id of terminals) routing.owners.set(id, x.id);
         // direct：公网 HTTPS 直连地址（连不上时在提示里写出来）
         const direct = typeof x.direct?.url === 'string' ? { url: x.direct.url } : undefined;
-        return { id: x.id, name: x.name || '', os: x.os || '', online: x.online !== false, terminals, ...(direct ? { direct } : {}) };
+        // shared：别人的“共享电脑”（本机客户端代为转发，见 src/shared_pcs.rs），不在账户里
+        const shared = x.shared === true ? { shared: true, url: x.url || '', remark: x.remark || '', has_code: Boolean(x.has_code), problem: x.problem || null } : {};
+        return { id: x.id, name: x.name || '', os: x.os || '', online: x.online !== false, terminals, ...(direct ? { direct } : {}), ...shared };
       });
     // local_only：本机 App 的“只看本机”（远程打开时没有这个字段）
     return { items, default: d.default ?? null, max: d.max ?? null, localOnly: typeof d.local_only === 'boolean' ? d.local_only : null,
@@ -211,6 +222,7 @@ export async function fetchDevices() {
 }
 
 async function request(method, path, body, options = {}) {
+  body = withOperator(method, path, body);
   const headers = { Accept: 'application/json' };
   if (method !== 'GET') headers['X-Looklook-Client'] = '1';
   if (body !== undefined) headers['Content-Type'] = 'application/json';

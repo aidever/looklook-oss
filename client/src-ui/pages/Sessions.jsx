@@ -4,7 +4,7 @@
 // 侧栏每个项目只列最近几个，其余在项目页（Project.jsx）。
 // 项目 = 某台电脑上的一个文件夹（见 shared/sessions.jsx）。电脑用颜色 + 系统图标区分（shared/brands.jsx）。
 // 电脑上会话在右边打开，最近打开的几个在后台保持连接；手机上整页打开 /t/{id}（有按键条）。
-import { AlertCircle, Check, ChevronDown, ChevronsDownUp, ChevronsUpDown, Container, Copy, Eraser, EyeOff, Folder, FolderPlus, History, Laptop, Lightbulb, ListTree, Moon, PanelLeftClose, Pin, PinOff, Play, Plus, Search, Server, SlidersHorizontal, Trash2, X } from 'lucide-react';
+import { AlertCircle, Check, ChevronDown, ChevronsDownUp, ChevronsUpDown, Container, Copy, Eraser, EyeOff, Folder, FolderPlus, History, Laptop, Lightbulb, ListTree, Moon, PanelLeftClose, Pin, PinOff, Play, Plus, Search, Server, SlidersHorizontal, Trash2, Users, X } from 'lucide-react';
 import { createContext, useContext, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 
@@ -26,6 +26,7 @@ import KeyHint from '../shared/KeyHint.jsx';
 import { openSshHost, sshAddr, useSshHosts } from '../shared/sshHosts.js';
 import { ErrorNote, Spinner, useToast } from '../shared/ui.jsx';
 import { usePressActivate } from '../shared/press.js';
+import { operatorName, setOwnOperator } from '../shared/operator.js';
 import { AddProjectDialog } from './AddProject.jsx';
 import { HomeScreenTip, Onboarding } from './Onboarding.jsx';
 import { TipBar, useTip } from '../shared/tips.jsx';
@@ -56,6 +57,9 @@ const DEVF_KEY = 'looklook.devfilter';
 const QUERY_KEY = 'looklook.query';
 const ONLINE_KEY = 'looklook.devonline';
 const STATUS_KEY = 'looklook.sstatus';
+// 按谁开的看（多人协作插件的操作员签名）：'' 全部、ME 只看我的、其他是某个人的名字
+const BY_KEY = 'looklook.sby';
+const ME = '\u0001me';
 // 会话栏顶上的标签：会话 / SSH（连 SSH 主机的会话按主机分在 SSH 下），记在浏览器里
 const TAB_KEY = 'looklook.sidetab';
 const SIDE_TABS = ['sessions', 'ssh'];
@@ -327,6 +331,7 @@ function SessionRow({ inst, current, attn, devTag = false, recent = null }) {
   const tip = [
     title,
     mine && t('sess.my_name', { name: mine }),
+    inst.created_by && t('sess.by.opened_by', { name: inst.created_by }),
     inst.fg && t('sess.running_cmd', { cmd: inst.fg }),
     inst.container ? `${inst.container.name}:${dir}` : dir,
     when > 0 && t('sess.last_input', { when: new Date(when).toLocaleString() }),
@@ -347,6 +352,7 @@ function SessionRow({ inst, current, attn, devTag = false, recent = null }) {
           )}
           {!attn && recent && <RecentSub x={recent} device={dev} when={when} live />}
         </span>
+        {inst.created_by && <RowBy name={inst.created_by} />}
         {devTag && !recent && dev && <RowDevice device={dev} />}
         {a.busy ? (
           <Spinner size={13} />
@@ -362,6 +368,18 @@ function SessionRow({ inst, current, attn, devTag = false, recent = null }) {
       <PopMenu items={a.menu(true)} className="btn btn-plain btn-icon srow-more" />
       {rc.menu}
     </div>
+  );
+}
+
+/** 谁开的（操作员签名）：自己开的标“我”。 */
+function RowBy({ name }) {
+  const { t } = useTranslation();
+  const me = useOperator();
+  const mine = Boolean(me) && name === me;
+  return (
+    <span className={`srow-by ${mine ? 'mine' : ''}`} title={t('sess.by.opened_by', { name })}>
+      {mine ? t('sess.by.me') : name}
+    </span>
   );
 }
 
@@ -775,6 +793,83 @@ function ViewSwitch({ value, onChange, multi }) {
 }
 
 /** 状态筛选：全部 / 等你处理 / 正在运行 / 停了的和以前的对话。 */
+/** 现在用的操作员名字，改了跟着变。 */
+function useOperator() {
+  const [name, setName] = useState(operatorName);
+  useEffect(() => {
+    const on = () => setName(operatorName());
+    window.addEventListener('ll-operator', on);
+    window.addEventListener('storage', on);
+    return () => {
+      window.removeEventListener('ll-operator', on);
+      window.removeEventListener('storage', on);
+    };
+  }, []);
+  return name;
+}
+
+/**
+ * 按谁开的看：全部 / 只看我的 / 某个人。只在有会话带着签名时出现（那台电脑装了多人协作插件）。
+ * 下面可以改“我的名字”，新开的会话用它签名（存在这个浏览器里）。
+ */
+function PersonFilter({ value, onChange, people, me }) {
+  const { t } = useTranslation();
+  const { open, setOpen, ref } = usePopover();
+  const [draft, setDraft] = useState(me);
+  useEffect(() => setDraft(me), [me, open]);
+  const on = value !== '';
+  const label = value === ME ? t('sess.by.mine') : value || t('sess.by.all');
+  const pick = (v) => {
+    onChange(v);
+    setOpen(false);
+  };
+  const save = (e) => {
+    e.preventDefault();
+    setOwnOperator(draft);
+  };
+  return (
+    <div className="sfilter" ref={ref}>
+      <button type="button" className={`sfilter-chip ${on ? 'on' : ''}`} onClick={() => setOpen(!open)} aria-expanded={open} aria-haspopup="dialog">
+        <Users size={14} aria-hidden="true" />
+        <span className="ellipsis">{label}</span>
+        <ChevronDown size={13} aria-hidden="true" />
+      </button>
+      {on && (
+        <button type="button" className="sfilter-clear" onClick={() => onChange('')} aria-label={t('sess.filter_clear')} title={t('sess.filter_clear')}>
+          <X size={12} />
+        </button>
+      )}
+      {open && (
+        <div className="sfilter-pop" role="dialog" aria-label={t('sess.by.title')}>
+          <button type="button" className="sfilter-row" role="menuitemradio" aria-checked={value === ''} onClick={() => pick('')}>
+            <Check size={14} aria-hidden="true" style={{ visibility: value === '' ? 'visible' : 'hidden' }} />
+            <span className="grow">{t('sess.by.all')}</span>
+          </button>
+          <button type="button" className="sfilter-row" role="menuitemradio" aria-checked={value === ME} disabled={!me} onClick={() => pick(ME)}>
+            <Check size={14} aria-hidden="true" style={{ visibility: value === ME ? 'visible' : 'hidden' }} />
+            <span className="grow ellipsis">{me ? t('sess.by.mine_named', { name: me }) : t('sess.by.mine')}</span>
+          </button>
+          {people.filter(([n]) => n !== me).map(([n, c]) => (
+            <button key={n} type="button" className="sfilter-row" role="menuitemradio" aria-checked={value === n} onClick={() => pick(n)}>
+              <Check size={14} aria-hidden="true" style={{ visibility: value === n ? 'visible' : 'hidden' }} />
+              <span className="grow ellipsis">{n}</span>
+              <span className="sfilter-count">{c}</span>
+            </button>
+          ))}
+          <form className="sfilter-me" onSubmit={save}>
+            <label className="sfilter-me-label" htmlFor="ll-operator-name">{t('sess.by.my_name')}</label>
+            <div className="sfilter-me-row">
+              <input id="ll-operator-name" value={draft} maxLength={32} onChange={(e) => setDraft(e.target.value)} placeholder={t('sess.by.my_name_placeholder')} spellCheck={false} />
+              <button type="submit" className="btn btn-sm" disabled={draft.trim() === me}>{t('action.save')}</button>
+            </div>
+            <p className="sfilter-me-hint">{t('sess.by.my_name_hint')}</p>
+          </form>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function StatusFilter({ value, onChange }) {
   const { t } = useTranslation();
   const { open, setOpen, ref } = usePopover();
@@ -812,6 +907,7 @@ export function SessionList({ currentId, onCollapse }) {
   const { navigate } = useRouter();
   const devices = useDevices();
   const s = useSessions();
+  const { status: hostStatus } = useStatus();
   const ui = useSessionUi();
   const [query, setQueryState] = useState(() => readStore(sessionStorage, QUERY_KEY, ''));
   const setQuery = (q) => {
@@ -872,6 +968,20 @@ export function SessionList({ currentId, onCollapse }) {
     setStatusState(v);
     writeStore(sessionStorage, STATUS_KEY, v);
   };
+  const me = useOperator();
+  const [byState, setByState] = useState(() => {
+    const v = readStore(sessionStorage, BY_KEY, '');
+    return typeof v === 'string' ? v : '';
+  });
+  const setBy = (v) => {
+    setByState(v);
+    writeStore(sessionStorage, BY_KEY, v);
+  };
+  // 谁开了几个（只数带签名的）；没人签过名就不显示这个筛选
+  const people = [...s.items.reduce((m, i) => (i.created_by ? m.set(i.created_by, (m.get(i.created_by) ?? 0) + 1) : m), new Map())].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
+  // 那台电脑开着操作员签名（多人协作插件）时也显示，好先填名字
+  const signing = people.length > 0 || Boolean(hostStatus?.features?.includes?.('operator'));
+  const by = !signing ? '' : byState === ME ? me : byState;
   // 折叠：用户点过的记住；没点过的，只展开最近用过的 3 个、有会话在等你的和正开着的那个，其他收起
   // （收起的项目行上照样显示几个在运行、有没有在等你，不会漏看）
   const [cleanup, setCleanup] = useState(false);
@@ -892,12 +1002,14 @@ export function SessionList({ currentId, onCollapse }) {
   const picked = multi ? devFilter.filter((id) => devices.items.some((d) => d.id === id)) : [];
   const devOk = (dev) => !multi || ((picked.length === 0 || picked.includes(dev)) && (!onlineOnly || devices.byId(dev)?.online));
   // 状态筛选：等你处理、正在运行只看在运行的会话；“停了的和以前的对话”只看其余的
-  const instOk = (i) => (status === 'attn' ? sessionState(i) === 'attn' : status === 'running' ? isLive(i) : status === 'rest' ? !isLive(i) : true) && (!match || match(i));
+  const byOk = (i) => !by || i.created_by === by;
+  const instOk = (i) => byOk(i) && (status === 'attn' ? sessionState(i) === 'attn' : status === 'running' ? isLive(i) : status === 'rest' ? !isLive(i) : true) && (!match || match(i));
+  // 以前的对话没有签名：按人看时不列
   const restOk = status !== 'attn' && status !== 'running';
-  const filtering = Boolean(match) || status !== 'all';
+  const filtering = Boolean(match) || status !== 'all' || Boolean(by);
   // 搜索、按状态筛选时项目默认都展开（符合的都看得到），点了也能收起；只记在这一次筛选里，不改平时的折叠
   const [filterFold, setFilterFold] = useState({});
-  const filterKey = `${query.trim()}|${status}`;
+  const filterKey = `${query.trim()}|${status}|${by}`;
   const [seenFilter, setSeenFilter] = useState(filterKey);
   if (seenFilter !== filterKey) {
     setSeenFilter(filterKey);
@@ -915,7 +1027,7 @@ export function SessionList({ currentId, onCollapse }) {
         const e = projectEntries(m);
         const tag = (r) => ({ ...r, m });
         const live = e.live.map(tag).filter((r) => instOk(r.inst));
-        const rest = restOk ? e.rest.map(tag).filter((r) => (r.kind === 'inst' ? instOk(r.inst) : !match || convMatch(r.conv))) : [];
+        const rest = restOk ? e.rest.map(tag).filter((r) => (r.kind === 'inst' ? instOk(r.inst) : !by && (!match || convMatch(r.conv)))) : [];
         return { m, live, rest, count: e.count };
       });
       const ms = g.members;
@@ -934,9 +1046,9 @@ export function SessionList({ currentId, onCollapse }) {
         items: ms.flatMap((m) => m.items),
       };
     })
-    .filter((x) => (!filtering ? true : x.live.length + x.rest.length > 0 || (match && status === 'all' && x.p.name.toLowerCase().includes(query.trim().toLowerCase()))));
+    .filter((x) => (!filtering ? true : x.live.length + x.rest.length > 0 || (match && status === 'all' && !by && x.p.name.toLowerCase().includes(query.trim().toLowerCase()))));
   const topKeys = new Set([...projects].sort((a, b) => Math.max(b.used, b.convAt) - Math.max(a.used, a.convAt)).slice(0, 3).map((x) => x.key));
-  const attnAll = status === 'rest' ? [] : s.items.filter((i) => sessionState(i) === 'attn' && devOk(multi ? terminalDevice(i.id) : null) && (!match || match(i)));
+  const attnAll = status === 'rest' ? [] : s.items.filter((i) => sessionState(i) === 'attn' && byOk(i) && devOk(multi ? terminalDevice(i.id) : null) && (!match || match(i)));
   const attn = attnAll.filter((i) => Boolean(sshHostOf(i)) === ssh);
   // 另一个标签下有等你处理的：标签上亮个点
   const otherAttn = attnAll.length > attn.length;
@@ -1157,11 +1269,12 @@ export function SessionList({ currentId, onCollapse }) {
             </button>
           </label>
         )}
-        {(multi || searchable || s.projects.length > 0) && (
+        {(multi || searchable || s.projects.length > 0 || signing) && (
           <div className="sfilters" role="group" aria-label={t('sess.filters')}>
             {!ssh && s.projects.length > 0 && <ViewSwitch value={groupBy === 'device' && !multi ? 'project' : groupBy} onChange={setGroupBy} multi={multi} />}
             {multi && <DeviceFilter value={picked} onChange={setDevFilter} online={onlineOnly} onOnline={setOnline} counts={counts} />}
             {(multi || searchable) && <StatusFilter value={status} onChange={setStatus} />}
+            {signing && !ssh && <PersonFilter value={byState} onChange={setBy} people={people} me={me} />}
           </div>
         )}
       </div>

@@ -2,7 +2,7 @@
 // 新建的会话用默认的（开始页可以另选），之后切换默认不影响已经建好的会话。两个助手共用这里的组件，`agent` 区分。
 // 官方账号的登录由 Claude Code 自己完成（后台运行 `claude auth login`，界面显示授权页地址、收授权码），看看不经手令牌。
 // 第三方接口可以从“常见服务商”里选（model_presets.rs）：地址填好了，贴上 Key 就行，模型从 models.dev 的列表里选。
-import { Check, CircleCheck, CircleX, Cpu, ExternalLink, Gauge, KeyRound, ListRestart, LogIn, Plus, Server, SlidersHorizontal, Sparkles, UserRound, Zap } from 'lucide-react';
+import { Check, CircleCheck, CircleX, Cpu, ExternalLink, Gauge, KeyRound, ListRestart, LogIn, LogOut, Plus, Server, SlidersHorizontal, Sparkles, UserRound, Zap } from 'lucide-react';
 import { createContext, useContext, useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 
@@ -109,12 +109,13 @@ export function KindIcon({ p, size = 15 }) {
   return <Icon size={size} aria-hidden="true" />;
 }
 
-/** 官方账号的登录状态：每个单独问（`claude auth status` 要一两秒）。`expired`：查用量时发现登录失效了 */
+/** 官方账号的登录状态：每个单独问（`claude auth status` / `codex login status` 要一两秒）。`expired`：查用量时发现登录失效了 */
 function LoginStatus({ s, err, expired, agent = 'claude' }) {
   const { t } = useTranslation();
-  if (err || s?.error) return <span className="muted">{t(s?.error === 'not_installed' ? (agent === 'agy' ? 'aprof.not_installed' : 'cprof.not_installed') : 'cprof.status_failed')}</span>;
+  const notInstalledKey = agent === 'agy' ? 'aprof.not_installed' : agent === 'codex' ? 'xprof.not_installed' : 'cprof.not_installed';
+  if (err || s?.error) return <span className="muted">{t(s?.error === 'not_installed' ? notInstalledKey : 'cprof.status_failed')}</span>;
   if (!s) return <span className="muted">{t('cprof.checking')}</span>;
-  if (!s.logged_in) return <span className="cprof-warn">{t(expired ? 'cprof.expired' : 'cprof.logged_out')}</span>;
+  if (!s.logged_in) return <span className="cprof-warn">{t(expired ? 'cprof.expired' : agent === 'codex' ? 'xprof.logged_out' : 'cprof.logged_out')}</span>;
   // 本机默认账号也可能是环境变量里的 Key（authMethod 不是 claude.ai）
   const who = s.email || (s.auth_method && s.auth_method !== 'claude.ai' ? t(`cprof.auth.${s.auth_method}`, { defaultValue: s.auth_method }) : '');
   return (
@@ -1036,14 +1037,15 @@ function TuningModal({ agent, p, onClose, onSaved }) {
  * 一个配置。Claude Code 的官方账号：已登录时按钮是“查用量”（请 Claude Code 去取，顺便确认登录状态；登录失效就提示重新登录），
  * 没登录时是“登录”，“重新登录”在更多菜单里。Codex 的本机默认只是说明（Codex 自己的登录和配置）。
  */
-function ProfileRow({ agent, p, isDefault, busy, nonce, onDefault, onLogin, onEdit, onTune, onRemove, only }) {
+function ProfileRow({ agent, p, isDefault, busy, nonce, onDefault, onLogin, onLogout, onEdit, onTune, onRemove, only }) {
   const api = useApi();
   const { t } = useTranslation();
   const toast = useToast();
   const cfg = AGENTS[agent];
   const official = p.kind === 'official' || agent === 'agy';
   const hasLogin = official && (agent === 'claude' || agent === 'agy');
-  const [loaded, err] = useLoad(() => (hasLogin ? api.get(`${cfg.base}/${p.id}/status`) : Promise.resolve(null)), [agent, p.id, nonce]);
+  const hasStatus = official && (agent === 'claude' || agent === 'agy' || agent === 'codex');
+  const [loaded, err] = useLoad(() => (hasStatus ? api.get(`${cfg.base}/${p.id}/status`) : Promise.resolve(null)), [agent, p.id, nonce]);
   // 查用量时顺便拿到的登录状态比上面问到的新；重新问过之后以问到的为准
   const [fresh, setFresh] = useState(null);
   useEffect(() => setFresh(null), [loaded]);
@@ -1118,7 +1120,7 @@ function ProfileRow({ agent, p, isDefault, busy, nonce, onDefault, onLogin, onEd
           {isDefault && <span className="badge badge-ok">{t('cprof.default')}</span>}
         </b>
         <span className="small" style={{ display: 'block' }}>
-          {hasLogin ? (
+          {hasStatus ? (
             <LoginStatus s={s} err={err} expired={usage?.state === 'logged_out'} agent={agent} />
           ) : official ? (
             <span className="muted">{t('xprof.builtin_desc')}</span>
@@ -1163,7 +1165,7 @@ function ProfileRow({ agent, p, isDefault, busy, nonce, onDefault, onLogin, onEd
             {t('cprof.usage')}
           </Button>
         )}
-        {/* Claude Code 的本机默认账号也能改名、从列表里去掉（只剩它一个时不能去掉）；Codex 的本机默认只能改模型设置；Antigravity 的本机默认可改名、不能删除 */}
+        {/* Claude Code、Antigravity、Codex 的官方账号（含只有 1 个本机默认账号时）已登录都可以退出登录 */}
         <PopMenu
             label={t('action.more')}
             items={[
@@ -1172,6 +1174,7 @@ function ProfileRow({ agent, p, isDefault, busy, nonce, onDefault, onLogin, onEd
               !isDefault && { icon: Check, label: t('cprof.make_default'), onClick: () => onDefault(p) },
               { icon: SlidersHorizontal, label: t('tune.menu'), hint: t(`tune.menu_hint_${agent}`), onClick: () => onTune(p) },
               (p.id !== 'official' || agent === 'claude' || agent === 'agy') && { label: t(p.kind === 'api' ? 'cprof.edit' : 'cprof.rename'), onClick: () => onEdit(p) },
+              hasStatus && loggedIn && { icon: LogOut, label: t('cprof.logout'), danger: true, onClick: () => onLogout(p) },
               !(p.id === 'official' && (only || agent === 'codex' || agent === 'agy')) && { label: t(p.id === 'official' ? 'cprof.hide_builtin' : 'action.delete'), danger: true, onClick: () => onRemove(p) },
             ]}
           />
@@ -1196,7 +1199,6 @@ function ProfilesCard({ agent, bare }) {
     if (data && window.location.hash === `#${cfg.anchor}`) document.getElementById(cfg.anchor)?.scrollIntoView({ block: 'start' });
   }, [Boolean(data)]);
   useEffect(() => {
-    if (agent !== 'claude' && agent !== 'agy') return undefined;
     const again = () => document.visibilityState === 'visible' && setNonce((n) => n + 1);
     document.addEventListener('visibilitychange', again);
     return () => document.removeEventListener('visibilitychange', again);
@@ -1205,6 +1207,22 @@ function ProfilesCard({ agent, bare }) {
   // 正在登录的账号（弹出登录框）
   const [loggingIn, setLoggingIn] = useState(null);
   const login = (p) => setLoggingIn(p);
+  const logout = async (p) => {
+    const name = profileName(t, p, agent);
+    const ok = await confirm({
+      title: t('cprof.logout_title', { name }),
+      body: t(`${cfg.t}.logout_body`),
+      confirm: t('cprof.logout'),
+      danger: true,
+    });
+    if (!ok) return;
+    const r = await run(() => api.post(`${cfg.base}/${p.id}/logout`, {}));
+    if (r) {
+      apply(r);
+      setNonce((n) => n + 1);
+      toast(t('cprof.logout_done', { name }));
+    }
+  };
   const setDefault = async (p) => {
     const r = await run(() => api.put(`${cfg.base}/default`, { id: p.id }));
     if (r) {
@@ -1285,6 +1303,7 @@ function ProfilesCard({ agent, bare }) {
                 nonce={nonce}
                 onDefault={setDefault}
                 onLogin={login}
+                onLogout={logout}
                 onEdit={(x) => setForm({ kind: x.kind || 'official', initial: x })}
                 onTune={(x) => setForm({ kind: 'tune', initial: x })}
                 onRemove={remove}

@@ -636,6 +636,7 @@ mod tests {
         let chat = crate::chat::Chat::new(store.clone(), paths.clone(), instances.clone());
         Arc::new(crate::gateway::Inner {
             direct: crate::direct_tls::Direct::new(store.clone(), 1),
+            shared: Arc::new(crate::shared_pcs::SharedPcs::new(store.clone())),
             account: account.clone(),
             instances,
             updater,

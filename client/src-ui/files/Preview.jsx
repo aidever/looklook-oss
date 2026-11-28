@@ -194,10 +194,11 @@ function richKind(name, office) {
  * `insertLabel`：填路径按钮的说明（对话会话里填进输入框，其他填进终端）。
  * `edit`：打开就进编辑（对话页 /memory 刚新建的空 CLAUDE.md）；`diff`：打开就看和会话开始前比改了什么。
  * `onOpenPath(path)`：另存为、解压之后打开新的文件 / 文件夹（“文件”页传）。
+ * `linked`：false 时不提供填进对话 / 评论这几行（新标签页里的查看页，旁边没有对话）。
  * 文字（设计稿 §4）：按原编码读写（/fs/read、/fs/write），可以换编码；大文件分段看；没存的改动记成草稿；
  * 外面改了文件：只读时自动重读，编辑时提示（对比 / 用磁盘上的 / 保留我的）。
  */
-export function Preview({ ep, entry, onClose, onInsert, insertLabel, sep, focus = null, extra = null, device = null, active = true, onAsk, edit = false, diff: diffInit = false, onOpenPath, onDirty }) {
+export function Preview({ ep, entry, onClose, onInsert, insertLabel, sep, focus = null, extra = null, device = null, active = true, onAsk, edit = false, diff: diffInit = false, onOpenPath, onDirty, linked = true }) {
   const { t } = useTranslation();
   const toast = useToast();
   const confirm = useConfirm();
@@ -222,7 +223,7 @@ export function Preview({ ep, entry, onClose, onInsert, insertLabel, sep, focus 
   const keepScroll = useRef(null);
   const body = useRef(null);
   // 没传 onAsk：对话里点开的文件，“让 AI 改”填进这个会话的对话输入框；传 null 表示不提供
-  const ask = onAsk === undefined ? (ep.id ? (text) => {
+  const ask = onAsk === undefined ? (linked && ep.id ? (text) => {
     window.dispatchEvent(new CustomEvent(`ll-chat-insert:${ep.id}`, { detail: text }));
     if (touchUi) onClose?.();
   } : null) : onAsk;
@@ -574,7 +575,7 @@ export function Preview({ ep, entry, onClose, onInsert, insertLabel, sep, focus 
   };
   // 评论这几行：作为引用放进对话输入框（和划词评论一样，发出去时带上）
   const comment = () => {
-    if (!ep.id || !sel) return;
+    if (!linked || !ep.id || !sel) return;
     const code = sel.text.length > 4000 ? `${sel.text.slice(0, 4000)}\n…` : sel.text;
     window.dispatchEvent(new CustomEvent(`ll-chat-quote:${ep.id}`, { detail: { quote: `${entry.path}:${lines}\n${code}`, note: '', focus: 'note' } }));
     if (touchUi) onClose?.();
@@ -663,16 +664,17 @@ export function Preview({ ep, entry, onClose, onInsert, insertLabel, sep, focus 
           </span>
         )}
         {rich && state.text != null && !editing && !diffOn && (
-          <button
-            type="button"
-            className="btn btn-plain btn-icon"
-            onClick={() => setRendered(!rendered)}
-            aria-pressed={!rendered}
-            aria-label={t(rendered ? 'fb.md_source' : `fv.rich_${rich}`)}
-            title={t(rendered ? 'fb.md_source' : `fv.rich_${rich}`)}
-          >
-            {rendered ? <Code2 size={16} /> : rich === 'csv' ? <FileSpreadsheet size={16} /> : rich === 'html' ? <Globe size={16} /> : rich === 'json' ? <Braces size={16} /> : <BookOpen size={16} />}
-          </button>
+          // 看效果 / 看源码：两个按钮并排，现在是哪种一眼看得出（以前一个图标显示的是“另一种”）
+          <span className="seg seg-xs fv-viewseg" role="group" aria-label={t('fv.view_mode')}>
+            <button type="button" aria-pressed={rendered} onClick={() => setRendered(true)} title={t(`fv.rich_${rich}`)}>
+              {rich === 'csv' ? <FileSpreadsheet size={14} aria-hidden="true" /> : rich === 'html' ? <Globe size={14} aria-hidden="true" /> : rich === 'json' ? <Braces size={14} aria-hidden="true" /> : <BookOpen size={14} aria-hidden="true" />}
+              <span className="fv-viewseg-text">{t(`fv.rich_${rich}`)}</span>
+            </button>
+            <button type="button" aria-pressed={!rendered} onClick={() => setRendered(false)} title={t('fv.source')}>
+              <Code2 size={14} aria-hidden="true" />
+              <span className="fv-viewseg-text">{t('fv.source')}</span>
+            </button>
+          </span>
         )}
         {image && state.url && (
           <button type="button" className="btn btn-plain btn-icon" onClick={() => setZoom(true)} aria-label={t('fb.zoom')} title={t('fb.zoom')}>
@@ -687,7 +689,7 @@ export function Preview({ ep, entry, onClose, onInsert, insertLabel, sep, focus 
         {editing ? (
           <>
             {dirty && <span className="muted small fv-unsaved">{t('fb.unsaved')}</span>}
-            {ep.id && sel && (
+            {linked && ep.id && sel && (
               <button type="button" className="btn btn-plain btn-icon" onClick={comment} aria-label={t('fv.comment')} title={t('fv.comment_hint')}>
                 <MessageSquarePlus size={16} />
               </button>
@@ -708,7 +710,7 @@ export function Preview({ ep, entry, onClose, onInsert, insertLabel, sep, focus 
                 {t('fb.ask_ai')}
               </button>
             )}
-            {ep.id && sel && (
+            {linked && ep.id && sel && (
               <button type="button" className="btn btn-plain btn-icon" onClick={comment} aria-label={t('fv.comment')} title={t('fv.comment_hint')}>
                 <MessageSquarePlus size={16} />
               </button>

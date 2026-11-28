@@ -23,6 +23,7 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod attach;
+mod shared_pcs;
 mod native_term;
 mod account;
 mod agent_update;
@@ -203,6 +204,13 @@ enum Cmd {
     },
     /// 查看状态 / Show status
     Status,
+    /// 显示本机机器指纹（申请插件离线授权码用）/ Show this computer's fingerprint (for plugin offline license codes)
+    Fingerprint,
+    /// 填插件离线授权码；不填则列出已填的 / Enter a plugin offline license code; lists entered codes when omitted
+    License {
+        /// 管理员按机器指纹生成的授权码 / The code an admin generated for this fingerprint
+        code: Option<String>,
+    },
     /// 重启客户端，终端里的任务不受影响 / Restart the client; running tasks keep running
     Restart,
     /// 检查并安装新版本，终端里的任务不受影响 / Check for and install a new version; running tasks keep running
@@ -414,6 +422,32 @@ fn main() -> Result<()> {
             println!("本机地址 / Local URL: {}", local_url(&cli.home, cli_listen).unwrap_or_else(|_| "-".into()));
             if let Ok(a) = rt.block_on(call(&cli.home, cli_listen, "GET", "/api/access", None)) {
                 print_access(&a);
+            }
+            Ok(())
+        }
+        Some(Cmd::Fingerprint) => {
+            let paths = Paths::discover(cli.home)?;
+            println!("{}", looklook_protocol::plugin::machine_fingerprint(&paths.home)?);
+            Ok(())
+        }
+        Some(Cmd::License { code }) => {
+            let v = match code {
+                Some(c) => rt.block_on(call(&cli.home, cli_listen, "POST", "/api/plugin-store/offline", Some(json!({ "code": c }))))?,
+                None => rt.block_on(call(&cli.home, cli_listen, "GET", "/api/plugin-store?local=1", None))?,
+            };
+            println!("机器指纹 / Fingerprint: {}", v["machine"].as_str().unwrap_or("-"));
+            let items = v["offline"].as_array().cloned().unwrap_or_default();
+            if items.is_empty() {
+                println!("还没有离线授权码 / No offline license codes");
+            }
+            for i in items {
+                let state = match i["state"].as_str().unwrap_or("") {
+                    "valid" => "有效 / valid",
+                    "expired" => "已过期 / expired",
+                    "other_machine" => "不是这台电脑的 / for another computer",
+                    _ => "无效 / invalid",
+                };
+                println!("{}  {}  {}", i["plugin"].as_str().unwrap_or("-"), i["expires_at"].as_str().unwrap_or("-"), state);
             }
             Ok(())
         }
@@ -733,6 +767,7 @@ async fn run(home: Option<PathBuf>, listen: Option<SocketAddr>, server: Option<S
     let _ = std::fs::remove_file(paths.home.join("local-token")); // 旧版本的本机访问口令，已不再使用
     let app = Arc::new(Inner {
         direct: direct_tls::Direct::new(store.clone(), ui_addr.port()),
+        shared: Arc::new(shared_pcs::SharedPcs::new(store.clone())),
         account: account.clone(),
         instances: instances.clone(),
         updater: updater.clone(),
@@ -1422,6 +1457,9 @@ fn cli_error(code: &str, params: &Value) -> String {
             )
         }
         "DEVICE_LIMIT_REACHED" => device_limit_text(params),
+        "LICENSE_CODE_INVALID" => "授权码不对，请整段复制后再试 / The license code is invalid; copy the whole code and try again".into(),
+        "LICENSE_CODE_MACHINE" => "这个授权码不是给这台电脑的，请用 looklook fingerprint 的指纹重新申请 / This code is for another computer; request one for the fingerprint from looklook fingerprint".into(),
+        "LICENSE_CODE_EXPIRED" => "这个授权码已经过期 / This license code has expired".into(),
         "MEMBERSHIP_EXPIRED" => "会员已到期，请先在看看网页续费 / Membership expired; renew it on the Looklook website".into(),
         "ACCOUNT_DISABLED" => "账户已停用 / This account is disabled".into(),
         "NETWORK" => "连不上看看服务器，请检查网络 / Can't reach the Looklook server; check the network".into(),

@@ -415,6 +415,9 @@ pub async fn exchange(app: &App, req: ExchangeReq) -> Result<ExchangeResp, Local
 
 /// 发起方：和一台电脑对一次账（§5.1）。
 async fn dial(app: &App, own: &str, dev: &str) -> Result<usize, LocalError> {
+    if crate::shared_pcs::is_shared(dev) {
+        return Err(LocalError::new("REMOTE_FORBIDDEN"));
+    }
     let link = app.outbound.link(&app.account, dev).await.map_err(|e| e.local())?;
     // 第一趟只带摘要，拿到对方的摘要后再发对方缺的；双方都没有剩下的就齐了
     let mut records = Vec::new();
@@ -503,7 +506,9 @@ impl Syncer {
                 Ok(d) => d,
                 Err(_) => continue,
             };
-            let online: HashSet<String> = devices.items.iter().filter(|d| d.online && d.id != own).map(|d| d.id.clone()).collect();
+            // 只和同一账户的电脑同步，绝不和共享电脑（crate::shared_pcs，不在平台的列表里）对账
+            let online: HashSet<String> =
+                devices.items.iter().filter(|d| d.online && d.id != own && !crate::shared_pcs::is_shared(&d.id)).map(|d| d.id.clone()).collect();
             for dev in &online {
                 if lock(&self.old).contains(dev) {
                     continue;

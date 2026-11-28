@@ -166,6 +166,18 @@ fn input_key(id: &str) -> String {
 const INPUT_SAVE_MS: i64 = 15_000;
 
 /// 最近一次在界面上打开这个会话的时间（毫秒，界面开着它时每几分钟报一次）：自动停掉很久没打开的会话用（idle_stop.rs）
+/// 谁开的这个会话（操作人署名，只用来显示和筛选，不管权限）
+fn by_key(id: &str) -> String {
+    format!("instance_by.{id}")
+}
+
+/// 操作人署名：去掉控制字符和看不见的排版字符（零宽、方向控制），空白并成一个，最多 32 个字。
+pub fn clean_operator(s: &str) -> String {
+    let invisible = |c: char| c.is_control() || matches!(c, '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{2069}' | '\u{FEFF}');
+    let kept: String = s.chars().map(|c| if c.is_whitespace() { ' ' } else { c }).filter(|c| !invisible(*c)).collect();
+    kept.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(32).collect::<String>().trim_end().to_string()
+}
+
 fn opened_key(id: &str) -> String {
     format!("instance_opened.{id}")
 }
@@ -260,6 +272,8 @@ pub struct View {
     pub codex_profile: Option<String>,
     /// Antigravity 用哪个账号（agy_profiles.rs）；新建时记下的，没记下时 null
     pub agy_profile: Option<String>,
+    /// 谁开的（操作人署名：浏览器里的昵称或登录账户的昵称）；没署名时 null
+    pub created_by: Option<String>,
 }
 
 /// 启动选项（不在 SQLite 的 instances 表里，单独存在 kv：`instance_opts.{id}`）。
@@ -347,6 +361,9 @@ pub struct Input {
     /// `agy_profile` 是 `"auto"` 时按哪个模型的额度挑账号（草稿页选的模型；不填按 agy 默认的 Gemini）
     #[serde(default)]
     pub agy_model: Option<String>,
+    /// 操作人署名（见 [`clean_operator`]）。只在新建时有效，只用来显示和筛选
+    #[serde(default)]
+    pub created_by: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -542,6 +559,7 @@ impl Instances {
             claude_profile: crate::claude_profiles::pinned(&self.store, &row.id),
             codex_profile: crate::codex_profiles::pinned(&self.store, &row.id),
             agy_profile: crate::agy_profiles::pinned(&self.store, &row.id),
+            created_by: self.store.get::<String>(&by_key(&row.id)).ok().flatten(),
             container: self.container(&row.id),
             running,
             task_alive,
@@ -957,6 +975,9 @@ impl Instances {
                 .then(|| crate::agy_profiles::resolve_auto(&self.store, &self.paths.home, input.agy_model.as_deref()));
             crate::agy_profiles::pin(&self.store, &row.id, picked.as_deref().or(agy_profile.as_deref()))?;
         }
+        if let Some(by) = input.created_by.as_deref().map(clean_operator).filter(|s| !s.is_empty()) {
+            self.store.set(&by_key(&row.id), &by)?;
+        }
         if let Some(r) = input.resume {
             if !r.fork {
                 self.store.set(&resume_key(&row.id), &r.id)?;
@@ -1104,6 +1125,7 @@ impl Instances {
         let _ = self.store.remove(&container_key(id));
         let _ = self.store.remove(&resume_key(id));
         let _ = self.store.remove(&opened_key(id));
+        let _ = self.store.remove(&by_key(id));
         let _ = self.store.remove(&idle_resume_key(id));
         let _ = self.store.remove(&input_key(id));
         lock(&self.inputs).remove(id);
@@ -3095,5 +3117,21 @@ mod tests {
         let claude_ui_view = inst.view(claude_ui_row.clone(), None);
         assert!(inst.claude_sdk_mode(&claude_ui_row));
         assert_eq!(inst.resolve_tool(&claude_ui_view, None, true), Some("claude"));
+    }
+}
+
+#[cfg(test)]
+mod operator_tests {
+    use super::clean_operator;
+
+    #[test]
+    fn operator_name_is_cleaned() {
+        assert_eq!(clean_operator("  小王  "), "小王");
+        assert_eq!(clean_operator("a\u{0}b\u{7}\nc"), "ab c");
+        assert_eq!(clean_operator("x\u{202E}gpj.exe\u{200B}"), "xgpj.exe", "方向控制、零宽字符去掉");
+        assert_eq!(clean_operator("a \t\r\n  b"), "a b");
+        assert_eq!(clean_operator(&"名".repeat(40)).chars().count(), 32);
+        assert_eq!(clean_operator(&format!("{} z", "a".repeat(31))), "a".repeat(31), "截断后不留结尾空格");
+        assert_eq!(clean_operator("\u{200B} \u{FEFF}"), "");
     }
 }

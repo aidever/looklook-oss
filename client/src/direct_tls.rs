@@ -78,6 +78,41 @@ const MUX_JTI_MAX_USES: u8 = 8;
 type HmacSha256 = Hmac<Sha256>;
 type Pending = Arc<Mutex<HashMap<String, String>>>;
 
+/// 单套自定义 TLS 证书路径对（证书链 PEM + 私钥 PEM）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct TlsCertPair {
+    pub cert_path: String,
+    pub key_path: String,
+}
+
+/// 界面展示的自定义证书状态（包含解析出的域名/IP SAN 与有效期）。
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct CustomCertView {
+    pub cert_path: String,
+    pub key_path: String,
+    pub ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub not_after: Option<i64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sans: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// 单个直连地址的连通性测试结果。
+#[derive(Debug, Clone, Serialize)]
+pub struct ProbeResult {
+    pub ok: bool,
+    pub ms: u64,
+    /// `ok` | `tls_untrusted` | `host_rejected` | `wrong_target` | `timeout` | `unreachable` | `invalid_url`
+    pub code: &'static str,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub app_only: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct DirectConfig {
@@ -86,17 +121,34 @@ pub struct DirectConfig {
     /// 用户添加的内网穿透 / 反向代理 / DDNS / 端口映射地址
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub custom_urls: Vec<String>,
-    /// 高级选项：自定义 TLS 证书链 PEM 路径
+    /// 兼容旧版：单套自定义 TLS 证书链 PEM 路径
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub tls_cert_path: String,
-    /// 高级选项：自定义 TLS 私钥 PEM 路径
+    /// 兼容旧版：单套自定义 TLS 私钥 PEM 路径
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub tls_key_path: String,
+    /// 多套自定义 TLS 证书（按 TLS SNI 自动匹配域名）
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tls_certs: Vec<TlsCertPair>,
 }
 
 impl DirectConfig {
     pub fn load(store: &Store) -> Self {
         store.get(KEY_CONFIG).ok().flatten().unwrap_or_default()
+    }
+
+    /// 合并新版 `tls_certs` 与旧版单套 `tls_cert_path`/`tls_key_path`。
+    pub fn effective_tls_certs(&self) -> Vec<TlsCertPair> {
+        if !self.tls_certs.is_empty() {
+            return self.tls_certs.clone();
+        }
+        if !self.tls_cert_path.is_empty() && !self.tls_key_path.is_empty() {
+            return vec![TlsCertPair {
+                cert_path: self.tls_cert_path.clone(),
+                key_path: self.tls_key_path.clone(),
+            }];
+        }
+        Vec::new()
     }
 }
 
@@ -132,6 +184,25 @@ struct SelfStored {
 enum CertSan {
     Dns(String),
     Ip(IpAddr),
+}
+
+impl CertSan {
+    fn display(&self) -> String {
+        match self {
+            CertSan::Dns(d) => d.clone(),
+            CertSan::Ip(ip) => ip.to_string(),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct LoadedCustomCert {
+    cert_path: String,
+    key_path: String,
+    ck: Arc<CertifiedKey>,
+    not_after: i64,
+    sha256_hex: String,
+    sans: Vec<CertSan>,
 }
 
 #[derive(Clone, Default)]
@@ -212,6 +283,8 @@ pub struct Direct {
     self_sha256: String,
     cert: RwLock<Option<Arc<CertifiedKey>>>,
     tls_meta: RwLock<ActiveTls>,
+    /// 按 SNI 自动匹配的多套自定义证书
+    custom_certs: RwLock<Vec<LoadedCustomCert>>,
     status: Mutex<Status>,
     /// 当前待验证的 http-01 token → key authorization（管理台端口和临时监听的 80 端口共用）
     pending: Pending,
@@ -476,9 +549,22 @@ fn san_matches_host(san: &CertSan, host: &str) -> bool {
     }
 }
 
+fn expand_tilde(path: &str) -> std::path::PathBuf {
+    let trimmed = path.trim();
+    if trimmed == "~" {
+        return dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from(trimmed));
+    }
+    if let Some(rest) = trimmed.strip_prefix("~/").or_else(|| trimmed.strip_prefix("~\\")) {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(rest);
+        }
+    }
+    std::path::PathBuf::from(trimmed)
+}
+
 fn load_custom_pem(cert_path: &str, key_path: &str) -> Result<(CertifiedKey, i64, String, Vec<CertSan>), &'static str> {
-    let chain = std::fs::read_to_string(cert_path).map_err(|_| "cert_read")?;
-    let key = std::fs::read_to_string(key_path).map_err(|_| "key_read")?;
+    let chain = std::fs::read_to_string(expand_tilde(cert_path)).map_err(|_| "cert_read")?;
+    let key = std::fs::read_to_string(expand_tilde(key_path)).map_err(|_| "key_read")?;
     let ck = certified_key(&chain, &key).map_err(|_| "cert_invalid")?;
     let (_, not_after) = validity(&ck.cert[0]).ok_or("cert_invalid")?;
     if not_after <= now_s() {
@@ -514,6 +600,7 @@ impl Direct {
             self_cert,
             self_sha256,
             tls_meta: RwLock::new(init_meta),
+            custom_certs: RwLock::new(Vec::new()),
             status: Mutex::new(Status { phase: "off", ..Status::default() }),
             pending: Pending::default(),
             wake: Notify::new(),
@@ -523,9 +610,11 @@ impl Direct {
             jtis: Mutex::new(HashMap::new()),
         });
         let cfg = DirectConfig::load(&d.store);
-        if !cfg.tls_cert_path.is_empty() && !cfg.tls_key_path.is_empty() {
-            let _ = d.reload_custom_tls(&cfg.tls_cert_path, &cfg.tls_key_path);
-        } else if cfg.enabled {
+        let pairs = cfg.effective_tls_certs();
+        if !pairs.is_empty() {
+            let _ = d.reload_custom_certs(&pairs);
+        }
+        if cfg.enabled || custom_public_ip(&cfg, port).is_some() {
             if let Some(s) = d.stored() {
                 if s.not_after > now_s() {
                     d.install(&s);
@@ -608,54 +697,130 @@ impl Direct {
         Ok(out)
     }
 
-    /// 设置或清除高级自定义 TLS 证书 PEM 文件路径。
+    /// 设置或清除兼容旧版的单套自定义 TLS 证书 PEM 文件路径。
     pub fn set_custom_tls(&self, cert_path: &str, key_path: &str) -> Result<(), &'static str> {
         let (cp, kp) = (cert_path.trim(), key_path.trim());
         if cp.is_empty() != kp.is_empty() {
             return Err("cert_pair");
         }
-        if !cp.is_empty() {
-            self.reload_custom_tls(cp, kp)?;
+        let list = if cp.is_empty() {
+            Vec::new()
+        } else {
+            vec![TlsCertPair { cert_path: cp.to_string(), key_path: kp.to_string() }]
+        };
+        self.set_custom_tls_list(&list)
+    }
+
+    /// 设置多套自定义 TLS 证书路径对（支持按 SNI 域名自动匹配，自动热加载）。
+    pub fn set_custom_tls_list(&self, raw_list: &[TlsCertPair]) -> Result<(), &'static str> {
+        let mut clean = Vec::new();
+        let mut seen = HashSet::new();
+        for item in raw_list {
+            let (cp, kp) = (item.cert_path.trim(), item.key_path.trim());
+            if cp.is_empty() && kp.is_empty() {
+                continue;
+            }
+            if cp.is_empty() || kp.is_empty() {
+                return Err("cert_pair");
+            }
+            let key = (cp.to_string(), kp.to_string());
+            if seen.insert(key.clone()) {
+                clean.push(TlsCertPair { cert_path: key.0, key_path: key.1 });
+            }
         }
-        let mut c = self.config();
-        c.tls_cert_path = cp.to_string();
-        c.tls_key_path = kp.to_string();
-        self.store.set(KEY_CONFIG, &c).map_err(|_| "internal")?;
-        if cp.is_empty() {
-            self.uninstall();
-            self.set_status(|st| {
-                if !self.config().enabled {
-                    *st = Status { phase: "off", ..Status::default() };
-                }
+        if clean.len() > MAX_CUSTOM_URLS {
+            return Err("url_too_many");
+        }
+        let mut loaded = Vec::with_capacity(clean.len());
+        for pair in &clean {
+            let (ck, not_after, sha256_hex, sans) = load_custom_pem(&pair.cert_path, &pair.key_path)?;
+            loaded.push(LoadedCustomCert {
+                cert_path: pair.cert_path.clone(),
+                key_path: pair.key_path.clone(),
+                ck: Arc::new(ck),
+                not_after,
+                sha256_hex,
+                sans,
             });
         }
+        *self.custom_certs.write().unwrap_or_else(|e| e.into_inner()) = loaded;
+        let mut c = self.config();
+        c.tls_certs = clean.clone();
+        if let Some(first) = clean.first() {
+            c.tls_cert_path = first.cert_path.clone();
+            c.tls_key_path = first.key_path.clone();
+        } else {
+            c.tls_cert_path.clear();
+            c.tls_key_path.clear();
+        }
+        self.store.set(KEY_CONFIG, &c).map_err(|_| "internal")?;
         self.wake();
         Ok(())
     }
 
-    fn reload_custom_tls(&self, cert_path: &str, key_path: &str) -> Result<(), &'static str> {
-        let (ck, not_after, sha256_hex, sans) = load_custom_pem(cert_path, key_path)?;
-        let current_fp = self.leaf_sha256();
-        if current_fp == sha256_hex && self.active() {
-            return Ok(());
+    /// 重新从磁盘读取全部自定义证书，返回是否有指纹变化（用于续期热加载检测）。
+    fn reload_custom_certs(&self, pairs: &[TlsCertPair]) -> bool {
+        let prev_fps: Vec<String> = self
+            .custom_certs
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|c| c.sha256_hex.clone())
+            .collect();
+        let mut loaded = Vec::new();
+        for pair in pairs {
+            match load_custom_pem(&pair.cert_path, &pair.key_path) {
+                Ok((ck, not_after, sha256_hex, sans)) => {
+                    loaded.push(LoadedCustomCert {
+                        cert_path: pair.cert_path.clone(),
+                        key_path: pair.key_path.clone(),
+                        ck: Arc::new(ck),
+                        not_after,
+                        sha256_hex,
+                        sans,
+                    });
+                }
+                Err(code) => {
+                    tracing::warn!(cert = %pair.cert_path, code, "自定义 TLS 证书读取失败或已过期");
+                }
+            }
         }
-        *self.cert.write().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(ck));
-        *self.tls_meta.write().unwrap_or_else(|e| e.into_inner()) = ActiveTls {
-            web_tls: true,
-            not_after,
-            sha256_hex,
-            sans,
-        };
-        self.set_status(|st| {
-            st.phase = "ok";
-            st.not_after = Some(not_after);
-            st.renew_at = None;
-            st.method = Some("custom".into());
-            st.error = None;
-            st.detail = None;
-            st.next_try = None;
-        });
-        Ok(())
+        let next_fps: Vec<String> = loaded.iter().map(|c| c.sha256_hex.clone()).collect();
+        *self.custom_certs.write().unwrap_or_else(|e| e.into_inner()) = loaded;
+        prev_fps != next_fps
+    }
+
+    /// 界面展示用：返回每套已配置自定义证书的解析状态、SAN 域名与过期时间。
+    pub fn custom_cert_views(&self) -> Vec<CustomCertView> {
+        let pairs = self.config().effective_tls_certs();
+        let loaded = self.custom_certs.read().unwrap_or_else(|e| e.into_inner());
+        let now = now_s();
+        pairs
+            .into_iter()
+            .map(|p| {
+                if let Some(c) = loaded.iter().find(|c| c.cert_path == p.cert_path && c.key_path == p.key_path) {
+                    let ok = c.not_after > now;
+                    CustomCertView {
+                        cert_path: p.cert_path,
+                        key_path: p.key_path,
+                        ok,
+                        not_after: Some(c.not_after),
+                        sans: c.sans.iter().map(CertSan::display).collect(),
+                        error: (!ok).then(|| "cert_expired".into()),
+                    }
+                } else {
+                    let err = load_custom_pem(&p.cert_path, &p.key_path).err().unwrap_or("cert_read");
+                    CustomCertView {
+                        cert_path: p.cert_path,
+                        key_path: p.key_path,
+                        ok: false,
+                        not_after: None,
+                        sans: Vec::new(),
+                        error: Some(err.into()),
+                    }
+                }
+            })
+            .collect()
     }
 
     /// 当前配置的自定义穿透/DDNS 主机名列表（小写，供 `local_guard` Host 白名单使用）。
@@ -677,10 +842,16 @@ impl Direct {
             .find(|p| p.host.eq_ignore_ascii_case(h))
     }
 
-    /// 判断本机当前安装的受信任证书是否覆盖这个主机或 IP，返回 `(web_tls, until)`。
+    /// 判断本机当前安装的受信任证书（自定义多证书或 ACME 证书）是否覆盖这个主机或 IP，返回 `(web_tls, until)`。
     fn cert_covers(&self, host: &str) -> (bool, i64) {
-        let meta = self.tls_meta.read().unwrap_or_else(|e| e.into_inner());
         let now = now_s();
+        {
+            let custom = self.custom_certs.read().unwrap_or_else(|e| e.into_inner());
+            if let Some(c) = custom.iter().find(|c| c.not_after > now && c.sans.iter().any(|san| san_matches_host(san, host))) {
+                return (true, c.not_after);
+            }
+        }
+        let meta = self.tls_meta.read().unwrap_or_else(|e| e.into_inner());
         if meta.web_tls && meta.not_after > now && meta.sans.iter().any(|san| san_matches_host(san, host)) {
             (true, meta.not_after)
         } else {
@@ -786,10 +957,95 @@ impl Direct {
         self.wake.notify_one();
     }
 
-    /// 当前是否装有浏览器受信任的证书（ACME 或用户自定义 PEM）。
+    /// 当前是否装有浏览器受信任的证书（ACME 或任一有效自定义 PEM）。
     /// 注意：即使为 `false`，本机持久自签证书也始终在位，供桌面端与手机端安全直连。
     pub fn active(&self) -> bool {
+        let now = now_s();
         self.tls_meta.read().unwrap_or_else(|e| e.into_inner()).web_tls
+            || self.custom_certs.read().unwrap_or_else(|e| e.into_inner()).iter().any(|c| c.not_after > now)
+    }
+
+    /// 测试一条直连地址是否能真正连通到当前 Looklook 实例。
+    pub async fn probe_url(&self, raw_url: &str) -> ProbeResult {
+        let Ok(parsed) = parse_custom_url(raw_url, self.port) else {
+            return ProbeResult { ok: false, ms: 0, code: "invalid_url", app_only: false, detail: None };
+        };
+        let is_plain = parsed.explicit_http || (parsed.kind == EndpointKind::Lan && !parsed.explicit_https);
+        let probe_target = if is_plain {
+            let base = if parsed.canonical.starts_with("http://") {
+                parsed.canonical.clone()
+            } else {
+                format!("http://{}", parsed.canonical)
+            };
+            format!("{base}{}", proto::PING_PATH)
+        } else if let Some(origin) = parsed.https_origin.as_deref() {
+            format!("{origin}{}", proto::PING_PATH)
+        } else {
+            return ProbeResult { ok: false, ms: 0, code: "invalid_url", app_only: false, detail: None };
+        };
+
+        let start = std::time::Instant::now();
+        let send_once = |insecure_tls: bool| {
+            let target = probe_target.clone();
+            async move {
+                let mut b = reqwest::Client::builder()
+                    .no_proxy()
+                    .timeout(Duration::from_secs(6))
+                    .redirect(reqwest::redirect::Policy::none());
+                if insecure_tls {
+                    b = b.danger_accept_invalid_certs(true);
+                }
+                let client = b.build().map_err(|e| (false, e.to_string()))?;
+                match client.get(&target).send().await {
+                    Ok(resp) => {
+                        let status = resp.status();
+                        let body = resp.text().await.unwrap_or_default();
+                        Ok((status, body))
+                    }
+                    Err(e) => {
+                        let msg = e.to_string();
+                        let lower = msg.to_ascii_lowercase();
+                        let is_timeout = e.is_timeout() || lower.contains("timed out");
+                        Err((is_timeout, msg))
+                    }
+                }
+            }
+        };
+
+        match send_once(false).await {
+            Ok((status, body)) => {
+                let ms = start.elapsed().as_millis() as u64;
+                if status == StatusCode::OK && body.trim() == proto::PING_BODY {
+                    ProbeResult { ok: true, ms, code: "ok", app_only: false, detail: None }
+                } else if status == StatusCode::FORBIDDEN {
+                    ProbeResult { ok: false, ms, code: "host_rejected", app_only: false, detail: None }
+                } else {
+                    ProbeResult { ok: false, ms, code: "wrong_target", app_only: false, detail: Some(format!("HTTP {}", status.as_u16())) }
+                }
+            }
+            Err((is_timeout, first_err)) => {
+                // HTTPS 证书不被系统信任时，用跳过校验证书再探一次以区分“客户端可连/仅缺浏览器证书”和“根本不通”
+                if !is_plain && !is_timeout {
+                    if let Ok((status, body)) = send_once(true).await {
+                        let ms = start.elapsed().as_millis() as u64;
+                        if status == StatusCode::OK && body.trim() == proto::PING_BODY {
+                            return ProbeResult { ok: true, ms, code: "tls_untrusted", app_only: true, detail: None };
+                        }
+                        if status == StatusCode::FORBIDDEN {
+                            return ProbeResult { ok: false, ms, code: "host_rejected", app_only: false, detail: None };
+                        }
+                    }
+                }
+                let ms = start.elapsed().as_millis() as u64;
+                ProbeResult {
+                    ok: false,
+                    ms,
+                    code: if is_timeout { "timeout" } else { "unreachable" },
+                    app_only: false,
+                    detail: Some(first_err),
+                }
+            }
+        }
     }
 
     pub fn status(&self) -> Status {
@@ -1079,40 +1335,30 @@ impl Direct {
     /// 走一步，返回下次什么时候再看。
     async fn step(self: &Arc<Self>, account: &Arc<crate::account::Account>, failures: &mut usize, retry_at: &mut i64) -> Duration {
         let cfg = self.config();
-        // 1. 用户指定了自定义证书 PEM 文件：定期检查文件是否更新（如 acme.sh / Lucky 自动续期），不再跑 ACME
-        if !cfg.tls_cert_path.is_empty() && !cfg.tls_key_path.is_empty() {
-            let prev_fp = self.leaf_sha256();
-            match self.reload_custom_tls(&cfg.tls_cert_path, &cfg.tls_key_path) {
-                Ok(()) => {
-                    if self.leaf_sha256() != prev_fp {
-                        tracing::info!("已热加载更新后的自定义 TLS 证书");
-                        account.wake();
-                    }
-                }
-                Err(code) => {
-                    tracing::warn!(code, "自定义 TLS 证书读取失败或已过期，回退自签证书");
-                    self.uninstall();
-                    self.set_status(|st| {
-                        st.phase = "failed";
-                        st.method = Some("custom".into());
-                        st.error = Some(code.into());
-                    });
-                }
-            }
-            return POLL;
+        // 1. 定期检查所有自定义证书文件是否更新（如 Lucky / acme.sh 自动续期），有变化立即热加载
+        let custom_pairs = cfg.effective_tls_certs();
+        let has_custom = !custom_pairs.is_empty();
+        if has_custom && self.reload_custom_certs(&custom_pairs) {
+            tracing::info!("已热加载更新后的自定义 TLS 证书");
+            account.wake();
         }
 
-        if !cfg.enabled {
+        // 2. 公网 IP 自动 ACME 证书（与自定义域名证书可并存；若该 IP 已被自定义证书覆盖则跳过 ACME）
+        let custom_ip = custom_public_ip(&cfg, self.port);
+        if !cfg.enabled && custom_ip.is_none() {
             self.uninstall();
             *failures = 0;
             self.set_status(|s| *s = Status { phase: "off", ..Status::default() });
-            return Duration::from_secs(3600);
+            return if has_custom { POLL } else { Duration::from_secs(3600) };
         }
-        let Some(ip) = acme_target_ip() else {
+        let Some(ip) = custom_ip.or_else(acme_target_ip) else {
             self.uninstall();
             self.set_status(|s| *s = Status { phase: "no_ip", ..Status::default() });
             return POLL;
         };
+        if self.custom_certs.read().unwrap_or_else(|e| e.into_inner()).iter().any(|c| c.not_after > now_s() && c.sans.iter().any(|san| san_matches_host(san, &ip.to_string()))) {
+            return POLL;
+        }
         let now = now_s();
         let mut stored = self.stored().filter(|s| s.ip == ip);
         if stored.as_ref().is_some_and(|s| s.not_after <= now) {
@@ -1331,6 +1577,25 @@ fn public_v4() -> Option<Ipv4Addr> {
     }
 }
 
+/// 从用户填写的直连地址里提取可直接走 ACME IP 证书的公网 IP（IPv4 优先于 IPv6）。
+fn custom_public_ip(cfg: &DirectConfig, port: u16) -> Option<IpAddr> {
+    let mut v6_fallback = None;
+    for raw in &cfg.custom_urls {
+        let Ok(p) = parse_custom_url(raw, port) else { continue };
+        if p.explicit_http {
+            continue;
+        }
+        if let Ok(ip) = p.host.parse::<IpAddr>() {
+            match (p.kind, ip) {
+                (EndpointKind::Public, IpAddr::V4(_)) => return Some(ip),
+                (EndpointKind::Ipv6, IpAddr::V6(_)) if v6_fallback.is_none() => v6_fallback = Some(ip),
+                _ => {}
+            }
+        }
+    }
+    v6_fallback
+}
+
 /// ACME 自动申请证书的目标公网 IP：优先配置的公网 IPv4，其次公网 IPv6（配置值或本机网卡 GUA）。
 fn acme_target_ip() -> Option<IpAddr> {
     if let Some(v4) = public_v4() {
@@ -1531,7 +1796,14 @@ async fn local_forward_ok(ip: IpAddr, token: &str, expect: &str) -> bool {
 struct Resolver(Arc<Direct>);
 
 impl ResolvesServerCert for Resolver {
-    fn resolve(&self, _: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+    fn resolve(&self, ch: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+        if let Some(sni) = ch.server_name() {
+            let now = now_s();
+            let custom = self.0.custom_certs.read().unwrap_or_else(|e| e.into_inner());
+            if let Some(found) = custom.iter().find(|c| c.not_after > now && c.sans.iter().any(|san| san_matches_host(san, sni))) {
+                return Some(found.ck.clone());
+            }
+        }
         self.0.cert.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
 }
@@ -1819,5 +2091,25 @@ mod tests {
         assert!(d.active());
         let eps = d.endpoints(&AccessConfig::default());
         assert!(eps.iter().find(|e| e.url == "https://home.example.com:18443").unwrap().web_tls);
+
+        // 多套证书同时生效（不互相覆盖），custom_cert_views 返回解析出的 SAN
+        let key2 = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let cert2 = rcgen::CertificateParams::new(vec!["nas.other.org".into()]).unwrap().self_signed(&key2).unwrap();
+        let (cp2, kp2) = (dir.path().join("cert2.pem"), dir.path().join("key2.pem"));
+        std::fs::write(&cp2, cert2.pem()).unwrap();
+        std::fs::write(&kp2, key2.serialize_pem()).unwrap();
+        d.set_custom_urls(&["home.example.com:18443".into(), "nas.other.org:18443".into()]).unwrap();
+        d.set_custom_tls_list(&[
+            TlsCertPair { cert_path: cp.to_str().unwrap().into(), key_path: kp.to_str().unwrap().into() },
+            TlsCertPair { cert_path: cp2.to_str().unwrap().into(), key_path: kp2.to_str().unwrap().into() },
+        ])
+        .unwrap();
+        let views = d.custom_cert_views();
+        assert_eq!(views.len(), 2);
+        assert!(views[0].ok && views[0].sans.iter().any(|s| s == "*.example.com"));
+        assert!(views[1].ok && views[1].sans.iter().any(|s| s == "nas.other.org"));
+        let eps = d.endpoints(&AccessConfig::default());
+        assert!(eps.iter().find(|e| e.url == "https://home.example.com:18443").unwrap().web_tls);
+        assert!(eps.iter().find(|e| e.url == "https://nas.other.org:18443").unwrap().web_tls);
     }
 }

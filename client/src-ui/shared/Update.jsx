@@ -12,7 +12,7 @@ import { api } from './api.js';
 import { deviceName, useDevices } from './devices.jsx';
 import { errorText } from './i18n.js';
 import { formatTime } from './time.js';
-import { Button, ErrorNote, Modal, Note, Switch, useAction, useToast } from './ui.jsx';
+import { Button, ErrorNote, Modal, Note, Row, Switch, useAction, useToast } from './ui.jsx';
 
 const ACTIVE = ['downloading', 'installing', 'restarting'];
 /** 重启超过这么久还没换成新版本：提示刷新页面看看（可能新版本没能自己启动） */
@@ -372,19 +372,13 @@ function AutoUpdate() {
     }
   };
   return (
-    <div className="stack" style={{ gap: 6, marginBottom: 12 }}>
-      <div className="between" style={{ flexWrap: 'nowrap' }}>
-        <span>
-          <b>{t('update.auto')}</b>
-          <span className="small muted" style={{ display: 'block' }}>
-            {t('update.auto_hint')}
-          </span>
-        </span>
+    <>
+      <Row label={t('update.auto')} hint={t('update.auto_hint')}>
         <Switch checked={on} disabled={busy} onChange={set} label={t('update.auto')} />
-      </div>
+      </Row>
       {on && ['dev', 'unsupported', 'readonly'].includes(reason) && <Note kind="warn">{t(`update.manual.${reason}`)}</Note>}
       <ErrorNote error={error} />
-    </div>
+    </>
   );
 }
 
@@ -396,19 +390,15 @@ export function UpdateCheck() {
   const u = status.update ?? {};
   return (
     <>
-    <AutoUpdate />
-    <div className="between" style={{ flexWrap: 'wrap', gap: 10 }}>
-      <span className="small">
-        {u.available ? (
-          <b className="update-dot-text">{t('gate.update', { version: u.version })}</b>
-        ) : (
-          <span className="muted">{u.checked_at ? t('update.checked_at', { when: formatTime(u.checked_at) }) : t('update.auto_check')}</span>
-        )}
-      </span>
-      <Button variant={u.available ? 'primary' : 'ghost'} icon={u.available ? Download : RefreshCw} onClick={openUpdate}>
-        {t(u.available ? 'update.view' : 'settings.check_update')}
-      </Button>
-    </div>
+      <AutoUpdate />
+      <Row
+        label={u.available ? <span className="update-dot-text">{t('gate.update', { version: u.version })}</span> : t('settings.check_update')}
+        hint={u.available ? undefined : u.checked_at ? t('update.checked_at', { when: formatTime(u.checked_at) }) : t('update.auto_check')}
+      >
+        <Button variant={u.available ? 'primary' : 'ghost'} icon={u.available ? Download : RefreshCw} onClick={openUpdate}>
+          {t(u.available ? 'update.view' : 'settings.check_update')}
+        </Button>
+      </Row>
     </>
   );
 }

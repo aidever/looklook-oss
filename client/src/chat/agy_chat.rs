@@ -51,6 +51,10 @@ pub struct Hub {
     /// 还没对上终端的会话发来的上下文用量：`session/new` 一返回 agy 就报 `{used, size}`，
     /// 这时会话还没记到 `sessions` 里，先放这里，[`Chat::agy_finish_attach`] 时补上
     early_usage: Mutex<HashMap<String, (Option<u64>, Option<u64>)>>,
+    /// 开着的旁聊（见 [`Chat::agy_side`]）：终端 id → (旁聊会话, 在第几个进程里)
+    sides: Mutex<HashMap<String, (String, u64)>>,
+    /// 旁聊会话这一轮收到的回答（会话 → 文字）
+    side_text: Mutex<HashMap<String, String>>,
 }
 
 /// agy 这边每个终端多记的状态
@@ -161,7 +165,7 @@ fn looklook_mode(acp: &str) -> Option<&'static str> {
     })
 }
 
-fn mode_key(id: &str) -> String {
+pub(super) fn mode_key(id: &str) -> String {
     format!("agy.mode.{id}")
 }
 
@@ -365,6 +369,74 @@ impl Chat {
         Ok((conn, gen))
     }
 
+    /// 旁聊：agy 的 ACP 不认 `/btw`（会当成普通消息进主对话），也没法分叉会话，所以在同一个目录开一个计划模式（只读）的会话，
+    /// 第一句带上主对话到现在说的话；之后的问题接着在这个会话里问。这个会话不进历史列表，关掉旁聊就关掉它
+    pub(super) async fn agy_side(&self, id: &str, question: &str) -> Result<Value, LocalError> {
+        let (conn, gen) = self.agy_conn(id).await?;
+        let kept = lock(&self.agy.sides).get(id).filter(|(_, g)| *g == gen).map(|(s, _)| s.clone());
+        let (session, first) = match kept {
+            Some(s) => (s, false),
+            None => {
+                self.agy_side_close(id).await;
+                let row = self.store.instance(id)?.ok_or_else(LocalError::not_found)?;
+                let r = conn.call("session/new", json!({ "cwd": row.workdir, "mcpServers": [] })).await?;
+                let sid = r["sessionId"].as_str().filter(|s| agy_log::valid_session(s)).ok_or_else(|| LocalError::new("AGY_REQUEST_FAILED").with("detail", "no sessionId"))?.to_string();
+                crate::history::hide(&self.store, &sid);
+                lock(&self.agy.sides).insert(id.to_string(), (sid.clone(), gen));
+                // 只读：计划模式（要审批的工具请求不是看看的终端的，会直接取消）；模型跟主对话一样
+                if let Err(e) = conn.call("session/set_mode", json!({ "sessionId": sid, "modeId": "plan" })).await {
+                    tracing::debug!(error = ?e, "旁聊会话没切到计划模式");
+                }
+                let model = lock(&self.inst(id).st).model.clone();
+                if let Some(m) = model {
+                    let _ = conn.call("session/set_config_option", json!({ "sessionId": sid, "configId": "model", "value": m })).await;
+                }
+                (sid, true)
+            }
+        };
+        let prompt = if first {
+            let ctx = self.side_context(id, 60_000).await;
+            format!(
+                "<side_question>\nThis is a side chat about another conversation in this project. Below is that conversation so far; answer from it and keep it focused. Do not change any files.\n\n<conversation>\n{ctx}\n</conversation>\n\n{question}\n</side_question>"
+            )
+        } else {
+            question.to_string()
+        };
+        lock(&self.agy.side_text).insert(session.clone(), String::new());
+        let r = tokio::time::timeout(Duration::from_secs(600), conn.call_long("session/prompt", json!({ "sessionId": session, "prompt": [{ "type": "text", "text": prompt }] }))).await;
+        conn.settled().await;
+        let text = lock(&self.agy.side_text).remove(&session).unwrap_or_default();
+        match r {
+            Ok(Ok(_)) => Ok(json!({ "response": text, "synthetic": false })),
+            Ok(Err(e)) => {
+                self.agy_side_close(id).await;
+                Err(e)
+            }
+            Err(_) => {
+                conn.notify("session/cancel", json!({ "sessionId": session }));
+                Err(LocalError::new("AGY_REQUEST_FAILED").with("detail", "timed out"))
+            }
+        }
+    }
+
+    /// 终端删了：拿走它的旁聊会话（由 [`Chat::agy_forget`] 关）
+    pub(super) fn agy_side_take(&self, id: &str) -> Option<String> {
+        let (s, _) = lock(&self.agy.sides).remove(id)?;
+        lock(&self.agy.side_text).remove(&s);
+        Some(s)
+    }
+
+    /// 关掉旁聊会话
+    pub(super) async fn agy_side_close(&self, id: &str) {
+        let Some((session, gen)) = lock(&self.agy.sides).remove(id) else { return };
+        lock(&self.agy.side_text).remove(&session);
+        let conn = self.agy_live(id).await.filter(|(c, g)| *g == gen && c.alive()).map(|(c, _)| c);
+        if let Some(c) = conn {
+            c.notify("session/cancel", json!({ "sessionId": session }));
+            let _ = c.call_timeout("session/close", json!({ "sessionId": session }), Duration::from_secs(5)).await;
+        }
+    }
+
     /// 有 agy 会话正在跑一轮（或等确认）
     fn agy_busy(&self) -> bool {
         let ids: Vec<String> = lock(&self.agy.sessions).values().cloned().collect();
@@ -375,6 +447,15 @@ impl Chat {
     pub fn agy_installed(&self) {
         tracing::info!("agy 更新好了，agy acp 空闲时换成新版本");
         self.agy.stale.store(true, Ordering::SeqCst);
+    }
+
+    /// 退出某个 agy 账号的登录时，停掉这个账号正在跑的 `agy acp` 进程，避免旧进程继续沿用内存里的旧凭据
+    pub async fn agy_drop_profile(&self, profile_id: &str) {
+        let conn = self.agy.conns.lock().await.remove(profile_id);
+        if let Some((c, _)) = conn {
+            tracing::info!(pid = ?c.pid, profile = %profile_id, "账号已退出登录，关闭 agy acp 进程");
+            c.kill();
+        }
     }
 
     /// 缓存最近一次看到的带模型选项的 configOptions（草稿页用）
@@ -657,6 +738,13 @@ impl Chat {
 
     fn agy_update(&self, session: &str, u: &Value) {
         let kind = u["sessionUpdate"].as_str().unwrap_or("");
+        // 旁聊会话：只收回答，不进任何终端
+        if let Some(text) = lock(&self.agy.side_text).get_mut(session) {
+            if kind == "agent_message_chunk" {
+                text.push_str(u["content"]["text"].as_str().unwrap_or_default());
+            }
+            return;
+        }
         let Some(inst) = self.agy_inst_of(session) else {
             if kind == "usage_update" && agy_log::valid_session(session) {
                 let mut early = lock(&self.agy.early_usage);

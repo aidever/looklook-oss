@@ -26,6 +26,11 @@ use super::claude_sdk::{self, Incoming, Proc};
 use super::{board, lock, models, Chat, Event, Inst, Pending, Phase, PermissionAnswer};
 use crate::error::LocalError;
 
+/// 界面或助理切换过的权限模式（客户端重启后重新 `--resume` 照旧沿用，不回退到建会话时的 `full_access`）
+pub(super) fn mode_key(id: &str) -> String {
+    format!("claude.mode.{id}")
+}
+
 /// 正在输出时最多每隔这么久推一次状态
 const PREVIEW_GAP: Duration = Duration::from_millis(120);
 /// 正在输出的回复最多推这么多字（只留最后这段）
@@ -231,10 +236,14 @@ impl Chat {
         let mut args: Vec<String> = ["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose", "--include-partial-messages", "--permission-prompt-tool", "stdio"].map(String::from).to_vec();
         // 助理的大脑：权限只由闸门（PreToolUse）管，不能跳过权限，也不让切到跳过权限
         let brain = crate::assistant::is_brain(&self.store, id);
-        // 跑腿和大脑一样只由闸门管权限
-        let gated = brain || crate::assistant::is_errand(&self.store, id);
-        if !gated {
-            args.push(if opts.full_access { "--dangerously-skip-permissions" } else { "--allow-dangerously-skip-permissions" }.into());
+        let ask = crate::assistant::is_ask(&self.store, id);
+        let errand = crate::assistant::is_errand(&self.store, id);
+        // 大脑、群里提问和未在设置里固定权限模式的跑腿：只由闸门管权限
+        let gated = crate::assistant::is_gated(&self.store, id);
+        if !brain && !ask {
+            let saved_mode = lock(&inst.st).sdk.mode.clone().or_else(|| crate::assistant::errand_mode(&self.store, id)).or_else(|| self.store.get::<String>(&mode_key(id)).ok().flatten());
+            let skip = !gated && saved_mode.as_deref().map_or(opts.full_access, |m| m == "bypassPermissions");
+            args.push(if skip { "--dangerously-skip-permissions" } else { "--allow-dangerously-skip-permissions" }.into());
         }
         let flag_env = crate::claude_profiles::settings_env(&self.paths.home, &profile);
         let flag_env = flag_env.as_ref().map(|e| (profile.id.as_str(), e));
@@ -251,7 +260,8 @@ impl Chat {
             let mut st = lock(&inst.st);
             let resume = st.sdk.resume.take().or_else(|| st.binding.as_ref().filter(|b| b.transcript_path.is_file()).map(|b| (b.session_id.clone(), false)));
             let transcript = st.binding.as_ref().filter(|b| resume.as_ref().is_some_and(|(sid, _)| *sid == b.session_id)).map(|b| b.transcript_path.clone());
-            (resume, st.sdk.resume_at.take(), st.sdk.first.take(), st.sdk.model.clone(), st.sdk.effort.clone(), st.sdk.mode.clone(), transcript)
+            let saved_mode = st.sdk.mode.clone().or_else(|| crate::assistant::errand_mode(&self.store, id)).or_else(|| self.store.get::<String>(&mode_key(id)).ok().flatten());
+            (resume, st.sdk.resume_at.take(), st.sdk.first.take(), st.sdk.model.clone(), st.sdk.effort.clone(), saved_mode, transcript)
         };
         // 接着的是界面上显示的那一支（编辑重发分出来的）：见 [`pin_leaf`]
         if let (Some((sid, _)), Some(path)) = (&resume, &transcript) {
@@ -271,7 +281,10 @@ impl Chat {
         // 助理的大脑（assistant.rs）：带上规矩和只给它的工具；没选过模型时用好的
         if brain {
             args.extend(crate::assistant::brain_args(&self.paths, &self.store));
-        } else if gated {
+        } else if ask {
+            // 群里提问：只读、不带用户的 MCP，规矩说明这是群成员的话
+            args.extend(crate::assistant::ask_args());
+        } else if errand {
             args.extend(crate::assistant::errand_args());
         } else if crate::assistant::is_worker(&self.store, id) {
             // 助理开的会话：多一个找助理的工具（assistant_note）
@@ -297,8 +310,8 @@ impl Chat {
         if crate::platform::is_root() {
             env.push(("IS_SANDBOX".to_string(), "1".to_string()));
         }
-        // 大脑、跑腿不用 Claude Code 自带的记忆（记忆归看看管，见 assistant_memory.rs）
-        if brain || gated {
+        // 大脑、跑腿、群里提问不用 Claude Code 自带的记忆（记忆归看看管，见 assistant_memory.rs）
+        if brain || errand || ask {
             env.push(("CLAUDE_CODE_DISABLE_AUTO_MEMORY".to_string(), "1".to_string()));
         }
         // 大脑不读用户的 CLAUDE.md（全局的写的是怎么写代码，和管家不相干、还会挤掉记忆）；规矩、记忆都由看看给。跑腿在项目里干活，照常读
@@ -782,6 +795,11 @@ impl Chat {
     async fn sdk_permission(&self, inst: &Arc<Inst>, proc: &Arc<Proc>, rid: &str, req: Value) {
         let tool = req["tool_name"].as_str().unwrap_or("").to_string();
         let input = req["input"].clone();
+        // 群里提问：从不让用户审批、回答（闸门没放行的就是不行）
+        if crate::assistant::is_ask(&self.store, &inst.id) {
+            let _ = proc.respond(rid, json!({ "behavior": "deny", "message": "[Looklook] Read-only group question: not allowed." })).await;
+            return;
+        }
         let (tx, rx) = oneshot::channel();
         let id = self.next_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         {
@@ -852,8 +870,6 @@ impl Chat {
         }
     }
 
-    /// `/btw 问题`（终端里的顺带问一句）：用这段对话的上下文回答，不记进对话、不打断正在跑的这一轮。
-    /// 返回 `{ response }`，界面上单独显示，关掉就没了
     /// 在跑的进程自己报的权限规则、MCP 状态、hook 列表；没在跑时 None
     pub(super) async fn sdk_config_live(self: &Arc<Self>, id: &str) -> Option<Value> {
         let proc = lock(&self.inst(id).st).sdk.proc.clone().filter(|p| p.alive())?;
@@ -928,9 +944,19 @@ impl Chat {
         Some(json!({ "requested": true, "active": r["enabled"] == true, "reason": reason }))
     }
 
-    pub(super) async fn sdk_btw(self: &Arc<Self>, id: &str, question: &str) -> Result<Value, LocalError> {
+    /// 旁聊：`history` 是这次旁聊前面的问答（side_question 自己不记，带上它才能接着问；最多带最近 20 轮）
+    pub(super) async fn sdk_btw(self: &Arc<Self>, id: &str, question: &str, history: &[Value]) -> Result<Value, LocalError> {
         let proc = self.sdk_attach(id).await?;
-        let r = proc.request_within("side_question", json!({ "question": question }), Duration::from_secs(600)).await?;
+        let history: Vec<Value> = history
+            .iter()
+            .filter_map(|h| Some(json!({ "question": h["question"].as_str()?, "response": h["response"].as_str()? })))
+            .collect();
+        let history = &history[history.len().saturating_sub(20)..];
+        let mut req = json!({ "question": question });
+        if !history.is_empty() {
+            req["history"] = json!(history);
+        }
+        let r = proc.request_within("side_question", req, Duration::from_secs(600)).await?;
         Ok(json!({ "response": r["response"], "synthetic": r["synthetic"] }))
     }
 
@@ -1438,8 +1464,8 @@ impl Chat {
                 if !MODES.contains(&value) {
                     return Err(LocalError::invalid("value", "invalid"));
                 }
-                // 助理的大脑、跑腿：权限由助理的权限模式定（助理页上换）
-                if crate::assistant::is_gated(&self.store, id) {
+                // 助理的大脑、群里提问：权限由助理固定；跑腿允许用户在会话里手动切换
+                if crate::assistant::is_brain(&self.store, id) || crate::assistant::is_ask(&self.store, id) {
                     return Err(LocalError::new("CHAT_MODE_UNAVAILABLE"));
                 }
             }
@@ -1456,6 +1482,11 @@ impl Chat {
             }
             _ => {
                 proc.request("set_permission_mode", json!({ "mode": value })).await.map_err(|e| if e.code == "CLAUDE_SDK_ERROR" { LocalError::new("CHAT_MODE_UNAVAILABLE") } else { e })?;
+                if crate::assistant::is_errand(&self.store, id) {
+                    crate::assistant::set_errand_mode(&self.store, id, value);
+                } else {
+                    let _ = self.store.set(&mode_key(id), &value.to_string());
+                }
             }
         }
         let mut st = lock(&inst.st);

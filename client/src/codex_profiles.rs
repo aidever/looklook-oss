@@ -14,6 +14,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -469,6 +470,83 @@ pub fn migrate(store: &Store, home: &Path) {
     let _ = std::fs::remove_file(old_key);
 }
 
+// ---------------- 本机默认账号的登录状态与退出 ----------------
+
+fn email_from_jwt(jwt: &str) -> Option<String> {
+    use base64::Engine;
+    let payload = jwt.split('.').nth(1)?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(payload))
+        .ok()?;
+    let v: Value = serde_json::from_slice(&bytes).ok()?;
+    v["email"].as_str().filter(|s| s.contains('@')).map(String::from)
+}
+
+fn parse_login_status(stdout: &str, stderr: &str, success: bool, auth_json: Option<&Value>) -> Value {
+    let text = format!("{stdout}\n{stderr}");
+    let lower = text.to_ascii_lowercase();
+    let logged_in = if lower.contains("not logged in") {
+        false
+    } else if lower.contains("logged in") {
+        true
+    } else {
+        success && auth_json.is_some_and(|v| v["tokens"]["access_token"].as_str().is_some_and(|s| !s.is_empty()) || v["OPENAI_API_KEY"].as_str().is_some_and(|s| !s.is_empty()))
+    };
+    let auth_method = if !logged_in {
+        None
+    } else if lower.contains("api key") {
+        Some("api_key")
+    } else if lower.contains("chatgpt") {
+        Some("chatgpt")
+    } else if auth_json.and_then(|v| v["OPENAI_API_KEY"].as_str()).is_some_and(|s| !s.is_empty()) {
+        Some("api_key")
+    } else {
+        Some("chatgpt")
+    };
+    let email = if logged_in {
+        auth_json.and_then(|v| v["tokens"]["id_token"].as_str()).and_then(email_from_jwt)
+    } else {
+        None
+    };
+    json!({
+        "logged_in": logged_in,
+        "auth_method": auth_method,
+        "email": email,
+    })
+}
+
+/// 检查本机默认 Codex 的登录状态（`codex login status` + 只读 `~/.codex/auth.json` 的邮箱元数据）
+pub async fn status(shell: &str) -> Value {
+    let Some(cli) = crate::tools::detect(shell).await.codex else {
+        return json!({ "error": "not_installed" });
+    };
+    let auth_json: Option<Value> = std::fs::read(crate::agents::codex_home().join("auth.json")).ok().and_then(|b| serde_json::from_slice(&b).ok());
+    match crate::agents::cli_output(shell, &cli, &["login", "status"], &[], Duration::from_secs(15)).await {
+        Ok(out) => parse_login_status(&String::from_utf8_lossy(&out.stdout), &String::from_utf8_lossy(&out.stderr), out.status.success(), auth_json.as_ref()),
+        Err(e) => {
+            tracing::debug!(error = %e, "codex login status 失败");
+            json!({ "error": "failed" })
+        }
+    }
+}
+
+/// 退出本机默认 Codex 登录（调用 `codex logout`）
+pub async fn logout(shell: &str) -> Result<(), LocalError> {
+    let cli = crate::tools::detect(shell).await.codex.ok_or_else(|| LocalError::new("AGENT_NOT_FOUND").with("agent", "codex"))?;
+    let out = crate::agents::cli_output(shell, &cli, &["logout"], &[], Duration::from_secs(30))
+        .await
+        .map_err(|e| LocalError::new("CLI_FAILED").with("detail", e))?;
+    if !out.status.success() {
+        let mut msg = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        if msg.is_empty() {
+            msg = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        }
+        return Err(LocalError::new("CLI_FAILED").with("detail", msg.chars().take(300).collect::<String>()));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -585,5 +663,20 @@ mod tests {
         assert!(store.get::<crate::model::Choice>("model_provider.codex").unwrap().is_none());
         assert!(!dir.join("model/codex.key").exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parse_codex_login_status() {
+        let logged = parse_login_status("Logged in using ChatGPT\n", "", true, None);
+        assert_eq!(logged["logged_in"], true);
+        assert_eq!(logged["auth_method"], "chatgpt");
+
+        let api = parse_login_status("Logged in using an API key\n", "", true, None);
+        assert_eq!(api["logged_in"], true);
+        assert_eq!(api["auth_method"], "api_key");
+
+        let out = parse_login_status("", "Not logged in\n", false, None);
+        assert_eq!(out["logged_in"], false);
+        assert!(out["auth_method"].is_null());
     }
 }

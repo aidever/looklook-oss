@@ -774,7 +774,7 @@ function LevelPick({ x, onChange }) {
   const toast = useToast();
   const [busy, setBusy] = useState(false);
   const engine = x.engine;
-  if (!ENGINE_MODES[engine] || x.errand) return null;
+  if (!ENGINE_MODES[engine]) return null;
   // 现在实际的模式（对话页设置栏里换过的也算）；还没起来时按助理给的那一档
   const cur = levelOfMode(engine, x.mode) ? x.mode : x.level ? LEVEL_MODE[engine][x.level] : null;
   const set = (mode) => {

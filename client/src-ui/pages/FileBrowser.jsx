@@ -23,6 +23,7 @@ import { formatBytes, quotePath } from '../shared/xfer.js';
 
 import { AUDIO, IMAGE, mediaSrc, Preview, VIDEO } from '../files/Preview.jsx';
 import { Thumb } from '../files/thumbs.jsx';
+import { openViewTab, sizeable, SizeButtons, sizeKey, useFullHost } from '../files/viewSize.jsx';
 
 export { AUDIO, mediaSrc, Preview, VIDEO };
 const ACTIVE = ['queued', 'uploading', 'retrying'];
@@ -712,6 +713,11 @@ export default function FileBrowser({ id, active = true, onInsert, insertTo = 't
   const [checked, setChecked] = useState(() => new Set());
   const [cursor, setCursor] = useState(-1);
   const [previewW, setPreviewW] = useState(() => readStore(WIDTH_KEY, 460));
+  // 预览的大小（电脑上）：normal 和列表并排 / wide 收起列表 / full 盖住整个页面（docs/FILE_VIEWER_LAYOUT_2026-11-27.md）
+  const [pv, setPv] = useState('normal');
+  const pvPrev = useRef('normal');
+  const pvFull = useFullHost(pv === 'full');
+  const pvWrap = useRef(null);
   const [deep, setDeep] = useState(false); // 搜索含子文件夹
   const [chatPick, setChatPick] = useState(null); // 发给对话：要填的文字
   const conn = useDeviceConn(device ?? selectedDevice());
@@ -1131,6 +1137,51 @@ export default function FileBrowser({ id, active = true, onInsert, insertTo = 't
       </button>
     </>
   );
+  const sizePv = (next) => {
+    if (next === 'full' && pv !== 'full') pvPrev.current = pv;
+    setPv(next);
+  };
+  const togglePv = (which) => sizePv(pv === which ? (which === 'full' ? pvPrev.current : 'normal') : which);
+  const pvExtra = open && (
+    <>
+      {prevNext}
+      <SizeButtons wide={pv === 'wide'} onWide={() => togglePv('wide')} full={pv === 'full'} onFull={() => togglePv('full')} onNewTab={() => openViewTab({ id: ep.id, device: device ?? selectedDevice(), path: open.path })} />
+    </>
+  );
+  useEffect(() => {
+    if (!open) setPv('normal');
+  }, [open]);
+  // 换了大小（全屏挪进挪出会丢焦点）：焦点放回预览，键盘接着能用
+  const pvSeen = useRef(pv);
+  useEffect(() => {
+    if (pvSeen.current === pv) return;
+    pvSeen.current = pv;
+    const el = pvWrap.current;
+    if (el && !el.contains(document.activeElement)) el.focus({ preventScroll: true });
+  }, [pv]);
+  // Esc 一档一档退（全屏 → 原来那档 → 和列表并排；并排时照旧）；焦点在预览里时 W 放大、F 全屏
+  useEffect(() => {
+    if (!open || !sizeable || !active) return undefined;
+    const key = (e) => {
+      const inside = pvWrap.current?.contains(e.target);
+      // 放大、全屏时 Esc 不管焦点在哪（挪动之后焦点可能掉到 body 上）；W / F 只在预览里
+      if (e.key === 'Escape' && pv !== 'normal' && (inside || !e.target.closest?.('.fb-list, input, textarea'))) {
+        if (e.target.closest?.('.cm-panels, .fv-goto, .menu-pop-list, .modal-backdrop')) return;
+        e.preventDefault();
+        e.stopPropagation();
+        setPv(pv === 'full' ? pvPrev.current : 'normal');
+        return;
+      }
+      const k = inside || pv === 'full' ? sizeKey(e) : null;
+      if (!k) return;
+      e.preventDefault();
+      e.stopPropagation();
+      if (k === 'full' && pv !== 'full') pvPrev.current = pv;
+      setPv(pv === k ? (k === 'full' ? pvPrev.current : 'normal') : k);
+    };
+    window.addEventListener('keydown', key, true);
+    return () => window.removeEventListener('keydown', key, true);
+  }, [open, pv, active]);
   const longPress = useLongPress((e) => toggle(e.name));
   if (quick) {
     return (
@@ -1180,7 +1231,7 @@ export default function FileBrowser({ id, active = true, onInsert, insertTo = 't
   const deepOn = deep && searching && filter.trim();
   return (
     <div
-      className={`fb ${open ? 'fb-has-preview' : ''} ${dropping ? 'fb-dropping' : ''} ${checked.size ? 'fb-picking' : ''} ${insert ? 'fb-with-insert' : ''}`}
+      className={`fb ${open ? 'fb-has-preview' : ''} ${open && pv === 'wide' ? 'fb-max' : ''} ${dropping ? 'fb-dropping' : ''} ${checked.size ? 'fb-picking' : ''} ${insert ? 'fb-with-insert' : ''}`}
       onDragOver={(e) => {
         if (!canWrite || !hasFiles(e)) return;
         e.preventDefault();
@@ -1458,8 +1509,9 @@ export default function FileBrowser({ id, active = true, onInsert, insertTo = 't
           )}
         </div>
         {open && <Splitter box={mainRef} width={previewW} onWidth={setWidth} />}
-        {open && (
-          <div className="fb-preview-wrap" style={{ '--fb-pw': `${previewW}px` }}>
+        {open && pvFull.slot}
+        {open && pvFull.portal(
+          <div className={`fb-preview-wrap ${pv === 'full' ? 'fb-full' : ''}`} style={{ '--fb-pw': `${previewW}px` }} ref={pvWrap} tabIndex={-1} role={pv === 'full' ? 'dialog' : undefined} aria-modal={pv === 'full' || undefined}>
             <Preview
               key={open.path}
               ep={ep}
@@ -1468,7 +1520,7 @@ export default function FileBrowser({ id, active = true, onInsert, insertTo = 't
               onClose={() => setOpen(null)}
               onInsert={insert}
               insertLabel={insertLabel}
-              extra={prevNext}
+              extra={pvExtra}
               device={device}
               active={active}
               onAsk={insert && insertTo === 'chat' ? onInsert : openSession ? setChatPick : null}

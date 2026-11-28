@@ -261,8 +261,8 @@ export const COMMANDS = [
   ['/review'],
   ['/init'],
   ['/doctor'],
-  ['/btw'],
-  ['/side'],
+  ['/btw', 'btw'],
+  ['/side', 'btw'],
   ['/goal'],
   ['/fast'],
   ['/fork'],
@@ -302,7 +302,7 @@ export const CODEX_PASS = ['/logout'];
 /** Antigravity（agy acp）：看看界面处理的命令 + agy 原生斜杠命令（菜单里还会合并 agy 报的命令和技能） */
 export const AGY_COMMANDS = [
   '/clear', '/new', '/model', '/resume', '/usage', '/context', '/status', '/mcp', '/plugins', '/agents', '/skills', '/hooks', '/permissions',
-  '/diff', '/rename', '/login', '/logout', '/share', '/export', '/compact', '/fast', '/goal', '/planning', '/grill-me', '/schedule', '/tasks', '/add-dir', '/btw',
+  '/diff', '/rename', '/login', '/logout', '/share', '/export', '/compact', '/fast', '/goal', '/planning', '/grill-me', '/schedule', '/tasks', '/add-dir', '/btw', '/side',
 ];
 
 /** Antigravity 里意思不一样的命令：/permissions 换权限模式，/tasks 打开子代理面板 */

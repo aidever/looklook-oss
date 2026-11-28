@@ -296,18 +296,131 @@ fn ct_eq(a: &str, b: &str) -> bool {
     a.len() == b.len() && a.bytes().zip(b.bytes()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
-/// 这台机器的局域网 IP（只要真正的局域网网段，跳过代理软件的虚拟网卡等），用来告诉用户在别的设备上输入什么地址。
-pub fn own_lan_ips() -> Vec<IpAddr> {
-    let mut ips: Vec<IpAddr> = local_ip_address::list_afinet_netifas()
-        .unwrap_or_default()
+/// 当前进程是否运行在 Docker / Podman / Kubernetes 容器内。
+pub fn in_container() -> bool {
+    if std::path::Path::new("/.dockerenv").exists()
+        || std::path::Path::new("/run/.containerenv").exists()
+        || std::env::var_os("KUBERNETES_SERVICE_HOST").is_some()
+    {
+        return true;
+    }
+    #[cfg(target_os = "linux")]
+    if let Ok(s) = std::fs::read_to_string("/proc/1/cgroup") {
+        if ["docker", "containerd", "kubepods", "libpod"].iter().any(|k| s.contains(k)) {
+            return true;
+        }
+    }
+    false
+}
+
+fn is_cgnat_v4(ip: IpAddr) -> bool {
+    matches!(ip.to_canonical(), IpAddr::V4(v) if v.octets()[0] == 100 && (64..128).contains(&v.octets()[1]))
+}
+
+/// 跳过 Docker / 容器 / 虚拟机网桥、回环与代理虚拟网卡（保留 Tailscale / ZeroTier / WireGuard 等组网网卡）。
+fn is_virtual_bridge_iface(name: &str, ip: IpAddr) -> bool {
+    let n = name.trim().to_ascii_lowercase();
+    if n.is_empty() || n == "lo" || n == "lo0" {
+        return true;
+    }
+    const SKIP_PREFIXES: &[&str] = &[
+        "docker",
+        "br-",
+        "veth",
+        "virbr",
+        "cni",
+        "flannel",
+        "kube",
+        "podman",
+        "lxc",
+        "lxd",
+        "vmnet",
+        "vboxnet",
+        "cali",
+        "weave",
+        "cilium",
+        "nerdctl",
+    ];
+    if SKIP_PREFIXES.iter().any(|p| n.starts_with(p)) {
+        return true;
+    }
+    // Windows WSL / Docker Desktop / Hyper-V 虚拟交换机
+    if n.starts_with("vethernet (wsl") || n.starts_with("vethernet (default switch") || n.starts_with("vethernet (docker") {
+        return true;
+    }
+    // 代理软件常用的 tun/utun 网卡：只有 Tailscale/CGNAT 网段才算组网地址
+    if (n.starts_with("tun") || n.starts_with("utun") || n.starts_with("tap")) && !is_cgnat_v4(ip) {
+        return true;
+    }
+    false
+}
+
+/// Docker / Podman / Kubernetes 常见容器内部桥接私网网段（外部局域网设备无法直连）。
+fn is_container_internal_v4(ip: IpAddr) -> bool {
+    match ip.to_canonical() {
+        IpAddr::V4(v) => {
+            let o = v.octets();
+            (o[0] == 172 && (16..=31).contains(&o[1]))
+                || (o[0] == 10 && matches!(o[1], 88 | 89 | 244))
+        }
+        IpAddr::V6(_) => false,
+    }
+}
+
+fn filter_lan_ifaces(ifaces: Vec<(String, IpAddr)>, in_ctr: bool) -> Vec<IpAddr> {
+    if in_ctr {
+        // 如果容器里能看到 docker0 / br-，说明处于 --network host 模式，可按宿主机处理；
+        // 否则如果只有单个 eth0 容器桥接私网（如 172.17.0.2），说明处于 bridge 模式，容器内 IP 无法给外部局域网使用。
+        let has_host_bridge = ifaces.iter().any(|(name, _)| {
+            let n = name.to_ascii_lowercase();
+            n.starts_with("docker") || n.starts_with("br-")
+        });
+        let mut non_lo_names: Vec<String> = ifaces
+            .iter()
+            .filter(|(name, ip)| !ip.is_loopback() && !matches!(name.to_ascii_lowercase().as_str(), "lo" | "lo0"))
+            .map(|(name, _)| name.to_ascii_lowercase())
+            .collect();
+        non_lo_names.sort();
+        non_lo_names.dedup();
+        if !has_host_bridge && non_lo_names.len() == 1 {
+            let cand: Vec<IpAddr> = ifaces
+                .iter()
+                .filter(|(_, ip)| is_lan(*ip) && !ip.is_loopback())
+                .map(|(_, ip)| ip.to_canonical())
+                .collect();
+            if !cand.is_empty() && cand.iter().all(|ip| is_container_internal_v4(*ip)) {
+                return Vec::new();
+            }
+        }
+    }
+
+    let mut ips: Vec<IpAddr> = ifaces
         .into_iter()
-        .map(|(_, ip)| ip)
-        .filter(|ip| is_lan(*ip) && !matches!(ip, IpAddr::V6(v) if (v.segments()[0] & 0xffc0) == 0xfe80))
+        .filter(|(name, ip)| !is_virtual_bridge_iface(name, *ip))
+        .map(|(_, ip)| ip.to_canonical())
+        .filter(|ip| {
+            is_lan(*ip)
+                && !matches!(ip, IpAddr::V4(v) if v.is_link_local())
+                && !matches!(ip, IpAddr::V6(v) if (v.segments()[0] & 0xffc0) == 0xfe80)
+        })
         .collect();
-    // IPv4 在前，家用网络里最常见的 192.168 排最前
-    ips.sort_by_key(|ip| (ip.is_ipv6(), !matches!(ip, IpAddr::V4(v) if v.octets()[0] == 192), *ip));
+    // 排序优先级：192.168 > 10.x > 100.64/10 (Tailscale) > 172.16-31 > IPv6 ULA
+    let rank = |ip: &IpAddr| match ip {
+        IpAddr::V4(v) if v.octets()[0] == 192 => 0u8,
+        IpAddr::V4(v) if v.octets()[0] == 10 => 1,
+        IpAddr::V4(_) if is_cgnat_v4(*ip) => 2,
+        IpAddr::V4(_) => 3,
+        IpAddr::V6(_) => 4,
+    };
+    ips.sort_by_key(|ip| (rank(ip), *ip));
     ips.dedup();
     ips
+}
+
+/// 这台机器的局域网 IP（自动过滤 Docker / 虚拟机网桥、代理虚拟网卡与容器内部 bridge 地址）。
+pub fn own_lan_ips() -> Vec<IpAddr> {
+    let ifaces = local_ip_address::list_afinet_netifas().unwrap_or_default();
+    filter_lan_ifaces(ifaces, in_container())
 }
 
 /// 白名单里域名的解析结果。后台每分钟解析一次（[`Resolved::run`]）；
@@ -453,6 +566,33 @@ mod tests {
         assert!(local_from(ip("172.17.0.1")));
         assert!(local_from(ip("::ffff:192.168.65.3")));
         assert!(!local_from(ip("172.17.0.2")));
+    }
+
+    #[test]
+    fn lan_ips_filter_docker_bridges_and_container_internal() {
+        // 1) 宿主机装了 Docker：跳过 docker0、br-xxx、veth、代理 tun0，保留真实网卡和 tailscale0
+        let host = vec![
+            ("lo".into(), ip("127.0.0.1")),
+            ("docker0".into(), ip("172.17.0.1")),
+            ("br-a1b2c3d4".into(), ip("172.18.0.1")),
+            ("veth12345".into(), ip("169.254.1.2")),
+            ("utun3".into(), ip("10.0.0.1")),
+            ("utun4".into(), ip("100.88.1.5")),
+            ("eth0".into(), ip("192.168.1.20")),
+        ];
+        assert_eq!(filter_lan_ifaces(host, false), vec![ip("192.168.1.20"), ip("100.88.1.5")]);
+
+        // 2) Docker bridge 容器内：只有 eth0 = 172.17.0.2，过滤掉不可达的容器内 IP
+        let ctr_bridge = vec![("lo".into(), ip("127.0.0.1")), ("eth0".into(), ip("172.17.0.2"))];
+        assert!(filter_lan_ifaces(ctr_bridge, true).is_empty());
+
+        // 3) Docker --network host 模式：可见 docker0 和宿主机真实网卡，保留宿主机 IP
+        let ctr_host = vec![
+            ("lo".into(), ip("127.0.0.1")),
+            ("docker0".into(), ip("172.17.0.1")),
+            ("enp3s0".into(), ip("192.168.50.8")),
+        ];
+        assert_eq!(filter_lan_ifaces(ctr_host, true), vec![ip("192.168.50.8")]);
     }
 
     #[test]

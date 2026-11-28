@@ -389,6 +389,69 @@ pub(crate) struct LocalAccountState {
 /// 本机登录成功记录文件（不含任何令牌，仅记成功时间，供 agy 把令牌放进系统钥匙串或不透明文件时识别）
 const LOGIN_MARKER: &str = ".looklook-agy-login.json";
 
+/// agy 账号目录下的本地认证/凭据文件（退出登录时只删这些非软链接文件，不碰共享的技能、MCP、对话记录）
+fn auth_files(dir: &Path) -> Vec<PathBuf> {
+    let data = dir.join("antigravity-cli");
+    vec![
+        dir.join("google_accounts.json"),
+        dir.join("oauth_creds.json"),
+        dir.join("credentials.json"),
+        dir.join("auth.json"),
+        dir.join("account.json"),
+        dir.join("user_status.json"),
+        dir.join("entitlement.json"),
+        data.join("antigravity-oauth-token"),
+        data.join("google_accounts.json"),
+        data.join("oauth_creds.json"),
+        data.join("credentials.json"),
+        data.join("auth.json"),
+        data.join("account.json"),
+        data.join("user_status.json"),
+        data.join("entitlement.json"),
+        data.join("auth").join("credentials.json"),
+        data.join("auth").join("oauth_creds.json"),
+        data.join("auth").join("account.json"),
+        dir.join(LOGIN_MARKER),
+    ]
+}
+
+/// 清除账号目录下的本地登录凭据文件（跳过软链接，绝不删共享目标）
+pub(crate) fn clear_dir_auth(dir: &Path) -> std::io::Result<()> {
+    for path in auth_files(dir) {
+        if is_link(&path) {
+            continue;
+        }
+        match std::fs::remove_file(&path) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// 退出登录（包括本机默认账号和额外账号）：取消进行中的登录、清除该账号目录下的本地凭据与登录标记、
+/// 清空已缓存的邮箱与套餐信息。不删除账号本身，也不碰共用的技能、MCP 与对话记录。
+pub fn logout(store: &Store, home: &Path, id: &str) -> Result<(), LocalError> {
+    get(store, id).ok_or_else(LocalError::not_found)?;
+    cancel_login(id);
+    clear_dir_auth(&account_dir(home, id))?;
+    if id == OFFICIAL {
+        let mut o = builtin_opts(store);
+        o.email = None;
+        o.plan = None;
+        o.logged_in_at = None;
+        store.set(BUILTIN_KEY, &o)?;
+    } else {
+        let mut all = stored(store);
+        if let Some(p) = all.iter_mut().find(|p| p.id == id) {
+            p.email = None;
+            p.plan = None;
+            store.set(LIST_KEY, &all)?;
+        }
+    }
+    Ok(())
+}
+
 fn write_login_marker(dir: &Path, email: Option<&str>, plan: Option<&str>) {
     let _ = std::fs::create_dir_all(dir);
     let body = json!({
@@ -437,9 +500,14 @@ fn non_empty_str<'a>(v: &'a Value, keys: &[&str]) -> Option<&'a str> {
 pub(crate) fn inspect_dir_state(dir: &Path) -> LocalAccountState {
     let mut state = LocalAccountState::default();
     let data = dir.join("antigravity-cli");
+    // agy CLI 实际写入的 OAuth 令牌文件（可能是非 JSON 的不透明文件）：非软链接且非空即认为已登录
+    let oauth_token = data.join("antigravity-oauth-token");
+    if !is_link(&oauth_token) && std::fs::metadata(&oauth_token).is_ok_and(|m| m.is_file() && m.len() > 0) {
+        state.logged_in = true;
+    }
     let candidates = [
         // agy 1.5 真正的登录凭据：{ token: { access_token, refresh_token, … }, auth_method, id_token_email }
-        data.join("antigravity-oauth-token"),
+        oauth_token,
         dir.join("google_accounts.json"),
         dir.join("oauth_creds.json"),
         dir.join("credentials.json"),
@@ -1694,6 +1762,37 @@ login cancelled: no authorization code was entered
         assert_eq!((today.requests, today.tokens()), (1, 1700));
         assert_eq!((seven.requests, seven.tokens()), (2, 4000));
         assert_eq!((thirty.requests, thirty.tokens()), (2, 4000));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn oauth_token_detection_and_logout_cleanup() {
+        let (dir, store) = tmp_store("logout");
+        let a = add(&store, &dir, Some("Work")).unwrap();
+        let acct = account_dir(&dir, &a.id);
+
+        // 只有 agy 自己的不透明令牌文件时，也能识别为已登录
+        std::fs::create_dir_all(acct.join("antigravity-cli")).unwrap();
+        std::fs::write(acct.join("antigravity-cli/antigravity-oauth-token"), "opaque-token-bytes").unwrap();
+        assert!(inspect_dir_state(&acct).logged_in);
+
+        // 再写登录标记与邮箱缓存，退出登录后凭据与缓存均被清空，但账号本身保留
+        write_login_marker(&acct, Some("work@example.com"), Some("Pro"));
+        sync_after_login(&store, &dir, &a.id);
+        assert_eq!(get(&store, &a.id).unwrap().email.as_deref(), Some("work@example.com"));
+
+        logout(&store, &dir, &a.id).unwrap();
+        assert!(!inspect_dir_state(&acct).logged_in);
+        assert!(!acct.join("antigravity-cli/antigravity-oauth-token").exists());
+        assert!(!acct.join(LOGIN_MARKER).exists());
+        let after = get(&store, &a.id).unwrap();
+        assert_eq!(after.name, "Work");
+        assert!(after.email.is_none());
+        assert!(after.plan.is_none());
+
+        // 不存在的账号返回 not_found
+        assert!(logout(&store, &dir, "nonexistent").is_err());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

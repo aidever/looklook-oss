@@ -104,6 +104,10 @@ pub struct Manifest {
     /// 插件能打开网址（对话里点链接时菜单里多一项“用 <插件> 打开”）：`POST /api/plugins/<名>/open-url {url}`
     #[serde(default)]
     pub open_url: bool,
+    /// 插件接的钩子（[`HOOK_FEATURES`]、[`HOOK_FEISHU_GROUP`]……）：看看到时候调 `POST /_hooks/<钩子>`（[`hook_path`]）。
+    /// 老看看不认这个字段，照常装、照常转页面和接口，只是不调钩子
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hooks: Vec<String>,
 }
 
 impl Manifest {
@@ -131,7 +135,14 @@ impl Manifest {
                 return Err(format!("bad autostart_if_exists {f:?}"));
             }
         }
+        if self.hooks.len() > 16 || self.hooks.iter().any(|h| !valid_name(h)) {
+            return Err(format!("bad hooks {:?}", self.hooks));
+        }
         Ok(())
+    }
+
+    pub fn has_hook(&self, hook: &str) -> bool {
+        self.hooks.iter().any(|h| h == hook)
     }
 
     /// 按界面语言挑显示名（没有就用英文，再没有用随便哪个）
@@ -296,6 +307,266 @@ pub fn machine_digest(raw: &str) -> String {
     sha256_hex(format!("looklook-plugin-machine\n{raw}").as_bytes())[..32].to_string()
 }
 
+// ---------------- 机器指纹（看看和所有插件共用一套算法） ----------------
+
+/// 安装号文件：放在看看数据目录（`LOOKLOOK_HOME`）里，看看和插件读同一个，算出来的指纹才一样
+pub const MACHINE_INSTALL_FILE: &str = "machine-install-id";
+/// 看看数据目录（插件拿它找安装号）
+pub const ENV_HOME: &str = "LOOKLOOK_HOME";
+
+/// 系统自己的机器号：Linux `/etc/machine-id`，macOS `IOPlatformUUID`，Windows `MachineGuid`。没有时为空
+/// （例如有的容器），这时只靠安装号区分机器
+pub fn os_machine_id() -> String {
+    #[cfg(target_os = "macos")]
+    {
+        let out = std::process::Command::new("/usr/sbin/ioreg").args(["-rd1", "-c", "IOPlatformExpertDevice"]).output();
+        if let Ok(o) = out {
+            let text = String::from_utf8_lossy(&o.stdout);
+            if let Some(v) = text.lines().find(|l| l.contains("\"IOPlatformUUID\"")).and_then(|l| l.split('"').nth(3)) {
+                return v.trim().to_string();
+            }
+        }
+        String::new()
+    }
+    #[cfg(windows)]
+    {
+        let out = std::process::Command::new("reg").args(["query", r"HKLM\SOFTWARE\Microsoft\Cryptography", "/v", "MachineGuid"]).output();
+        if let Ok(o) = out {
+            let text = String::from_utf8_lossy(&o.stdout);
+            if let Some(v) = text.lines().find(|l| l.contains("MachineGuid")).and_then(|l| l.split_whitespace().last()) {
+                return v.trim().to_string();
+            }
+        }
+        String::new()
+    }
+    #[cfg(not(any(target_os = "macos", windows)))]
+    {
+        ["/etc/machine-id", "/var/lib/dbus/machine-id"].iter().find_map(|p| std::fs::read_to_string(p).ok()).map(|s| s.trim().to_string()).unwrap_or_default()
+    }
+}
+
+fn valid_install_id(s: &str) -> bool {
+    (16..=64).contains(&s.len()) && s.chars().all(|c| c.is_ascii_alphanumeric())
+}
+
+/// 读安装号，没有就生成一个（只用来区分机器，不是秘密）。两个进程同时生成时以先写下的为准
+pub fn install_id(home: &std::path::Path) -> std::io::Result<String> {
+    let path = home.join(MACHINE_INSTALL_FILE);
+    if let Ok(s) = std::fs::read_to_string(&path) {
+        if valid_install_id(s.trim()) {
+            return Ok(s.trim().to_string());
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+    std::fs::create_dir_all(home)?;
+    let seed = format!(
+        "{:?}|{}|{}|{:p}",
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default(),
+        std::process::id(),
+        home.display(),
+        &path
+    );
+    let fresh = sha256_hex(seed.as_bytes())[..26].to_string();
+    use std::io::Write;
+    match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+        Ok(mut f) => {
+            f.write_all(fresh.as_bytes())?;
+            Ok(fresh)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            let s = std::fs::read_to_string(&path)?;
+            if valid_install_id(s.trim()) {
+                Ok(s.trim().to_string())
+            } else {
+                Err(std::io::Error::other("bad install id"))
+            }
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// 这台机器的指纹（32 位 hex）：系统机器号 + 看看数据目录里的安装号，再哈希。
+/// 看看在插件页显示它（离线授权就按它签），插件自己也按同一个算法算、拿来核对凭证
+pub fn machine_fingerprint(home: &std::path::Path) -> std::io::Result<String> {
+    Ok(fingerprint_of(&os_machine_id(), &install_id(home)?))
+}
+
+pub fn fingerprint_of(os_id: &str, install_id: &str) -> String {
+    machine_digest(&format!("{os_id}|{install_id}"))
+}
+
+pub fn valid_machine(m: &str) -> bool {
+    m.len() == 32 && m.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+}
+
+/// 用户粘贴的指纹：去掉空格、横线，转小写
+pub fn normalize_machine(s: &str) -> Option<String> {
+    let m: String = s.chars().filter(|c| !c.is_whitespace() && *c != '-').collect::<String>().to_ascii_lowercase();
+    valid_machine(&m).then_some(m)
+}
+
+// ---------------- 离线授权码 ----------------
+
+/// 离线授权的 `did`（没有账号、设备，`uid` 为 0）
+pub const OFFLINE_DID: &str = "offline";
+
+/// 离线授权码：管理后台按机器指纹给一个或几个插件签的凭证（和联网领的同一个格式，只是没有 7 天上限，到期为止），
+/// 几个凭证之间用空格隔开。这里只拆开、读出内容，不验签
+pub fn split_offline_code(code: &str) -> Vec<String> {
+    code.split(|c: char| c.is_whitespace() || c == ',').map(str::trim).filter(|t| !t.is_empty()).map(String::from).collect()
+}
+
+/// 只读凭证里的内容（不验签，看看用来显示和挑出插件名；真的判权在插件里）
+pub fn peek_license(token: &str) -> Option<LicenseClaims> {
+    let parts: Vec<&str> = token.trim().split('.').collect();
+    let [tag, _kid, payload, _sig] = parts.as_slice() else { return None };
+    if *tag != LICENSE_TAG {
+        return None;
+    }
+    b64_decode(payload).and_then(|b| serde_json::from_slice(&b).ok())
+}
+
+// ---------------- 离线安装包 ----------------
+
+/// 离线安装包（`.llplugin`）：在联网的电脑上下载，拷到别的电脑上导入。
+/// 格式：`LLPLUGIN1\n` + 8 字节大端长度 + `release.json` 原文 + 8 字节大端长度 + `release.sig` + 后面到结尾是 `package.tar.gz`。
+/// 导入时照样验 `release.json` 的签名和包的 SHA-256
+pub const OFFLINE_PACKAGE_MAGIC: &[u8] = b"LLPLUGIN1\n";
+/// 离线安装包的扩展名
+pub const OFFLINE_PACKAGE_EXT: &str = "llplugin";
+const OFFLINE_HEAD_MAX: u64 = 1 << 20;
+
+/// 离线安装包的开头（后面直接接 `package.tar.gz`）
+pub fn offline_package_head(release_json: &[u8], sig: &ReleaseSig) -> Vec<u8> {
+    let sig = serde_json::to_vec(sig).expect("sig");
+    let mut out = Vec::with_capacity(OFFLINE_PACKAGE_MAGIC.len() + 16 + release_json.len() + sig.len());
+    out.extend_from_slice(OFFLINE_PACKAGE_MAGIC);
+    out.extend_from_slice(&(release_json.len() as u64).to_be_bytes());
+    out.extend_from_slice(release_json);
+    out.extend_from_slice(&(sig.len() as u64).to_be_bytes());
+    out.extend_from_slice(&sig);
+    out
+}
+
+/// 读离线安装包的开头：`release.json` 原文和签名；读完后 `r` 停在包开始的地方
+pub fn read_offline_package_head(r: &mut impl std::io::Read) -> Result<(Vec<u8>, ReleaseSig), String> {
+    let mut magic = vec![0u8; OFFLINE_PACKAGE_MAGIC.len()];
+    r.read_exact(&mut magic).map_err(|_| "not a plugin package".to_string())?;
+    if magic != OFFLINE_PACKAGE_MAGIC {
+        return Err("not a plugin package".into());
+    }
+    let chunk = |r: &mut dyn std::io::Read| -> Result<Vec<u8>, String> {
+        let mut n = [0u8; 8];
+        r.read_exact(&mut n).map_err(|_| "truncated".to_string())?;
+        let n = u64::from_be_bytes(n);
+        if n > OFFLINE_HEAD_MAX {
+            return Err("bad header".into());
+        }
+        let mut b = vec![0u8; n as usize];
+        r.read_exact(&mut b).map_err(|_| "truncated".to_string())?;
+        Ok(b)
+    };
+    let raw = chunk(r)?;
+    let sig = chunk(r)?;
+    let sig: ReleaseSig = serde_json::from_slice(&sig).map_err(|_| "bad signature".to_string())?;
+    Ok((raw, sig))
+}
+
+// ---------------- 钩子（看看 → 插件） ----------------
+//
+// 看看在某些时候问插件要主意：经插件的 Socket 发 `POST /_hooks/<钩子>`（带 [`HDR_TOKEN`]），请求体、回答都是 JSON。
+// 插件只出主意，真正动手的（开只读会话、发飞书）仍由看看做，安全上的限制（只读闸门、并发、超时）也由看看管，插件放不开。
+// 插件出错、超时、回了认不出的东西时，看看按“不做”处理。
+
+pub const HOOK_PREFIX: &str = "/_hooks/";
+/// `{}` → [`Features`]：插件现在开着的功能（没授权、过期时不列）
+pub const HOOK_FEATURES: &str = "features";
+/// [`GroupMessage`] → [`GroupDecision`]：飞书群里不是主人的人 @ 了机器人，看看没别的安排（不是在等的人）时问插件
+pub const HOOK_FEISHU_GROUP: &str = "feishu-group";
+/// [`AskDone`] → `{}`：按插件的主意开的只读提问答完了（记录、统计用）
+pub const HOOK_ASK_DONE: &str = "ask-done";
+
+/// 功能名：新建会话记下操作人署名（`created_by`），会话列表能按人看
+pub const FEATURE_OPERATOR: &str = "operator";
+/// 功能名：飞书群成员 @ 机器人提问（只读）
+pub const FEATURE_GROUP_ASK: &str = "group_ask";
+
+/// 只读提问最长跑多久（秒）：插件给的超过就按这个
+pub const ASK_TIMEOUT_MAX: u64 = 600;
+pub const ASK_TIMEOUT_DEFAULT: u64 = 180;
+/// 问题最长（字符），超过的截掉
+pub const ASK_QUESTION_MAX: usize = 4000;
+
+pub fn hook_path(hook: &str) -> String {
+    format!("{HOOK_PREFIX}{hook}")
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Features {
+    #[serde(default)]
+    pub features: Vec<String>,
+}
+
+/// 飞书群里的一条 @ 机器人的消息（@ 已经去掉、换成名字）
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct GroupMessage {
+    pub chat_id: String,
+    pub message_id: String,
+    /// 发消息的人（open_id）和看看认得的名字（可能为空）
+    pub sender: String,
+    #[serde(default)]
+    pub sender_name: String,
+    pub text: String,
+    /// 带了图片、文件（只读提问看不到）
+    #[serde(default)]
+    pub attachments: bool,
+}
+
+/// 插件的主意。认不出的一律当 [`GroupDecision::Ignore`]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum GroupDecision {
+    /// 不管（看看照老样子转给主人）
+    Ignore,
+    /// 在群里回这句并 @ 他（比如“今天问得太多了”），不开会话
+    Reply { text: String },
+    /// 开一个一次性的只读会话回答 `question`，答案回到群里 @ 他
+    Ask {
+        question: String,
+        /// 只读会话的工作目录（这台电脑上的绝对路径）；空、不存在时用看看给的空目录
+        #[serde(default)]
+        workdir: String,
+        /// 最长跑多久（秒），0 = [`ASK_TIMEOUT_DEFAULT`]，最多 [`ASK_TIMEOUT_MAX`]
+        #[serde(default)]
+        timeout_secs: u64,
+        /// 插件自己的编号，[`AskDone`] 里带回来
+        #[serde(default)]
+        ask_id: String,
+    },
+}
+
+impl GroupDecision {
+    /// 解析插件的回答：认不出就是不管
+    pub fn parse(v: &serde_json::Value) -> GroupDecision {
+        serde_json::from_value(v.clone()).unwrap_or(GroupDecision::Ignore)
+    }
+}
+
+/// 只读提问的结果
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AskDone {
+    #[serde(default)]
+    pub ask_id: String,
+    pub chat_id: String,
+    pub sender: String,
+    /// `answered`、`failed`、`timeout`、`busy`（同时在答的太多）、`unavailable`（这台电脑开不了只读会话）
+    pub outcome: String,
+    #[serde(default)]
+    pub secs: u64,
+    #[serde(default)]
+    pub answer_chars: u64,
+}
+
 // ---------------- 客户端 ↔ 服务端 ----------------
 
 /// `GET /api/client/v1/plugins?platform=…`：这个平台能装的插件，和这个账号的授权
@@ -366,6 +637,7 @@ mod tests {
             exec: "bin/looklook-browser".into(),
             autostart_if_exists: Some("run.json".into()),
             open_url: true,
+            hooks: vec![],
         }
     }
 
@@ -416,6 +688,64 @@ mod tests {
         let bad = Release { version: "9.9.9".into(), ..r };
         let raw = serde_json::to_vec(&bad).unwrap();
         assert!(verify_release(&keys, &raw, &sign_release(&sk, "pk1", &raw)).is_err());
+    }
+
+    #[test]
+    fn hooks_and_decisions() {
+        let m = Manifest { hooks: vec![HOOK_FEATURES.into(), HOOK_FEISHU_GROUP.into()], ..manifest() };
+        assert!(m.validate().is_ok() && m.has_hook(HOOK_FEISHU_GROUP) && !m.has_hook(HOOK_ASK_DONE));
+        assert!(Manifest { hooks: vec!["../x".into()], ..manifest() }.validate().is_err());
+        // 老清单没有 hooks：照常解析；没有 hooks 时也不写出来
+        let old: Manifest = serde_json::from_value(serde_json::json!({ "name": "browser", "version": "1.0.0", "protocol": 1, "title": { "en-US": "B" }, "exec": "bin/b" })).unwrap();
+        assert!(old.hooks.is_empty() && !serde_json::to_string(&old).unwrap().contains("hooks"));
+        assert_eq!(hook_path(HOOK_FEISHU_GROUP), "/_hooks/feishu-group");
+        let ask = GroupDecision::parse(&serde_json::json!({ "action": "ask", "question": "接口在哪", "ask_id": "a1" }));
+        assert_eq!(ask, GroupDecision::Ask { question: "接口在哪".into(), workdir: String::new(), timeout_secs: 0, ask_id: "a1".into() });
+        assert_eq!(GroupDecision::parse(&serde_json::json!({ "action": "reply", "text": "太多了" })), GroupDecision::Reply { text: "太多了".into() });
+        for bad in [serde_json::json!({ "action": "run_shell" }), serde_json::json!(null), serde_json::json!({ "action": "ask" })] {
+            assert_eq!(GroupDecision::parse(&bad), GroupDecision::Ignore, "{bad}");
+        }
+    }
+
+    #[test]
+    fn fingerprint_and_offline_code() {
+        let d = std::env::temp_dir().join(format!("llp-fp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let a = machine_fingerprint(&d).unwrap();
+        // 安装号存下来了：再算一样
+        assert_eq!(machine_fingerprint(&d).unwrap(), a);
+        assert!(valid_machine(&a));
+        assert_ne!(fingerprint_of("x", &install_id(&d).unwrap()), fingerprint_of("y", &install_id(&d).unwrap()));
+        // 坏掉的安装号重新生成
+        std::fs::write(d.join(MACHINE_INSTALL_FILE), "../bad").unwrap();
+        assert_ne!(machine_fingerprint(&d).unwrap(), a);
+        let _ = std::fs::remove_dir_all(&d);
+        assert_eq!(normalize_machine(&format!(" {} ", a.to_uppercase())), Some(a.clone()));
+        assert_eq!(normalize_machine("abcd-"), None);
+
+        let sk = SigningKey::from_bytes(&[3u8; 32]);
+        let c = |p: &str| LicenseClaims { v: 1, plugin: p.into(), uid: 0, did: OFFLINE_DID.into(), mach: a.clone(), iat: 1, exp: 99, ent_exp: 99, wm: "w".into() };
+        let code = format!("{}  {}\n", issue_license(&sk, "p1", &c("team")), issue_license(&sk, "p1", &c("browser")));
+        let parts = split_offline_code(&code);
+        assert_eq!(parts.len(), 2);
+        assert_eq!(peek_license(&parts[1]).unwrap().plugin, "browser");
+        assert!(peek_license("LL1L.x.y").is_none());
+    }
+
+    #[test]
+    fn offline_package() {
+        let sk = SigningKey::from_bytes(&[7u8; 32]);
+        let raw = br#"{"x":1}"#.to_vec();
+        let sig = sign_release(&sk, "pk1", &raw);
+        let mut file = offline_package_head(&raw, &sig);
+        file.extend_from_slice(b"PACKAGE");
+        let mut r = std::io::Cursor::new(file);
+        let (r2, s2) = read_offline_package_head(&mut r).unwrap();
+        assert_eq!((r2, s2), (raw, sig));
+        let mut rest = vec![];
+        std::io::Read::read_to_end(&mut r, &mut rest).unwrap();
+        assert_eq!(rest, b"PACKAGE");
+        assert!(read_offline_package_head(&mut std::io::Cursor::new(b"PK\x03\x04junk".to_vec())).is_err());
     }
 
     #[test]

@@ -522,10 +522,23 @@ impl Chat {
                 }
             }
         }
+        // 开着的旁聊也放掉
+        if let Some(me) = self.me.upgrade() {
+            let id = id.to_string();
+            tokio::spawn(async move {
+                me.codex_side_close(&id).await;
+                if let Some(s) = me.agy_side_take(&id) {
+                    me.agy_forget(Some(s)).await;
+                }
+            });
+        }
         let _ = self.store.remove(&binding_key(id));
         let _ = self.store.remove(&windows_key(id));
         let _ = self.store.remove(&board::key(id));
         let _ = self.store.remove(&agy_chat::limit_key(id));
+        let _ = self.store.remove(&agy_chat::mode_key(id));
+        let _ = self.store.remove(&codex_chat::perm_key(id));
+        let _ = self.store.remove(&claude_chat::mode_key(id));
     }
 
     fn require(&self, id: &str) -> Result<(), LocalError> {
@@ -898,8 +911,13 @@ impl Chat {
 
     /// 大脑每一轮带上的话（两种引擎共用）
     pub(super) fn assistant_context(&self) -> String {
+        let settings = crate::assistant::settings(&self.store);
         let (errands, doing): (Vec<_>, Vec<_>) = self.assistant_doing().into_iter().partition(|d| crate::assistant::is_errand(&self.store, &d.session));
-        let mut s = crate::assistant::turn_context(&self.paths, crate::assistant::settings(&self.store).mode, &doing, &errands, &crate::assistant::waits(&self.store));
+        let mut s = crate::assistant::turn_context(&self.paths, settings.mode, &doing, &errands, &crate::assistant::waits(&self.store));
+        if let Some(defaults) = crate::assistant::dispatch_defaults_context(&settings) {
+            let at = s.rfind("</looklook-context>").unwrap_or(s.len());
+            s.insert_str(at, &defaults);
+        }
         if let Some(news) = crate::assistant::memory_news(&self.store, &self.paths) {
             // 放进 <looklook-context> 里面
             let at = s.rfind("</looklook-context>").unwrap_or(s.len());
@@ -913,7 +931,13 @@ impl Chat {
     /// 大脑、跑腿现在按哪种模式。跑腿最多“动手前问”（它会读网页这类外面的东西，只查不改不能只靠规矩）
     pub(super) fn assistant_mode(&self, id: &str) -> crate::assistant::Mode {
         let mode = crate::assistant::settings(&self.store).mode;
-        if crate::assistant::is_errand(&self.store, id) { mode.for_errand() } else { mode }
+        if crate::assistant::is_ask(&self.store, id) {
+            crate::assistant::Mode::ReadOnly
+        } else if crate::assistant::is_errand(&self.store, id) {
+            mode.for_errand()
+        } else {
+            mode
+        }
     }
 
     /// 助理换了模式：对话模式 Claude Code 的大脑带的系统沙箱（只读时才有）和现在要的不一样了，就重起（接着同一段对话）。
@@ -957,10 +981,20 @@ impl Chat {
 
     /// 大脑要用工具：按助理的权限模式过闸门（Claude Code 的 PreToolUse、Codex 的审批请求都走这里）
     pub(super) fn assistant_gate(&self, id: &str, tool: &str, input: &Value) -> crate::assistant::Verdict {
+        // 群里提问：只读工作目录和附件，别的都拒绝，从不问用户
+        if crate::assistant::is_ask(&self.store, id) {
+            let Some(row) = self.store.instance(id).ok().flatten() else { return crate::assistant::Verdict::Deny(crate::assistant::DENY_PREFIX.into()) };
+            return crate::assistant::ask_gate(&[std::path::PathBuf::from(&row.workdir), self.paths.attach_dir(id)], tool, input);
+        }
         let busy = |p: &std::path::Path| self.project_busy(p, id);
         let settings = crate::assistant::settings(&self.store);
         let mode = self.assistant_mode(id);
-        crate::assistant::gate(&self.paths, mode, crate::assistant::start_ceiling(&settings, input["engine"].as_str()), &crate::guard::load(&self.store), tool, input, &busy)
+        let engine = input["engine"]
+            .as_str()
+            .filter(|e| !e.is_empty())
+            .map(String::from)
+            .or_else(|| input["session"].as_str().and_then(|sid| self.store.instance(sid.trim()).ok().flatten().map(|r| r.launch)));
+        crate::assistant::gate(&self.paths, mode, crate::assistant::start_ceiling(&settings, engine.as_deref()), &crate::guard::load(&self.store), tool, input, &busy)
     }
 
     /// 助理盯着的会话现在怎么样了（每一轮告诉大脑）
@@ -1875,21 +1909,67 @@ impl Chat {
         Ok(false)
     }
 
-    /// `/btw`：顺带问一句（只有对话模式的 Claude Code 有，见 `claude_chat::sdk_btw`）
-    pub async fn btw(self: &Arc<Self>, id: &str, question: &str) -> Result<Value, LocalError> {
+    /// `/btw`、`/side` 旁聊：用这段对话的上下文回答，不记进对话、不打断正在跑的这一轮，可以接着问（和官方桌面端的旁聊一样）。
+    /// `history`：这次旁聊前面问过的（Claude 的 side_question 自己不记，要带上）；`fresh`：界面上是新开的旁聊，
+    /// Codex / agy 留着的上一次旁聊先丢掉
+    pub async fn btw(self: &Arc<Self>, id: &str, question: &str, history: &[Value], fresh: bool) -> Result<Value, LocalError> {
         self.require(id)?;
         let q = question.trim();
         if q.is_empty() {
             return Err(LocalError::invalid("question", "required"));
         }
+        if fresh {
+            self.btw_close(id).await;
+        }
         if self.is_codex(id) {
             return self.codex_side(id, q).await;
+        }
+        if self.is_agy(id) {
+            return self.agy_side(id, q).await;
         }
         if !self.is_sdk(id) {
             return Err(LocalError::new("CHAT_UNAVAILABLE"));
         }
         self.inst(id).sdk.store(true, Ordering::Relaxed);
-        self.sdk_btw(id, q).await
+        self.sdk_btw(id, q, history).await
+    }
+
+    /// 关掉旁聊：Codex 的临时分叉、agy 的旁聊会话放掉（Claude 的旁聊不在进程里留东西）
+    pub async fn btw_close(self: &Arc<Self>, id: &str) {
+        self.codex_side_close(id).await;
+        self.agy_side_close(id).await;
+    }
+
+    /// 旁聊开头给模型看的：主对话到现在说了什么（只取文字，从后往前取到 `max` 个字为止）。
+    /// agy 没法分叉会话，旁聊会话靠这个知道主对话
+    pub(super) async fn side_context(&self, id: &str, max: usize) -> String {
+        let inst = self.inst(id);
+        let tr = inst.tr.lock().await;
+        let Some(t) = tr.as_ref().map(Reader::get) else { return String::new() };
+        let items = t.items(0, t.len());
+        let mut parts: Vec<String> = vec![];
+        let mut used = 0;
+        for it in items.iter().rev() {
+            let line = match &it.body {
+                transcript::Body::User { text, .. } if !text.trim().is_empty() => format!("User: {}", text.trim()),
+                transcript::Body::Assistant { blocks, .. } => {
+                    let text: Vec<&str> = blocks.iter().filter_map(|b| if let transcript::Block::Text { text } = b { Some(text.trim()) } else { None }).filter(|t| !t.is_empty()).collect();
+                    if text.is_empty() {
+                        continue;
+                    }
+                    format!("Assistant: {}", text.join("\n"))
+                }
+                transcript::Body::Summary { text } => format!("[Earlier conversation summary]\n{}", text.trim()),
+                _ => continue,
+            };
+            used += line.chars().count();
+            if used > max {
+                break;
+            }
+            parts.push(line);
+        }
+        parts.reverse();
+        parts.join("\n\n")
     }
 
     /// 把前台在跑的命令、子代理转到后台（终端里的 Ctrl+B）。`tool`：只转这一个工具调用起的；不给就全转

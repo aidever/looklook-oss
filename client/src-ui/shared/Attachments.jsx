@@ -11,7 +11,7 @@ import { api } from './api.js';
 import { errorText } from './i18n.js';
 import { SyncLabel } from './SettingsSync.jsx';
 import { relativeTime } from './time.js';
-import { Button, Card, CopyButton, Empty, ErrorNote, Field, Modal, Skeleton, useConfirm, useLoad, useToast } from './ui.jsx';
+import { Button, Card, CopyButton, Empty, ErrorNote, Modal, More, Row, Skeleton, useConfirm, useLoad, useToast } from './ui.jsx';
 import { formatBytes } from './xfer.js';
 
 export const RETENTION_DAYS = [1, 3, 7, 14, 30];
@@ -178,18 +178,16 @@ export function AttachmentsCard() {
   return (
     <Card
       title={t('att.title')}
+      sub={t('att.lead')}
       actions={
         items.length > 0 && (
-          <Button variant="ghost" icon={Trash2} onClick={clear}>
+          <Button variant="ghost" size="sm" icon={Trash2} onClick={clear}>
             {t('att.clear')}
           </Button>
         )
       }
     >
-      <p className="muted small" style={{ marginTop: 0 }}>
-        {t('att.lead')}
-      </p>
-      <Field label={<SyncLabel text={t('att.keep')} />} hint={data?.dir && <span className="mono">{data.dir}</span>}>
+      <Row label={<SyncLabel text={t('att.keep')} />} hint={data?.dir && <span className="mono">{data.dir}</span>} stack>
         <div className="seg" role="group" aria-label={t('att.keep')} aria-busy={saving}>
           {RETENTION_DAYS.map((d) => (
             <button key={d} type="button" aria-pressed={days === d} disabled={saving} onClick={() => days !== d && setDays(d)}>
@@ -197,50 +195,55 @@ export function AttachmentsCard() {
             </button>
           ))}
         </div>
-      </Field>
+      </Row>
       <ErrorNote error={error} />
-      {!data && !error && <Skeleton height={88} />}
-      {data && (
-        <>
-          <div className="att-bar">
-            <span className="small muted grow">{t('att.summary', { n: items.length, size: formatBytes(total) })}</span>
-            <div className="seg seg-sm" role="group" aria-label={t('att.filter')}>
-              <button type="button" aria-pressed={filter === 'image'} onClick={() => setFilter('image')}>
-                {t('att.only_images')}
-              </button>
-              <button type="button" aria-pressed={filter === 'all'} onClick={() => setFilter('all')}>
-                {t('att.all')}
-              </button>
+      {!data && !error && <Skeleton height={44} />}
+      {data &&
+        (items.length === 0 ? (
+          <p className="muted small" style={{ margin: '6px 0 0' }}>
+            {t('att.empty')} · {t('att.empty_hint')}
+          </p>
+        ) : (
+          <More summary={t('att.browse_summary', { n: items.length, size: formatBytes(total) })}>
+            <div className="att-bar">
+              <span className="small muted grow">{t('att.summary', { n: items.length, size: formatBytes(total) })}</span>
+              <div className="seg seg-sm" role="group" aria-label={t('att.filter')}>
+                <button type="button" aria-pressed={filter === 'image'} onClick={() => setFilter('image')}>
+                  {t('att.only_images')}
+                </button>
+                <button type="button" aria-pressed={filter === 'all'} onClick={() => setFilter('all')}>
+                  {t('att.all')}
+                </button>
+              </div>
             </div>
-          </div>
-          {shown.length === 0 ? (
-            <Empty icon={Images} title={t('att.empty')}>
-              <p className="muted small">{t('att.empty_hint')}</p>
-            </Empty>
-          ) : (
-            <ul className="att-grid">
-              {shown.map((item) => (
-                <li key={`${item.instance}/${item.name}`} className="att-cell">
-                  <button type="button" className="att-cell-img" onClick={() => setView(item)} aria-label={`${t('att.view')} ${item.name}`}>
-                    <Thumb item={item} size={120} />
-                  </button>
-                  <div className="att-cell-meta">
-                    <span className="ellipsis small" title={item.name}>
-                      {item.name}
-                    </span>
-                    <span className="ellipsis small muted" title={names[item.instance] ?? item.instance}>
-                      {names[item.instance] ?? t('att.deleted_term')} · {relativeTime(t, isoOf(item.modified))}
-                    </span>
-                  </div>
-                  <button type="button" className="btn btn-plain btn-icon att-cell-del" onClick={() => remove(item)} title={t('att.delete')} aria-label={`${t('att.delete')} ${item.name}`}>
-                    <Trash2 size={15} />
-                  </button>
-                </li>
-              ))}
-            </ul>
-          )}
-        </>
-      )}
+            {shown.length === 0 ? (
+              <Empty icon={Images} title={t('att.empty')}>
+                <p className="muted small">{t('att.empty_hint')}</p>
+              </Empty>
+            ) : (
+              <ul className="att-grid">
+                {shown.map((item) => (
+                  <li key={`${item.instance}/${item.name}`} className="att-cell">
+                    <button type="button" className="att-cell-img" onClick={() => setView(item)} aria-label={`${t('att.view')} ${item.name}`}>
+                      <Thumb item={item} size={120} />
+                    </button>
+                    <div className="att-cell-meta">
+                      <span className="ellipsis small" title={item.name}>
+                        {item.name}
+                      </span>
+                      <span className="ellipsis small muted" title={names[item.instance] ?? item.instance}>
+                        {names[item.instance] ?? t('att.deleted_term')} · {relativeTime(t, isoOf(item.modified))}
+                      </span>
+                    </div>
+                    <button type="button" className="btn btn-plain btn-icon att-cell-del" onClick={() => remove(item)} title={t('att.delete')} aria-label={`${t('att.delete')} ${item.name}`}>
+                      <Trash2 size={15} />
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </More>
+        ))}
       <ImageViewer item={view} onClose={() => setView(null)} onDelete={remove} />
     </Card>
   );
